@@ -44,7 +44,7 @@ def layout(root, component=None, name=None):
         (root / "owned.exe").write_bytes(b)
 
 
-def profile(root, packages=(), extra=(), versions=None, hashes=None, reverse=False, native_imports=False):
+def profile(root, packages=(), extra=(), versions=None, hashes=None, reverse=False, native_imports=False, lifecycle="owned_fixture"):
     records = []
     files = [("entry", root / "owned.exe", "executable"),
              ("appx", root / "AppxManifest.xml", "resource"), ("logo", root / "logo.png", "resource"),
@@ -59,6 +59,8 @@ def profile(root, packages=(), extra=(), versions=None, hashes=None, reverse=Fal
     rows = ['xboxone-systemos-v1', 'profile "owned-appmodel" "owned-revision-1" synthetic "' + "a" * 64 + '"',
             'entry "entry"', 'appmodel "appx" "OwnedLifecycle" "owned packaged desktop lifecycle contract v1"']
     rows += list(reversed(records)) if reverse else records
+    if lifecycle is not None:
+        rows.append('appmodel_lifecycle ' + lifecycle)
     rows += extra
     path = root / "profile.txt"
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")

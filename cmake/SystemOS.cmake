@@ -57,6 +57,10 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
         target_include_directories(xboxone_appmodel_activation_tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
         target_link_libraries(xboxone_appmodel_activation_tests PRIVATE xboxone_systemos)
         add_test(NAME appmodel_activation_failure COMMAND xboxone_appmodel_activation_tests)
+        add_test(NAME appmodel_process_observation COMMAND xboxone_appmodel_activation_tests
+                 $<TARGET_FILE:bootstrap_component_ok> $<TARGET_FILE:bootstrap_component_hang>
+                 $<TARGET_FILE:bootstrap_component_fail>)
+        set_tests_properties(appmodel_process_observation PROPERTIES TIMEOUT 20 LABELS "windows;synthetic;no-deployment")
         set_tests_properties(appmodel_activation_failure PROPERTIES TIMEOUT 20 LABELS "windows;appmodel;no-deployment")
         add_executable(appmodel_component ${PROJECT_SOURCE_DIR}/tests/appmodel_component.cpp)
         target_compile_options(appmodel_component PRIVATE /GS- /Zl)

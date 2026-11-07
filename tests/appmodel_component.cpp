@@ -18,7 +18,11 @@ extern "C" void appmodel_test_entry() {
         while (marker[i] && p[i] == marker[i]) ++i;
         if (!marker[i]) { nonce = p + i; break; }
     }
-    if (!nonce) ExitProcess(33);
+    if (!nonce) {
+        // Normal process observation has no fixture handshake or stop request.
+        Sleep(1000);
+        ExitProcess(0);
+    }
     wchar_t token[39];
     token[38] = 0;
     for (unsigned i = 0; i < 38; ++i) {

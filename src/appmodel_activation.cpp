@@ -12,6 +12,30 @@
 
 namespace xboxone::systemos {
 #ifdef _WIN32
+bool observe_appmodel_exit(void* process, Report& report, std::uint32_t timeout_ms) {
+    const auto waited = WaitForSingleObject(process, timeout_ms);
+    report.activation_events.push_back({"WaitForSingleObject(process)", waited, "win32"});
+    if (waited == WAIT_TIMEOUT) {
+        report.stage = Stage::timed_out;
+        report.diagnostics.push_back({"packaged_observation_timeout", report.activated_aumid,
+            "process remains unmodified; observation timeout is not shutdown or initialization"});
+        return false;
+    }
+    DWORD code = 0;
+    if (waited != WAIT_OBJECT_0 || !GetExitCodeProcess(process, &code)) {
+        report.stage = Stage::failed;
+        report.diagnostics.push_back({"packaged_observation_failed", report.activated_aumid,
+            "cannot observe process exit; Win32=" + std::to_string(GetLastError())});
+        return false;
+    }
+    report.exit_code = code;
+    report.exit_code_available = true;
+    report.stage = Stage::exited;
+    if (code != 0) report.diagnostics.push_back({"packaged_exit_nonzero", report.activated_aumid,
+        "process exited with code " + std::to_string(code)});
+    return code == 0;
+}
+
 bool request_packaged_activation(const std::string& aumid, const std::wstring& arguments, Report& report) {
     using namespace appmodel::windows;
     Apartment apartment;
@@ -23,7 +47,7 @@ bool request_packaged_activation(const std::string& aumid, const std::wstring& a
     const auto created = CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&manager));
     if (!event("CoCreateInstance(ApplicationActivationManager)", created)) return false;
     const auto foreground = CoAllowSetForegroundWindow(manager.Get(), nullptr);
-    // Foreground permission is advisory for this windowless owned fixture.
+    // Foreground permission is advisory, not proof of activation or focus.
     // Preserve its failure and let ActivateApplication return its actual result.
     event("CoAllowSetForegroundWindow", foreground);
     DWORD pid = 0;
@@ -55,9 +79,13 @@ bool run_appmodel(const Profile& profile, Report& report, std::uint32_t timeout_
             [&](const auto& n) { return n.artifact == profile.appmodel.manifest; });
         if (package == report.packages.end()) return fail("appmodel_package_missing", "prepared package required");
         const auto& manifest = package->manifest;
-        const auto& application = manifest.applications.at(0);
+        const auto application = std::find_if(manifest.applications.begin(), manifest.applications.end(),
+            [&](const auto& a) { return a.id == profile.appmodel.application_id; });
+        if (application == manifest.applications.end()) return fail("appmodel_application_missing", "prepared application required");
         const auto entry = std::find_if(profile.artifacts.begin(), profile.artifacts.end(), [&](const auto& a) { return a.id == profile.entry; });
         const auto source = std::find_if(profile.artifacts.begin(), profile.artifacts.end(), [&](const auto& a) { return a.id == profile.appmodel.manifest; });
+        if (entry == profile.artifacts.end() || source == profile.artifacts.end())
+            return fail("appmodel_artifact_missing", "prepared entry and manifest required");
         const auto event = [&](const char* api, std::uint32_t result, const char* kind = "win32") {
             report.activation_events.push_back({api, result, kind});
         };
@@ -81,21 +109,26 @@ bool run_appmodel(const Profile& profile, Report& report, std::uint32_t timeout_
         std::string hash, error;
         if (input.value == INVALID_HANDLE_VALUE || !inventory::fingerprint(entry->path, hash, error) || hash != entry->sha256)
             return fail("package_entry_changed", "entry lock/hash verification failed: " + error);
-        GUID guid{};
-        require(CoCreateGuid(&guid), "CoCreateGuid");
-        wchar_t token[40]{};
-        if (!StringFromGUID2(guid, token, 40)) return fail("activation_nonce_failed", "GUID formatting failed");
-        const std::wstring prefix = std::wstring(L"Local\\XON-AppModel-") + token;
-        const auto make_event = [&](const wchar_t* suffix) {
-            const auto h = CreateEventW(nullptr, TRUE, FALSE, (prefix + suffix).c_str());
-            if (!h) throw std::runtime_error("CreateEventW; Win32=" + std::to_string(GetLastError()));
-            if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); throw std::runtime_error("activation event collision"); }
-            return h;
-        };
-        Handle started{make_event(L"-started")}, stop{make_event(L"-stop")}, finished{make_event(L"-finished")};
-        const auto args = std::wstring(L"--xboxone-appmodel-test=") + token;
+        const bool fixture = profile.appmodel.lifecycle == AppModelActivation::Lifecycle::owned_fixture;
+        Handle started, stop, finished;
+        std::wstring args;
+        if (fixture) {
+            GUID guid{};
+            require(CoCreateGuid(&guid), "CoCreateGuid");
+            wchar_t token[40]{};
+            if (!StringFromGUID2(guid, token, 40)) return fail("activation_nonce_failed", "GUID formatting failed");
+            const std::wstring prefix = std::wstring(L"Local\\XON-AppModel-") + token;
+            const auto make_event = [&](const wchar_t* suffix) {
+                const auto h = CreateEventW(nullptr, TRUE, FALSE, (prefix + suffix).c_str());
+                if (!h) throw std::runtime_error("CreateEventW; Win32=" + std::to_string(GetLastError()));
+                if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(h); throw std::runtime_error("activation event collision"); }
+                return h;
+            };
+            started.value = make_event(L"-started"); stop.value = make_event(L"-stop"); finished.value = make_event(L"-finished");
+            args = std::wstring(L"--xboxone-appmodel-test=") + token;
+        }
         // No CreateProcess fallback, no shell activation and no deployment.
-        if (!request_packaged_activation(application.aumid, args, report))
+        if (!request_packaged_activation(application->aumid, args, report))
             return fail("packaged_activation_failed", "official activation API failed; see HRESULT activation_events");
         report.stage = Stage::running;
         Handle process{OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, report.process_id)};
@@ -110,16 +143,18 @@ bool run_appmodel(const Profile& profile, Report& report, std::uint32_t timeout_
             return status == ERROR_SUCCESS && utf8(value.c_str()) == expected;
         };
         if (!identity(GetPackageFullName, manifest.full_name, "GetPackageFullName(process)") ||
-            !identity(GetApplicationUserModelId, application.aumid, "GetApplicationUserModelId(process)")) {
-            SetEvent(stop.value);
+            !identity(GetApplicationUserModelId, application->aumid, "GetApplicationUserModelId(process)")) {
+            if (stop.value) SetEvent(stop.value);
             return fail("activated_process_identity_mismatch", "returned PID is not the exact package/application");
         }
         wchar_t image[32768]{}; DWORD count = 32768;
         if (!QueryFullProcessImageNameW(process.value, 0, image, &count) ||
             !std::filesystem::equivalent(detail::file_path(image), detail::file_path(entry->path), ec) || ec) {
-            SetEvent(stop.value);
+            if (stop.value) SetEvent(stop.value);
             return fail("activated_process_path_mismatch", "returned PID executable differs from pinned entry");
         }
+        report.activation_identity_verified = true;
+        if (!fixture) return observe_appmodel_exit(process.value, report, timeout_ms);
         const auto began = GetTickCount64();
         auto waited = WaitForSingleObject(started.value, timeout_ms);
         event("owned_fixture_started_event", waited);
@@ -132,7 +167,7 @@ bool run_appmodel(const Profile& profile, Report& report, std::uint32_t timeout_
         event("WaitForSingleObject(process)", exited);
         if (exited != WAIT_OBJECT_0) {
             report.stage = Stage::timed_out;
-            report.diagnostics.push_back({"packaged_observation_timeout", application.id, "cooperative stop requested; process exit not observed within deadline"});
+            report.diagnostics.push_back({"packaged_observation_timeout", application->id, "cooperative stop requested; process exit not observed within deadline"});
             return false;
         }
         DWORD code = 0;
@@ -143,6 +178,7 @@ bool run_appmodel(const Profile& profile, Report& report, std::uint32_t timeout_
         if (waited != WAIT_OBJECT_0 || completed != WAIT_OBJECT_0 || code != 0)
             return fail("packaged_lifecycle_unverified", "owned lifecycle handshake/exit failed; exit=" + std::to_string(code));
         report.stage = Stage::exited;
+        report.owned_lifecycle_verified = true;
         return true;
     } catch (const std::exception& e) { return fail("appmodel_backend_failed", e.what()); }
 #endif

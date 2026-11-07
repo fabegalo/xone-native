@@ -66,9 +66,20 @@ def main():
                 r = evidence["bootstrap"]
                 calls = [e for e in r["activation_events"] if e["api"] == "IApplicationActivationManager::ActivateApplication"]
                 if (run.returncode or r["stage"] != "exited" or not r["process_id"] or r["exit_code"] != 0
+                        or not r['activation_identity_verified'] or not r['owned_lifecycle_verified']
                         or r["primary_thread_resumed"] or len(calls) != 1 or calls[0]["result"] != 0):
                     raise RuntimeError("packaged lifecycle was not verified")
                 evidence["activation_verified"] = True
+                path = profile(root, native_imports=True, lifecycle=None)
+                observed = subprocess.run([str(args.bootstrap.resolve()), 'run', str(path), '5000'],
+                                          capture_output=True, encoding='utf-8', timeout=20)
+                r = evidence['process_exit_bootstrap'] = json.loads(observed.stdout)
+                if (observed.returncode or r['stage'] != 'exited' or r['exit_code'] != 0
+                        or not r['activation_identity_verified'] or r['owned_lifecycle_verified']
+                        or r['appmodel_lifecycle'] != 'process_exit'
+                        or any(e['api'].startswith('owned_fixture') for e in r['activation_events'])):
+                    raise RuntimeError('normal packaged process observation was not verified')
+                evidence['process_exit_verified'] = True
             finally:
                 if registered:
                     clean = powershell("$p=Get-AppxPackage -Name $env:XON_TEST_PACKAGE_NAME; "
@@ -83,7 +94,7 @@ def main():
         evidence["blocker"] = str(exception)
     args.evidence.resolve().write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(evidence))
-    return 0 if evidence["activation_verified"] and evidence["cleanup_verified"] else 1
+    return 0 if evidence["activation_verified"] and evidence.get('process_exit_verified') and evidence["cleanup_verified"] else 1
 
 
 if __name__ == "__main__":

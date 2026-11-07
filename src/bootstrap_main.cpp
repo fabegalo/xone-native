@@ -29,7 +29,10 @@ void print(const xboxone::systemos::Report& r) {
     if (r.exit_code_available) std::cout << r.exit_code;
     else std::cout << "null";
     std::cout << ",\"execution_model\":\"" << escape(r.execution_model) << "\",\"activated_aumid\":\"" << escape(r.activated_aumid)
-              << "\",\"activation_events\":[";
+              << "\",\"appmodel_lifecycle\":\"" << escape(r.appmodel_lifecycle)
+              << "\",\"activation_identity_verified\":" << (r.activation_identity_verified ? "true" : "false")
+              << ",\"owned_lifecycle_verified\":" << (r.owned_lifecycle_verified ? "true" : "false")
+              << ",\"activation_events\":[";
     bool event_first = true;
     for (const auto& e : r.activation_events) {
         if (!event_first) std::cout << ',';
@@ -132,7 +135,8 @@ int main(int argc, char** argv) {
         std::cout << "SystemOS bootstrap (no renderer)\n"
                      "  xboxone-systemos prepare <manifest>\n"
                      "  xboxone-systemos run <manifest> [timeout-ms: 1..60000, default 5000]\n"
-                     "Win32 console or explicit owned packaged desktop lifecycle contract; no Xbox activation.\n"
+                     "Win32 console or audited packaged desktop contract; no Xbox activation.\n"
+                     "AppModel defaults to process_exit observation; appmodel_lifecycle owned_fixture selects the test handshake.\n"
                      "AppModel run never registers packages. Its timeout bounds observation after synchronous COM activation.\n";
         return 0;
     }

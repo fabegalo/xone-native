@@ -133,7 +133,7 @@ bool read_profile(const fs::path& path, Profile& profile, std::string& error) {
     }
     std::ifstream input(detail::file_path(path));
     std::string line;
-    bool header = false, identity = false, entry = false;
+    bool header = false, identity = false, entry = false, lifecycle = false;
     std::size_t number = 0, bytes = 0;
     Profile candidate;
     while (std::getline(input, line)) {
@@ -181,6 +181,13 @@ bool read_profile(const fs::path& path, Profile& profile, std::string& error) {
             row >> std::quoted(candidate.appmodel.manifest) >> std::quoted(candidate.appmodel.application_id)
                 >> std::quoted(candidate.appmodel.evidence);
             valid = !candidate.appmodel.manifest.empty();
+        } else if (command == "appmodel_lifecycle" && !lifecycle) {
+            std::string value;
+            row >> value;
+            valid = value == "process_exit" || value == "owned_fixture";
+            candidate.appmodel.lifecycle = value == "owned_fixture" ?
+                AppModelActivation::Lifecycle::owned_fixture : AppModelActivation::Lifecycle::process_exit;
+            lifecycle = true;
         } else if (command == "package_bind") {
             PackageBinding b;
             row >> std::quoted(b.requester) >> std::quoted(b.name) >> std::quoted(b.provider) >> std::quoted(b.evidence);
@@ -191,7 +198,7 @@ bool read_profile(const fs::path& path, Profile& profile, std::string& error) {
         if (row >> extra) valid = false;
         if (!valid) { error = "invalid manifest record at line " + std::to_string(number); return false; }
     }
-    if (input.bad() || !header || !identity || !entry) {
+    if (input.bad() || !header || !identity || !entry || (lifecycle && candidate.appmodel.manifest.empty())) {
         error = "incomplete manifest (header, profile and entry required)";
         return false;
     }
@@ -212,6 +219,8 @@ bool Session::prepare(const Profile& profile) {
     report_.source_sha256 = profile.source_sha256;
     const bool packaged = !profile.appmodel.manifest.empty();
     report_.execution_model = packaged ? "appmodel" : "win32";
+    if (packaged) report_.appmodel_lifecycle = profile.appmodel.lifecycle == AppModelActivation::Lifecycle::owned_fixture ?
+        "owned_fixture" : "process_exit";
     if (!token(profile.id) || profile.version.empty() || !digest(profile.source_sha256) ||
         (profile.origin != Origin::synthetic && profile.origin != Origin::original))
         block(report_, "invalid_identity", profile.id, "profile id, exact revision and source SHA-256 are required");

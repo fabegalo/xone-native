@@ -17,6 +17,25 @@ else()
     target_compile_options(xboxone_inspection PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(xboxone_presentation STATIC
+    src/presentation.cpp
+    src/presentation_d3d12.cpp
+    src/frame_pipe.cpp
+)
+target_include_directories(xboxone_presentation PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_compile_features(xboxone_presentation PUBLIC cxx_std_20)
+target_link_libraries(xboxone_presentation PRIVATE xboxone_inspection)
+if(MSVC)
+    target_compile_options(xboxone_presentation PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(xboxone_presentation PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+if(WIN32)
+    target_link_libraries(xboxone_presentation PRIVATE user32 d3d12 dxgi dxguid ole32)
+endif()
+
 add_executable(xboxone-native src/main.cpp)
 target_link_libraries(xboxone-native PRIVATE xboxone_inspection)
 
@@ -29,6 +48,16 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     target_include_directories(xboxone_inventory_tests PRIVATE src)
     target_link_libraries(xboxone_inventory_tests PRIVATE xboxone_inspection)
     add_test(NAME inventory_regressions COMMAND xboxone_inventory_tests)
+    add_executable(xboxone_presentation_tests tests/presentation_tests.cpp)
+    target_link_libraries(xboxone_presentation_tests PRIVATE xboxone_presentation)
+    add_test(NAME presentation_regressions COMMAND xboxone_presentation_tests)
+    if(WIN32)
+        add_executable(xboxone_frame_pipe_tests tests/frame_pipe_tests.cpp)
+        target_include_directories(xboxone_frame_pipe_tests PRIVATE src)
+        target_link_libraries(xboxone_frame_pipe_tests PRIVATE xboxone_presentation xboxone_inspection)
+        add_test(NAME frame_pipe_regressions COMMAND xboxone_frame_pipe_tests)
+        set_tests_properties(frame_pipe_regressions PROPERTIES TIMEOUT 45 LABELS "windows;synthetic;no-deployment")
+    endif()
     add_test(NAME cli_help COMMAND xboxone-native --help)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)

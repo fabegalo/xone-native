@@ -63,6 +63,25 @@ class AppModel(unittest.TestCase):
         self.assertEqual(r["activation_events"], [])
         self.assertTrue(any(d["kind"] == "appx_resource" and d["status"] == "pinned_resource_verified" for d in r["dependencies"]))
 
+    def test_explicit_and_default_observation_contracts(self):
+        for lifecycle in (None, 'process_exit', 'owned_fixture'):
+            status, r = self.prepare(lifecycle=lifecycle)
+            self.assertEqual(status, 0, r)
+            self.assertEqual(r['appmodel_lifecycle'], lifecycle or 'process_exit')
+            self.assertFalse(r['activation_identity_verified'])
+            self.assertFalse(r['owned_lifecycle_verified'])
+        for extra in (['appmodel_lifecycle unknown'],
+                      ['appmodel_lifecycle process_exit', 'appmodel_lifecycle owned_fixture']):
+            p = profile(self.root, lifecycle=None, extra=extra)
+            run = subprocess.run([str(CLI), 'prepare', str(p)], capture_output=True, encoding='utf-8', timeout=10)
+            self.assertEqual(run.returncode, 2, run.stdout)
+            self.assertIn('invalid manifest record', run.stderr)
+        p = profile(self.root)
+        text = '\n'.join(line for line in p.read_text(encoding='utf-8').splitlines() if not line.startswith('appmodel '))
+        p.write_text(text + '\n', encoding='utf-8')
+        run = subprocess.run([str(CLI), 'prepare', str(p)], capture_output=True, encoding='utf-8', timeout=10)
+        self.assertEqual(run.returncode, 2)
+
     def test_deep_package_path_without_deployment(self):
         owned = Path("\\\\?\\" + str(self.root)) / "long-package-fixture"
         deep = owned

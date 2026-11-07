@@ -13,6 +13,9 @@ void reject(Report& r, std::string code, std::string subject, std::string detail
 }
 void prepare_appmodel(const Profile& profile, Report& report) {
     const auto& activation = profile.appmodel;
+    if (activation.lifecycle != AppModelActivation::Lifecycle::process_exit &&
+        activation.lifecycle != AppModelActivation::Lifecycle::owned_fixture)
+        reject(report, "appmodel_lifecycle_invalid", activation.manifest, "unknown observation contract");
     if (activation.application_id.empty() || activation.evidence.empty())
         reject(report, "appmodel_selection_invalid", activation.manifest, "application ID and audited activation evidence required");
     std::map<std::string, const DependencyNode*> nodes;

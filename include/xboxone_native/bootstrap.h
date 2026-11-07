@@ -42,6 +42,9 @@ struct AppModelActivation {
     std::string manifest; // Exact resource artifact ID, never a directory search.
     std::string application_id;
     std::string evidence;
+    // Normal applications are observed without requiring our test handshake.
+    enum class Lifecycle { process_exit, owned_fixture };
+    Lifecycle lifecycle = Lifecycle::process_exit;
 };
 struct PackageBinding {
     std::string requester, name, provider, evidence; // All manifest artifact IDs explicit.
@@ -110,6 +113,9 @@ struct Report {
     };
     std::vector<ActivationEvent> activation_events;
     std::string activated_aumid;
+    std::string appmodel_lifecycle;
+    bool activation_identity_verified = false;
+    bool owned_lifecycle_verified = false;
     // Exit is not proof of app initialization, authentic rendering or dashboard boot.
 };
 

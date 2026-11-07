@@ -1,5 +1,11 @@
 # STATUS — xboxone-native
 
+## 2026-11-07 — AppModel e ponte gráfica: contratos independentes de originais
+
+- AppModel observa saída normal sem handshake obrigatório; `appmodel_lifecycle owned_fixture` mantém o protocolo de teste explícito. Preservadas as verificações de registro, pacote/AUMID, caminho e hash, sem fallback Win32. JSON distingue identidade de ativação e lifecycle da fixture; timeout normal não encerra o processo do broker.
+- `FramePipe` Windows desktop conecta um produtor identificado ao `Presenter` existente por pipe local, com pixels RGBA/BGRA, padding, sequência, limite de 64 MiB, confirmação de recebimento e I/O cancelável. Frames recebidos permanecem externos, sem certificação SystemOS. Transporte GPU compartilhado e integração automática AppModel→ponte continuam pendentes.
+- Build nova Windows x64/MSVC Release e dez grupos CTest afetados aprovados; um caso AppModel de symlink ignorado por falta de privilégio. Evidência, uso e limites em [M1-STATUS.md](docs/M1-STATUS.md). Nenhum deployment no host, original executado, frame Xbox ou ganho de desempenho demonstrado.
+
 ## 2026-11-07 — Gaming Services: contexto correto e recusa real do XVD
 
 - Resolvida a falha de carregamento `xsapi.dll`: sua regra de execução é condicionada à identidade Gaming Services. O comando Microsoft `Invoke-CommandInDesktopPackage` permite carregar o provedor instalado sem mudar ACL, políticas ou registro de pacotes. Token administrativo sozinho não bastava.

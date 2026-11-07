@@ -1,5 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Independent bootstrap; deliberately has no dependency on presentation code.
+add_library(xboxone_compatibility STATIC ${PROJECT_SOURCE_DIR}/src/compatibility.cpp)
+target_include_directories(xboxone_compatibility PUBLIC ${PROJECT_SOURCE_DIR}/include)
+target_compile_features(xboxone_compatibility PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_options(xboxone_compatibility PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(xboxone_compatibility PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_library(xboxone_systemos STATIC ${PROJECT_SOURCE_DIR}/src/bootstrap.cpp)
 target_sources(xboxone_systemos PRIVATE
     ${PROJECT_SOURCE_DIR}/src/appmodel_manifest.cpp
@@ -8,7 +17,7 @@ target_sources(xboxone_systemos PRIVATE
 if(WIN32)
     target_link_libraries(xboxone_systemos PRIVATE ole32 shlwapi xmllite uuid)
 endif()
-target_link_libraries(xboxone_systemos PUBLIC xboxone_inspection)
+target_link_libraries(xboxone_systemos PUBLIC xboxone_inspection xboxone_compatibility)
 target_compile_features(xboxone_systemos PUBLIC cxx_std_20)
 if(MSVC)
     target_compile_options(xboxone_systemos PRIVATE /W4 /permissive-)

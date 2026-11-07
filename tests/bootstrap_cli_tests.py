@@ -185,13 +185,17 @@ class BootstrapCLI(unittest.TestCase):
         self.assertEqual(self.run_cli("prepare", self.profile).returncode, 2)
 
     def test_unknown_service_does_not_succeed(self):
-        with self.profile.open("a", encoding="utf-8") as out:
-            out.write('service "test-broker" xbox_broker "synthetic missing contract"\n')
-        result = self.run_cli("run", self.profile)
-        self.assertEqual(result.returncode, 1)
-        report = json.loads(result.stdout)
-        self.assertEqual(report["process_id"], 0)
-        self.assertIn("service_adapter_missing", [d["code"] for d in report["diagnostics"]])
+        original = self.profile.read_text(encoding="utf-8")
+        for kind in ("nt_kernel", "xbox_device", "xbox_broker", "winrt_activation", "compositor", "storage"):
+            with self.subTest(kind=kind):
+                self.profile.write_text(original + f'service "test-service" {kind} "synthetic missing contract"\n', encoding="utf-8")
+                result = self.run_cli("run", self.profile)
+                self.assertEqual(result.returncode, 1)
+                report = json.loads(result.stdout)
+                self.assertEqual(report["process_id"], 0)
+                diagnostic = next(d for d in report["diagnostics"] if d["code"] == "service_adapter_missing")
+                self.assertIn("SystemOS", diagnostic["detail"])
+                self.assertIn("synthetic missing contract", diagnostic["detail"])
 
 
 if __name__ == "__main__":

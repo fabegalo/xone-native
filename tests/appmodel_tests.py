@@ -151,7 +151,9 @@ class AppModel(unittest.TestCase):
                 self.manifest.write_text(original.replace(old, new), encoding="utf-8")
                 self.rejected(code)
         self.manifest.write_text(original, encoding="utf-8")
-        self.rejected("service_adapter_missing", extra=['service "xbox-contract" xbox_broker "no Xbox broker adapter"'])
+        for kind in ("nt_kernel", "xbox_device", "xbox_broker", "winrt_activation", "compositor", "storage"):
+            with self.subTest(service=kind):
+                self.rejected("service_adapter_missing", extra=[f'service "xbox-contract" {kind} "no Xbox service adapter"'])
 
     def dependency(self, name="XboxOneNative.Dependency", version="1.0.0.0"):
         self.edit('</Dependencies>', f'<PackageDependency Name="{name}" Publisher="CN=XboxOneNative.OwnedTest" MinVersion="{version}"/></Dependencies>')

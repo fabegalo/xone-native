@@ -47,17 +47,6 @@ void block(Report& r, std::string code, std::string subject, std::string detail)
     r.stage = Stage::blocked;
 }
 
-bool service_kind(std::string_view s, ServiceKind& out) {
-    if (s == "nt_kernel") out = ServiceKind::nt_kernel;
-    else if (s == "xbox_device") out = ServiceKind::xbox_device;
-    else if (s == "xbox_broker") out = ServiceKind::xbox_broker;
-    else if (s == "winrt_activation") out = ServiceKind::winrt_activation;
-    else if (s == "compositor") out = ServiceKind::compositor;
-    else if (s == "storage") out = ServiceKind::storage;
-    else return false;
-    return true;
-}
-
 bool role_value(std::string_view s, Role& out) {
     if (s == "executable") out = Role::executable;
     else if (s == "module") out = Role::module;
@@ -175,7 +164,7 @@ bool read_profile(const fs::path& path, Profile& profile, std::string& error) {
             ServiceRequirement s;
             std::string kind;
             row >> std::quoted(s.id) >> kind >> std::quoted(s.evidence);
-            valid = service_kind(kind, s.kind);
+            valid = compatibility::parse_service_kind(kind, s.kind);
             candidate.services.push_back(std::move(s));
         } else if (command == "appmodel" && candidate.appmodel.manifest.empty()) {
             row >> std::quoted(candidate.appmodel.manifest) >> std::quoted(candidate.appmodel.application_id)
@@ -308,7 +297,7 @@ bool Session::prepare(const Profile& profile) {
         node.pe = image.pe;
         const auto& pe = image.pe;
         if (pe.subsystem == 1 || (pe.characteristics & 0x1000))
-            block(report_, "needs_nt_kernel", a.id, "native subsystem/system image requires an isolated kernel backend evaluation");
+            block(report_, "needs_nt_kernel", a.id, "native subsystem/system image needs an unimplemented kernel contract; execution backend undecided");
         else if (pe.subsystem != 3 && !(packaged && pe.subsystem == 2))
             block(report_, "activation_model_unsupported", a.id, "only audited Win32 console activation is implemented");
         if (pe.has_delay_imports)
@@ -447,19 +436,8 @@ bool Session::prepare(const Profile& profile) {
     for (const auto& s : profile.services) {
         if (!token(s.id) || !service_ids.insert(s.id).second || s.evidence.empty())
             block(report_, "invalid_service", s.id, "unique service id and dependency evidence required");
-        switch (s.kind) {
-            case ServiceKind::nt_kernel:
-            case ServiceKind::xbox_device:
-                block(report_, "isolated_backend_required_for_evaluation", s.id, s.evidence);
-                break;
-            case ServiceKind::xbox_broker:
-            case ServiceKind::winrt_activation:
-            case ServiceKind::compositor:
-            case ServiceKind::storage:
-                block(report_, "service_adapter_missing", s.id, s.evidence);
-                break;
-            default: block(report_, "invalid_service_kind", s.id, "unknown contract"); break;
-        }
+        const auto diagnostic = compatibility::service_blocker(compatibility::Domain::systemos, s);
+        block(report_, diagnostic.code, s.id, diagnostic.detail);
     }
     if (!native_host())
         block(report_, "native_backend_unavailable", profile.id, "execution implemented only for native Windows AMD64");

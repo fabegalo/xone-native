@@ -2,6 +2,7 @@
 #pragma once
 #include "xboxone_native/inspection.h"
 #include "xboxone_native/appmodel.h"
+#include "xboxone_native/compatibility.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +14,8 @@ namespace xboxone::systemos {
 enum class Origin { synthetic, original }; // Declaration, not publisher authentication.
 enum class Role { executable, module, resource, container };
 enum class Stage { empty, blocked, prepared, process_created, running, exited, timed_out, failed };
-enum class ServiceKind { nt_kernel, xbox_device, xbox_broker, winrt_activation, compositor, storage };
+using compatibility::ServiceKind;
+using compatibility::ServiceRequirement;
 
 struct Artifact {
     std::string id;
@@ -30,12 +32,6 @@ struct ImportBinding {
     // "host:kernel32" or "artifact:<exact manifest id>". Never auto-selected by name.
     std::string provider;
     std::string evidence; // Audited compatibility decision, not inferred from a DLL name.
-};
-
-struct ServiceRequirement {
-    std::string id;
-    ServiceKind kind = ServiceKind::xbox_broker;
-    std::string evidence; // Actual observed dependency; no guessed services.
 };
 
 struct AppModelActivation {

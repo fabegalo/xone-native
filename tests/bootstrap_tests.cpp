@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -72,6 +73,21 @@ Profile profile(const fs::path& path) {
     return p;
 }
 void structural() {
+    namespace compat = xboxone::compatibility;
+    for (const auto& [domain, name] : std::vector<std::pair<compat::Domain, std::string>>{
+             {compat::Domain::hostos, "HostOS"}, {compat::Domain::systemos, "SystemOS"},
+             {compat::Domain::gameos_era, "GameOS/ERA"}, {compat::Domain::gamecore, "GameCore"}}) {
+        const auto diagnostic = compat::service_blocker(domain,
+            {"observed-service", ServiceKind::nt_kernel, "owned dependency evidence"});
+        check(diagnostic.code == "service_adapter_missing", "no domain implies a working service provider");
+        check(diagnostic.detail.starts_with(name + " service"), "contract domain retained in diagnostic");
+        check(diagnostic.detail.ends_with("owned dependency evidence"), "dependency evidence retained");
+    }
+    check(compat::service_blocker(static_cast<compat::Domain>(100), {}).code == "invalid_service_domain",
+          "unknown contract domain rejected");
+    auto kind = ServiceKind::storage;
+    check(!compat::parse_service_kind("unknown", kind) && kind == ServiceKind::storage,
+          "unknown service name rejected without changing output");
     Temporary temp;
     const auto path = temp.root / "entry.exe";
     const auto bytes = image();
@@ -100,12 +116,30 @@ void structural() {
     reject(p, "ambiguous_path");
     p = base; p.artifacts[0].role = static_cast<Role>(100); reject(p, "invalid_role");
     p = base; p.imports.push_back({"entry", "other.dll", "host:kernel32", "explicit"}); reject(p, "unused_binding");
-    p = base; p.services.push_back({"xvio-test", ServiceKind::xbox_device, "synthetic dependency requirement"});
-    reject(p, "isolated_backend_required_for_evaluation");
-    p = base; p.services.push_back({"winrt-test", ServiceKind::winrt_activation, "synthetic activation requirement"});
-    reject(p, "service_adapter_missing");
+    for (const auto kind : {ServiceKind::nt_kernel, ServiceKind::xbox_device,
+                           ServiceKind::xbox_broker, ServiceKind::winrt_activation,
+                           ServiceKind::compositor, ServiceKind::storage}) {
+        p = base; p.services.push_back({"service-test", kind, "synthetic dependency requirement"});
+        reject(p, "service_adapter_missing");
+        Session blocked;
+        blocked.prepare(p);
+        check(!has(blocked, "isolated_backend_required_for_evaluation"),
+              "a service requirement does not select a VM backend");
+    }
+    p = base; p.services.push_back({"invalid-kind", static_cast<ServiceKind>(100), "owned test"});
+    reject(p, "invalid_service_kind");
+    p = base; p.services.push_back({"missing-evidence", ServiceKind::storage, ""});
+    reject(p, "invalid_service");
+    p = base; p.services.push_back({"duplicate", ServiceKind::storage, "owned test"});
+    p.services.push_back(p.services.front()); reject(p, "invalid_service");
     auto changed = bytes;
     put(changed, 0xdc, 1, 2); write(path, changed); reject(profile(path), "needs_nt_kernel");
+    Session kernel_image;
+    kernel_image.prepare(profile(path));
+    check(std::any_of(kernel_image.report().diagnostics.begin(), kernel_image.report().diagnostics.end(),
+                     [](const auto& d) { return d.code == "needs_nt_kernel" &&
+                         d.detail.find("backend undecided") != std::string::npos; }),
+          "native subsystem does not choose an isolated execution backend");
     changed = bytes; put(changed, 0x96, 0x2002, 2); write(path, changed); reject(profile(path), "entry_not_executable");
     changed = bytes; put(changed, 0x170, 0x20c0); put(changed, 0x174, 64);
     put(changed, 0x2c0, 1); put(changed, 0x2c4, 0x2080);

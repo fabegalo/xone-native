@@ -82,3 +82,13 @@ O JSON de diagnóstico está em saída de build ignorada, sem nova cópia de evi
 ## Encerramento da infraestrutura M0 solicitada
 
 Inventário, estudo OSU1/2/3 e pré-checagem foram publicados diretamente na `main` em `7307692`, com originais e hashes preservados. O avanço executável posterior e seus bloqueios pertencem a [M1-STATUS.md](M1-STATUS.md); isso não converte a identificação M0 em boot original.
+
+## Backend de apresentação Windows x64 (`xboxone_presentation`)
+
+Implementado para preparar o caminho de exibição sem depender do carregador de SystemOS e sem simular a dashboard:
+
+- **Arquivos:** `include/xboxone_native/presentation.h`, `src/presentation_backend.h`, `src/presentation.cpp`, `src/presentation_d3d12.cpp` e `tests/presentation_tests.cpp`.
+- **Execução real D3D12 + Win32:** janela `HWND` com ciclo de vida explícito (`initialize`, `pump_messages`, `resize`, `present_frame`, `wait_for_gpu`, `recover_swapchain`, `close_window`, `shutdown`), swapchain flip-model (`IDXGISwapChain3`), alocadores de comando por backbuffer, sincronização CPU/GPU via `ID3D12Fence` e buffer de upload persistente alinhado a `D3D12_TEXTURE_DATA_PITCH_ALIGNMENT` (256 bytes).
+- **Prevenção de falso boot:** quadros de teste usam `FrameOrigin::synthetic_test`, rotulam a janela como `[SYNTHETIC TEST - NOT SYSTEMOS]` e nunca incrementam `authentic_systemos_frames`. Quadros ou superfícies `FrameOrigin::systemos_component` são rejeitados se não trouxerem `component_id`, SHA-256 de 64 dígitos hexadecimais e `system_version_raw` não nulo.
+- **Interfaces futuras:** `BackendKind::vulkan` e `BackendKind::metal` compartilham o mesmo contrato C++20 e falham com diagnóstico explícito enquanto seus backends nativos não forem implementados.
+- **Validação focada:** compilado apenas `xboxone_presentation_tests` (`MSVC 19.44.35207` x64) e executado `ctest --test-dir build-checked -R "^presentation_regressions$" --output-on-failure -V`, aprovando **109 verificações** em `NVIDIA GeForce RTX 4070` (`software=false`) e no adaptador `WARP` (`software=true`), com readback da backbuffer D3D12 comprovando integridade pixel a pixel.

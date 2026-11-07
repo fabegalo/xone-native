@@ -38,6 +38,16 @@ Identificar **um componente original do Xbox One já legível por acesso autoriz
 3. Aplicar o grafo PE já implementado ao conjunto legível. Auditar o mapeamento exato de API Sets da revisão e interpretar seus metadados reais de pacote/WinRT/SxS. O parser preserva RT_MANIFEST/RT_VERSION e marca CLR/TLS; não resolve classes WinRT, schemas API Set, manifestos externos, serviços, assets ou comunicação com HostOS automaticamente.
 4. Usar `xboxone-systemos prepare <manifesto>` para registrar dependências ausentes ou não implementadas. O backend atual aceita só EXE Win32 console com kernel32 auditado; imports privados/atrasados, WinRT, serviços, kernel NT e dispositivos exigem trabalho específico. Não escolher outro arquivo/OSU por basename.
 5. Estender somente o contrato observado, com teste próprio. Quando kernel/dispositivo for indispensável, registrar símbolo/serviço/IOCTL e avaliar backend isolado. Só executar `run` após auditoria de ativação e dependências; saída 0 sozinha não prova inicialização original.
+6. Conectar a superfície gráfica produzida pelo componente original de SystemOS ao `xboxone::presentation::Presenter` através de `SystemOsSurfaceHandoffDesc` / `ExternalFrameView` com `FrameOrigin::systemos_component`, informando o SHA-256 verificado do executável e a revisão `system_version_raw` do perfil isolado correspondente.
+
+## Caminho técnico para conectar a saída gráfica real do SystemOS
+
+1. **Identidade e isolamento prévios:** o perfil de SystemOS precisa validar o componente original legível e seus recursos da mesma revisão, preenchendo `FrameProvenance` (`origin = FrameOrigin::systemos_component`, `component_id`, `component_sha256` de 64 caracteres hexadecimais e `system_version_raw != 0`).
+2. **Interceptação/ponte de composição do SystemOS:** quando o contrato real de composição/swapchain do shell original (`dcomp` / `dxgi` / `d3d11.x` / `d3d12` do SystemOS) for mapeado a partir dos imports reais do binário legível, o adaptador de composição capturará a superfície final produzida pelo componente original.
+3. **Entrega ao `Presenter`:**
+   - **Estágio inicial (staging verificado):** mapear a superfície produzida pelo componente original para `ExternalFrameView` (`bgra8_unorm` ou `rgba8_unorm`, respeitando `row_pitch_bytes`) e submeter a `Presenter::present_frame`.
+   - **Estágio direto na GPU:** usar o contrato `SystemOsSurfaceHandoffDesc` (`SurfaceHandleKind::d3d12_resource` ou `dxgi_shared_handle`) para copiar/apresentar diretamente a textura na fila D3D12 sem cópia intermediária pela CPU.
+4. **Critério de primeira imagem autêntica:** somente quando `stats().authentic_systemos_frames > 0` for produzido por execução real do componente original autorizado, com log, hash verificável e captura correspondente. Testes sintéticos (`synthetic_frames`) permanecem estritamente separados.
 
 ## Critérios de conclusão
 

@@ -53,6 +53,14 @@
 - Evidência local: `build-m1/m1-bootstrap-evidence.json` registra PID real, retomada da thread, `stage=exited`, `exit_code=0`, origem sintética e **zero frames autênticos**. O componente verificou memória/proteção e uma thread real. Nenhum executável original SystemOS estava legível; não houve tentativa de executar conteúdo criptografado ou alegação de dashboard inicializada.
 - Contrato de entrega ao backend gráfico paralelo, limitações e dependências: [docs/M1-STATUS.md](docs/M1-STATUS.md). Código gráfico concorrente preservado. Próxima etapa: [docs/NEXT-TASK.md](docs/NEXT-TASK.md). Nenhuma Release publicada.
 
+## 2026-11-04 — Camada `Presentation` C++20 (Win32 + Direct3D 12) e contrato de saída gráfica
+
+- Biblioteca `xboxone_presentation` (`include/xboxone_native/presentation.h`, `src/presentation.cpp`, `src/presentation_d3d12.cpp`) implementada em C++20 para Windows x64, sem dependências externas além do Windows SDK (`user32`, `d3d12`, `dxgi`, `dxguid`).
+- Ciclo de vida completo: criação/destruição de janela Win32, bomba de mensagens não bloqueante, seleção de adaptador Direct3D 12 (hardware com fallback opcional para WARP), fila de comandos, alocadores por frame, sincronização por `ID3D12Fence`, `IDXGISwapChain3` (`DXGI_SWAP_EFFECT_FLIP_DISCARD`), `ResizeBuffers`, reconstrução de swapchain (`recover_swapchain`) e upload de buffers externos (`rgba8_unorm` e `bgra8_unorm`, com `row_pitch_bytes` compacto ou alinhado) sem realocação por frame em regime estável.
+- Isolamento de proveniência (`FrameOrigin::synthetic_test`, `external_host_buffer`, `systemos_component`): quadros sintéticos e buffers externos prefixam a janela com `[SYNTHETIC TEST - NOT SYSTEMOS]` e mantêm `authentic_systemos_frames = 0`. A origem `systemos_component` e o descritor `SystemOsSurfaceHandoffDesc` exigem SHA-256 hexadecimal de 64 caracteres e revisão bruta não nula.
+- Interfaces `BackendKind::vulkan` e `BackendKind::metal` preparadas na mesma fachada C++20; retornam erro explícito de backend ainda não implementado, sem stubs de sucesso falso.
+- Validação focada no Windows x64 (`MSVC 19.44.35207`, GPU `NVIDIA GeForce RTX 4070` e validação adicional em `WARP`): `ctest --test-dir build-checked -R "^presentation_regressions$" --output-on-failure` aprovou **109 verificações** (inicialização, apresentação sintética com readback real da backbuffer na GPU, conversão `BGRA8 -> RGBA8`, `row_pitch_bytes` com padding, múltiplos resizes, rejeição e recuperação de erros, fechamento de janela e reinicialização). **Nenhum componente original do SystemOS foi executado; o teste é estritamente sintético.**
+
 ## 2026-11-04 — M0 retomado: OSUs separados por alvo e pré-checagem SystemOS
 
 - **Manter OSU1, OSU2 e OSU3.** OSU1 contém candidatos Xbox One e componentes Scarlett; OSU2/OSU3 são bases históricas do Xbox One original. Nenhum ZIP fornecido foi identificado como exclusivamente de outro console. `ScarlettHost.xvd` foi excluído da seleção SystemOS/One, sem apagar ou reempacotar o OSU1. A classificação usa o papel OSU registrado e o layout observado, não autenticação Microsoft.
@@ -82,6 +90,6 @@
 
 Para alcançar a primeira imagem autêntica, são necessários um componente original do SystemOS **legalmente legível** e seus recursos da mesma versão, mais um mapa de dependências (PE/WinRT/NT, pacote, composição, broker e dispositivos). O XVD reconhecido pelo inspetor não fornece esses componentes automaticamente.
 
-**Próximo incremento:** [docs/NEXT-TASK.md](docs/NEXT-TASK.md). O diagnóstico por pacote e as referências SystemOS já existem. Falta um conjunto original legível para identificar o shell, fixar seu manifesto por versão e mapear PE/WinRT/NT, recursos e dispositivos. A pré-checagem retorna bloqueio explícito; não simula a dashboard.
+**Próximo incremento:** [docs/NEXT-TASK.md](docs/NEXT-TASK.md). O diagnóstico por pacote, as referências SystemOS e o backend de apresentação Windows x64 (`xboxone_presentation`) já existem. Falta um conjunto original legível para identificar o shell, fixar seu manifesto por versão, mapear PE/WinRT/NT/recursos/dispositivos e entregar sua superfície gráfica verificada ao `Presenter`. A pré-checagem retorna bloqueio explícito; não simula a dashboard.
 
-**Regra de leitura:** status acima é evidência de ferramentas de inspeção, não compatibilidade de software Xbox One. Toda nova afirmação de boot, imagem ou jogabilidade precisa de teste real e versão/hash identificados.
+**Regra de leitura:** status acima é evidência de ferramentas de inspeção e infraestrutura gráfica sintética, não compatibilidade de software Xbox One. Toda nova afirmação de boot, imagem ou jogabilidade precisa de teste real e versão/hash identificados.

@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // WinRT activation boundary of the title. The title's C++/CX runtime (host
 // vccorlib140) resolves classes through RoGetActivationFactory; that import is
-// redirected here so title activations are observable and, later, served by
-// title implementations of Xbox classes. Today every request is forwarded to
-// the host and its real result is returned and logged.
+// redirected here. Classes the title layer implements are served here; every
+// other request is forwarded to the host and its real result returned. Every
+// activation is logged.
 #include "xboxone_native/era_loader.h"
+#include "era_winrt_classes.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -12,12 +13,21 @@
 #include <winstring.h>
 
 #include <cstring>
+#include <string_view>
 
 namespace xboxone::era {
 namespace {
 
 using GetFactory = HRESULT(WINAPI*)(HSTRING, REFIID, void**);
 GetFactory host_get_factory = nullptr;
+
+struct TitleClass {
+    std::wstring_view name;
+    HRESULT (*factory)(REFIID, void**);
+};
+constexpr TitleClass title_classes[]{
+    {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
+};
 
 void note(const wchar_t* text) {
     char line[600];
@@ -27,10 +37,14 @@ void note(const wchar_t* text) {
 }
 
 HRESULT WINAPI era_RoGetActivationFactory(HSTRING class_id, REFIID iid, void** factory) {
-    const HRESULT hr = host_get_factory(class_id, iid, factory);
+    const HRESULT hr = get_title_activation_factory(class_id, iid, factory);
+    UINT32 length = 0;
+    const wchar_t* name = WindowsGetStringRawBuffer(class_id, &length);
+    bool served = false;
+    for (const auto& c : title_classes) served = served || c.name == std::wstring_view(name, length);
     wchar_t line[400];
-    wsprintfW(line, L"xone-era: activation %ls -> 0x%08lX\n", WindowsGetStringRawBuffer(class_id, nullptr),
-              static_cast<unsigned long>(hr));
+    wsprintfW(line, L"xone-era: activation %ls -> 0x%08lX%ls\n", name, static_cast<unsigned long>(hr),
+              served ? L" (title layer)" : L"");
     note(line);
     return hr;
 }
@@ -44,6 +58,17 @@ bool ascii_prefix(const char* text, const char* prefix) {
 }
 
 } // namespace
+
+HRESULT get_title_activation_factory(HSTRING class_id, REFIID iid, void** factory) {
+    if (!factory) return E_POINTER;
+    *factory = nullptr;
+    UINT32 length = 0;
+    const wchar_t* name = WindowsGetStringRawBuffer(class_id, &length);
+    for (const auto& c : title_classes)
+        if (c.name == std::wstring_view(name, length)) return c.factory(iid, factory);
+    if (!host_get_factory) return RoGetActivationFactory(class_id, iid, factory);
+    return host_get_factory(class_id, iid, factory);
+}
 
 bool hook_winrt_activation(void* module_base) {
     auto* base = static_cast<std::uint8_t*>(module_base);

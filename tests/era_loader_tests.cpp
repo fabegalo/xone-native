@@ -7,6 +7,9 @@
 #include <evntprov.h>
 #include <d3dcommon.h>
 #include <dxgi.h>
+#include <activation.h>
+#include <roapi.h>
+#include <winstring.h>
 
 #include <fstream>
 #include <string>
@@ -224,6 +227,71 @@ int main(int argc, char** argv) {
               DXGI_ERROR_UNSUPPORTED && !device, "unsupported driver type rejected");
     }
 
+    {
+        // WinRT title layer: XboxLiveConfiguration from a synthetic package manifest.
+        check(SUCCEEDED(RoInitialize(RO_INIT_MULTITHREADED)), "WinRT initialized");
+        wchar_t temp[MAX_PATH];
+        GetTempPathW(MAX_PATH, temp);
+        const std::wstring package = std::wstring(temp) + L"xone-era-package-" + std::to_wstring(GetCurrentProcessId());
+        const std::wstring manifest = package + L"\\AppxManifest.xml";
+        CreateDirectoryW(package.c_str(), nullptr);
+        {
+            std::ofstream out(manifest, std::ios::binary);
+            out << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                   "<Package xmlns=\"http://schemas.microsoft.com/appx/2010/manifest\" "
+                   "xmlns:mx=\"http://schemas.microsoft.com/appx/2013/xbox/manifest\">"
+                   "<Extensions><mx:Extension Category=\"xbox.live\">"
+                   "<mx:XboxLive TitleId=\"0000F00D\" PrimaryServiceConfigId=\"00000000-1111-2222-3333-44440000f00d\"/>"
+                   "</mx:Extension></Extensions></Package>";
+        }
+        set_title_package_root(package);
+        struct __declspec(uuid("00193376-6a84-4c67-84a5-3b8a8aaea712")) Statics : IInspectable {
+            virtual HRESULT STDMETHODCALLTYPE get_TitleId(HSTRING*) = 0;
+            virtual HRESULT STDMETHODCALLTYPE get_PrimaryServiceConfigId(HSTRING*) = 0;
+            virtual HRESULT STDMETHODCALLTYPE get_SandboxId(HSTRING*) = 0;
+        };
+        const auto text = [](HSTRING s) {
+            std::wstring v = WindowsGetStringRawBuffer(s, nullptr);
+            WindowsDeleteString(s);
+            return v;
+        };
+        const auto activate = [](const wchar_t* name, REFIID iid, void** out) {
+            HSTRING id = nullptr;
+            WindowsCreateString(name, static_cast<UINT32>(wcslen(name)), &id);
+            const HRESULT hr = get_title_activation_factory(id, iid, out);
+            WindowsDeleteString(id);
+            return hr;
+        };
+        Statics* statics = nullptr;
+        check(activate(L"Windows.Xbox.Services.XboxLiveConfiguration", __uuidof(Statics),
+                       reinterpret_cast<void**>(&statics)) == S_OK && statics, "XboxLiveConfiguration served by title layer");
+        if (statics) {
+            HSTRING value = nullptr;
+            check(statics->get_TitleId(&value) == S_OK && text(value) == L"0000F00D", "TitleId read from package manifest");
+            check(statics->get_PrimaryServiceConfigId(&value) == S_OK &&
+                  text(value) == L"00000000-1111-2222-3333-44440000f00d", "PrimaryServiceConfigId read from package manifest");
+            check(statics->get_SandboxId(&value) == S_OK && text(value) == L"RETAIL", "retail sandbox");
+            check(statics->GetRuntimeClassName(&value) == S_OK &&
+                  text(value) == L"Windows.Xbox.Services.XboxLiveConfiguration", "runtime class name");
+            IActivationFactory* factory = nullptr;
+            check(statics->QueryInterface(__uuidof(IActivationFactory), reinterpret_cast<void**>(&factory)) == S_OK,
+                  "factory answers IActivationFactory");
+            IInspectable* instance = reinterpret_cast<IInspectable*>(1);
+            check(factory && factory->ActivateInstance(&instance) == E_NOTIMPL && !instance, "static class has no instances");
+            statics->Release();
+            if (factory) factory->Release();
+        }
+        IActivationFactory* host = nullptr;
+        check(activate(L"Windows.Foundation.Uri", __uuidof(IActivationFactory), reinterpret_cast<void**>(&host)) == S_OK && host,
+              "host class forwarded to Windows");
+        if (host) host->Release();
+        void* missing = &missing;
+        check(activate(L"Windows.Xbox.System.User", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
+              "unimplemented Xbox class keeps the real host error");
+        DeleteFileW(manifest.c_str());
+        RemoveDirectoryW(package.c_str());
+        RoUninitialize();
+    }
     std::cout << (failures ? "era_loader: FAILED\n" : "era_loader: all checks passed\n");
     return failures ? 1 : 0;
 }

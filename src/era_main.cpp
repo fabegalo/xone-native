@@ -115,6 +115,7 @@ int wmain(int argc, wchar_t** argv) {
     // Title package root is the working directory, as on console.
     if (!SetCurrentDirectoryW(title.parent_path().c_str())) { std::cerr << "cannot enter package directory\n"; return 1; }
     xboxone::era::set_title_storage_root(storage);
+    xboxone::era::set_title_package_root(title.parent_path().wstring());
     if (!xboxone::era::hook_winrt_activation(GetModuleHandleW(L"vccorlib140.dll")))
         report("xone-era: warning: WinRT activation boundary not installed\n");
     title_base = reinterpret_cast<std::uintptr_t>(image.base());

@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <hstring.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -70,6 +76,10 @@ void set_d3d11x_trap_handler(D3D11XTrapHandler handler);
 // Redirects a loaded host module's RoGetActivationFactory import (vccorlib140)
 // to the title activation boundary, which logs and forwards to the host.
 bool hook_winrt_activation(void* module_base);
+// Title activation: title-layer classes first, then the host (real result).
+HRESULT get_title_activation_factory(HSTRING class_id, REFIID iid, void** factory);
+// Package directory holding the title's AppxManifest.xml; read once per process.
+void set_title_package_root(const std::wstring& root);
 // EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
 void* resolve_etwplus(const ImportRequest& request);
 // Writable title storage root for file mutation APIs (DeleteFileW). Empty (the

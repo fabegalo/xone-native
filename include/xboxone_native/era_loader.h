@@ -67,6 +67,9 @@ void* resolve_kernelx(const ImportRequest& request);
 using D3D11XTrapHandler = std::uintptr_t (*)(const char* interface_name, unsigned slot);
 void* resolve_d3d11x(const ImportRequest& request);
 void set_d3d11x_trap_handler(D3D11XTrapHandler handler);
+// Redirects a loaded host module's RoGetActivationFactory import (vccorlib140)
+// to the title activation boundary, which logs and forwards to the host.
+bool hook_winrt_activation(void* module_base);
 // EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
 void* resolve_etwplus(const ImportRequest& request);
 // Writable title storage root for file mutation APIs (DeleteFileW). Empty (the

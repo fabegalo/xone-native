@@ -39,6 +39,7 @@ std::wstring package_root;
 struct Identity {
     HRESULT status = E_FAIL;
     std::wstring title_id, service_config_id;
+    std::wstring entry_point; // First Application element's EntryPoint.
 };
 
 Identity read_identity() {
@@ -65,19 +66,24 @@ Identity read_identity() {
     if (SUCCEEDED(hr)) hr = reader->SetInput(stream);
     XmlNodeType type{};
     bool found = false;
-    while (SUCCEEDED(hr) && !found && (hr = reader->Read(&type)) == S_OK) {
+    while (SUCCEEDED(hr) && (hr = reader->Read(&type)) == S_OK) {
         if (type != XmlNodeType_Element) continue;
         const wchar_t* local = nullptr;
-        if (FAILED(reader->GetLocalName(&local, nullptr)) || lstrcmpW(local, L"XboxLive") != 0) continue;
-        found = true;
+        if (FAILED(reader->GetLocalName(&local, nullptr))) continue;
+        const bool xbox_live = !found && !lstrcmpW(local, L"XboxLive");
+        const bool application = id.entry_point.empty() && !lstrcmpW(local, L"Application");
+        if (!xbox_live && !application) continue;
+        found = found || xbox_live;
         for (HRESULT a = reader->MoveToFirstAttribute(); a == S_OK; a = reader->MoveToNextAttribute()) {
             const wchar_t* attribute = nullptr;
             const wchar_t* value = nullptr;
             if (FAILED(reader->GetLocalName(&attribute, nullptr)) || FAILED(reader->GetValue(&value, nullptr))) continue;
-            if (!lstrcmpW(attribute, L"TitleId")) id.title_id = value;
-            else if (!lstrcmpW(attribute, L"PrimaryServiceConfigId")) id.service_config_id = value;
+            if (xbox_live && !lstrcmpW(attribute, L"TitleId")) id.title_id = value;
+            else if (xbox_live && !lstrcmpW(attribute, L"PrimaryServiceConfigId")) id.service_config_id = value;
+            else if (application && !lstrcmpW(attribute, L"EntryPoint")) id.entry_point = value;
         }
     }
+    if (hr == S_FALSE) hr = S_OK; // End of document.
     if (reader) reader->Release();
     if (stream) stream->Release();
     if (FAILED(hr)) id.status = hr;
@@ -146,6 +152,14 @@ private:
 void set_title_package_root(const std::wstring& root) {
     std::lock_guard lock(package_mutex);
     package_root = root;
+}
+
+HRESULT title_entry_point(std::wstring& entry_point) {
+    Identity id = read_identity();
+    if (FAILED(id.status) && id.status != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) return id.status;
+    if (id.entry_point.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+    entry_point = id.entry_point;
+    return S_OK;
 }
 
 HRESULT xbox_live_configuration_factory(REFIID iid, void** factory) {

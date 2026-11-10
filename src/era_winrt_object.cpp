@@ -160,6 +160,13 @@ HRESULT WinrtEvent::remove(std::int64_t token) {
     return S_OK; // WinRT remove of an unknown token is not an error.
 }
 
+std::vector<IUnknown*> WinrtEvent::snapshot() const {
+    std::lock_guard lock(mutex_);
+    std::vector<IUnknown*> copy;
+    for (const auto& h : handlers_) { h.second->AddRef(); copy.push_back(h.second); }
+    return copy;
+}
+
 std::size_t WinrtEvent::size() const {
     std::lock_guard lock(mutex_);
     return handlers_.size();

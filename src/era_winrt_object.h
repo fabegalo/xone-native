@@ -48,6 +48,8 @@ public:
     HRESULT add(IUnknown* handler, std::int64_t* token);
     HRESULT remove(std::int64_t token);
     std::size_t size() const;
+    // Referenced copies of the current handlers; the caller releases each.
+    std::vector<IUnknown*> snapshot() const;
 
 private:
     mutable std::mutex mutex_;

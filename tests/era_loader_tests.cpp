@@ -244,7 +244,9 @@ int main(int argc, char** argv) {
                    "xmlns:mx=\"http://schemas.microsoft.com/appx/2013/xbox/manifest\">"
                    "<Extensions><mx:Extension Category=\"xbox.live\">"
                    "<mx:XboxLive TitleId=\"0000F00D\" PrimaryServiceConfigId=\"00000000-1111-2222-3333-44440000f00d\"/>"
-                   "</mx:Extension></Extensions></Package>";
+                   "</mx:Extension></Extensions>"
+                   "<Applications><Application Id=\"App\" Executable=\"t.exe\" EntryPoint=\"Title.App\"/></Applications>"
+                   "</Package>";
         }
         set_title_package_root(package);
         struct __declspec(uuid("00193376-6a84-4c67-84a5-3b8a8aaea712")) Statics : IInspectable {
@@ -354,6 +356,91 @@ int main(int argc, char** argv) {
         if (manager) manager->Release();
         if (dlc_instance) dlc_instance->Release();
         if (dlc) dlc->Release();
+        // CoreApplication: the title layer drives the view lifecycle in contract order.
+        {
+            static std::string lifecycle;
+            static std::wstring loaded;
+            struct Handler : IUnknown {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = this; return S_OK; }
+                ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+                ULONG STDMETHODCALLTYPE Release() override { return 1; }
+                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable* sender, IInspectable* args) {
+                    lifecycle += sender && args ? "A" : "a";
+                    return S_OK;
+                }
+            };
+            static Handler handler;
+            struct View : IInspectable {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = this; return S_OK; }
+                ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+                ULONG STDMETHODCALLTYPE Release() override { return 1; }
+                HRESULT STDMETHODCALLTYPE GetIids(ULONG*, IID**) override { return E_NOTIMPL; }
+                HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING*) override { return E_NOTIMPL; }
+                HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel*) override { return E_NOTIMPL; }
+                virtual HRESULT STDMETHODCALLTYPE Initialize(IInspectable* view) {
+                    std::int64_t token = 0;
+                    auto** vt = *reinterpret_cast<void***>(view);
+                    lifecycle += "I";
+                    return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(view, &handler, &token);
+                }
+                virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
+                    HSTRING name = nullptr;
+                    window->GetRuntimeClassName(&name);
+                    lifecycle += std::wstring(WindowsGetStringRawBuffer(name, nullptr)) == L"Windows.UI.Core.CoreWindow" ? "S" : "s";
+                    WindowsDeleteString(name);
+                    std::int64_t token = 0;
+                    auto** vt = *reinterpret_cast<void***>(window);
+                    return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[19])(window, &handler, &token);
+                }
+                virtual HRESULT STDMETHODCALLTYPE Load(HSTRING entry) {
+                    loaded = WindowsGetStringRawBuffer(entry, nullptr);
+                    lifecycle += "L";
+                    return S_OK;
+                }
+                virtual HRESULT STDMETHODCALLTYPE Run() { lifecycle += "R"; return S_OK; }
+                virtual HRESULT STDMETHODCALLTYPE Uninitialize() { lifecycle += "U"; return S_OK; }
+            };
+            static View fake_view;
+            // IFrameworkViewSource: CreateView at slot 6.
+            struct SourceShim : IInspectable {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = this; return S_OK; }
+                ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+                ULONG STDMETHODCALLTYPE Release() override { return 1; }
+                HRESULT STDMETHODCALLTYPE GetIids(ULONG*, IID**) override { return E_NOTIMPL; }
+                HRESULT STDMETHODCALLTYPE GetRuntimeClassName(HSTRING*) override { return E_NOTIMPL; }
+                HRESULT STDMETHODCALLTYPE GetTrustLevel(TrustLevel*) override { return E_NOTIMPL; }
+                virtual HRESULT STDMETHODCALLTYPE CreateView(IInspectable** out) { *out = &fake_view; return S_OK; }
+            };
+            static SourceShim source;
+            constexpr GUID iid_core_application{0x0aacf7a4, 0x5e1d, 0x49df, {0x80, 0x34, 0xfb, 0x6a, 0x68, 0xbc, 0x5e, 0xd1}};
+            constexpr GUID iid_resources{0x9ff3799e, 0x6e83, 0x468c, {0xa5, 0xb0, 0x50, 0x1c, 0xe6, 0xbb, 0x0f, 0xa1}};
+            IActivationFactory* core = nullptr;
+            check(activate(L"Windows.ApplicationModel.Core.CoreApplication", __uuidof(IActivationFactory),
+                           reinterpret_cast<void**>(&core)) == S_OK && core, "CoreApplication served by title layer");
+            IInspectable* app = nullptr;
+            IInspectable* resources = nullptr;
+            if (core) {
+                check(core->QueryInterface(iid_core_application, reinterpret_cast<void**>(&app)) == S_OK && app, "ICoreApplication");
+                check(core->QueryInterface(iid_resources, reinterpret_cast<void**>(&resources)) == S_OK && resources,
+                      "Xbox resource availability interface");
+            }
+            if (app) {
+                auto** vt = *reinterpret_cast<void***>(app);
+                std::int64_t token = 0;
+                check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(app, &handler, &token) == S_OK &&
+                      reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, std::int64_t)>(vt[8])(app, token) == S_OK,
+                      "Suspending registration");
+                const HRESULT hr = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*)>(vt[13])(app, &source);
+                check(hr == S_OK, "CoreApplication::Run succeeds");
+                check(lifecycle == "ISLARU", "view lifecycle Initialize, SetWindow, Load, Activated, Run, Uninitialize");
+                check(loaded == L"Title.App", "Load receives the manifest entry point");
+                check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*)>(vt[13])(app, nullptr) == E_INVALIDARG,
+                      "Run without a view source");
+            }
+            if (resources) resources->Release();
+            if (app) app->Release();
+            if (core) core->Release();
+        }
         if (user_statics) user_statics->Release();
         if (user) user->Release();
         if (host) host->Release();

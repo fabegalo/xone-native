@@ -1,0 +1,5 @@
+; Import-library description for the synthetic ERA fixture only. No DLL is built.
+LIBRARY kernelx.dll
+EXPORTS
+    GetCurrentProcessId
+    Sleep

@@ -71,3 +71,4 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
 endif()
 
 include(cmake/SystemOS.cmake)
+include(cmake/Era.cmake)

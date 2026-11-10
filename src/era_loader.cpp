@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#include "xboxone_native/era_loader.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <cstring>
+
+namespace xboxone::era {
+namespace {
+
+constexpr std::size_t max_image = std::size_t{1} << 30;
+constexpr std::size_t max_imports = 1u << 16;
+
+template <class T>
+bool within(std::size_t offset, std::size_t count, std::size_t limit) {
+    return offset <= limit && count <= (limit - offset) / sizeof(T);
+}
+
+DWORD protection(DWORD c) {
+    const bool x = c & IMAGE_SCN_MEM_EXECUTE, r = c & IMAGE_SCN_MEM_READ, w = c & IMAGE_SCN_MEM_WRITE;
+    if (x) return w ? PAGE_EXECUTE_READWRITE : (r ? PAGE_EXECUTE_READ : PAGE_EXECUTE);
+    if (w) return PAGE_READWRITE;
+    return r ? PAGE_READONLY : PAGE_NOACCESS;
+}
+
+// Returns a NUL-terminated string at rva inside the mapped image, or nullptr.
+const char* image_string(const std::uint8_t* base, std::size_t size, DWORD rva) {
+    if (rva == 0 || rva >= size) return nullptr;
+    const auto* s = reinterpret_cast<const char*>(base + rva);
+    return std::memchr(s, 0, size - rva) ? s : nullptr;
+}
+
+} // namespace
+
+Image::~Image() { release(); }
+
+void Image::release() {
+    if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));
+    if (base_) VirtualFree(base_, 0, MEM_RELEASE);
+    base_ = nullptr; size_ = 0; entry_ = nullptr; function_table_ = nullptr;
+}
+
+bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result) {
+    result = {};
+    release();
+    const auto fail = [&](std::string error) { result.errors.push_back(std::move(error)); release(); return false; };
+
+    if (file.size() < sizeof(IMAGE_DOS_HEADER)) return fail("truncated DOS header");
+    IMAGE_DOS_HEADER dos;
+    std::memcpy(&dos, file.data(), sizeof dos);
+    if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew < 0 ||
+        !within<IMAGE_NT_HEADERS64>(static_cast<std::size_t>(dos.e_lfanew), 1, file.size()))
+        return fail("invalid DOS header");
+    IMAGE_NT_HEADERS64 nt;
+    std::memcpy(&nt, file.data() + dos.e_lfanew, sizeof nt);
+    const auto& opt = nt.OptionalHeader;
+    if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        opt.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return fail("not a PE32+ AMD64 image");
+    if (nt.FileHeader.Characteristics & IMAGE_FILE_DLL) return fail("DLL images are not title entry images");
+    if (opt.SizeOfImage == 0 || opt.SizeOfImage > max_image || opt.SizeOfHeaders > opt.SizeOfImage ||
+        opt.SizeOfHeaders > file.size() || opt.NumberOfRvaAndSizes < IMAGE_DIRECTORY_ENTRY_TLS + 1)
+        return fail("invalid image or header size");
+    const std::size_t sections_at = static_cast<std::size_t>(dos.e_lfanew) + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                                    nt.FileHeader.SizeOfOptionalHeader;
+    const std::size_t count = nt.FileHeader.NumberOfSections;
+    if (count == 0 || count > 96 || !within<IMAGE_SECTION_HEADER>(sections_at, count, opt.SizeOfHeaders))
+        return fail("invalid section table");
+    const auto& dirs = opt.DataDirectory;
+    if (dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
+        return fail("static TLS directory: title TLS slot allocation not implemented");
+    if (dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress)
+        return fail("delay-load imports not implemented");
+    if (dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
+        return fail("CLR images not supported");
+
+    size_ = opt.SizeOfImage;
+    base_ = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!base_) return fail("image reservation failed: " + std::to_string(GetLastError()));
+    std::memcpy(base_, file.data(), opt.SizeOfHeaders);
+    std::vector<IMAGE_SECTION_HEADER> sections(count);
+    std::memcpy(sections.data(), file.data() + sections_at, count * sizeof(IMAGE_SECTION_HEADER));
+    for (const auto& s : sections) {
+        const std::size_t span = (std::max)(s.Misc.VirtualSize, s.SizeOfRawData);
+        if (s.VirtualAddress < opt.SizeOfHeaders || s.VirtualAddress > size_ || span > size_ - s.VirtualAddress)
+            return fail("section outside image");
+        const std::size_t raw = (std::min)(s.SizeOfRawData, s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData);
+        if (raw && (s.PointerToRawData > file.size() || raw > file.size() - s.PointerToRawData))
+            return fail("section raw data outside file");
+        if (raw) std::memcpy(base_ + s.VirtualAddress, file.data() + s.PointerToRawData, raw);
+    }
+    const auto dir = [&](int index, std::size_t& rva, std::size_t& bytes) {
+        rva = dirs[index].VirtualAddress; bytes = dirs[index].Size;
+        return rva == 0 || (rva <= size_ && bytes <= size_ - rva);
+    };
+
+    // Base relocations: the title is never assumed to own its preferred address.
+    const auto delta = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(base_) - opt.ImageBase);
+    std::size_t rva = 0, bytes = 0;
+    if (!dir(IMAGE_DIRECTORY_ENTRY_BASERELOC, rva, bytes)) return fail("relocation directory outside image");
+    if (delta && (rva == 0 || (nt.FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED)))
+        return fail("image has no relocations and cannot be placed at its preferred base");
+    for (std::size_t at = rva, end = rva + bytes; delta && at < end;) {
+        IMAGE_BASE_RELOCATION block;
+        if (end - at < sizeof block) return fail("truncated relocation block");
+        std::memcpy(&block, base_ + at, sizeof block);
+        if (block.SizeOfBlock < sizeof block || block.SizeOfBlock > end - at || (block.SizeOfBlock & 1))
+            return fail("invalid relocation block size");
+        for (std::size_t i = sizeof block; i < block.SizeOfBlock; i += 2) {
+            std::uint16_t entry;
+            std::memcpy(&entry, base_ + at + i, 2);
+            const unsigned type = entry >> 12;
+            const std::size_t target = static_cast<std::size_t>(block.VirtualAddress) + (entry & 0xfff);
+            if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+            if (type != IMAGE_REL_BASED_DIR64) return fail("unsupported relocation type " + std::to_string(type));
+            if (target > size_ - 8) return fail("relocation target outside image");
+            std::uint64_t value;
+            std::memcpy(&value, base_ + target, 8);
+            value += static_cast<std::uint64_t>(delta);
+            std::memcpy(base_ + target, &value, 8);
+        }
+        at += block.SizeOfBlock;
+    }
+
+    // Imports: collect every unresolved symbol before failing.
+    if (!dir(IMAGE_DIRECTORY_ENTRY_IMPORT, rva, bytes)) return fail("import directory outside image");
+    std::size_t total = 0;
+    for (std::size_t at = rva; rva; at += sizeof(IMAGE_IMPORT_DESCRIPTOR)) {
+        if (at > size_ - sizeof(IMAGE_IMPORT_DESCRIPTOR)) return fail("unterminated import directory");
+        IMAGE_IMPORT_DESCRIPTOR d;
+        std::memcpy(&d, base_ + at, sizeof d);
+        if (d.Name == 0 && d.FirstThunk == 0) break;
+        const char* library = image_string(base_, size_, d.Name);
+        if (!library) return fail("invalid import library name");
+        const DWORD lookup = d.OriginalFirstThunk ? d.OriginalFirstThunk : d.FirstThunk;
+        for (std::size_t i = 0;; ++i) {
+            const std::size_t slot = static_cast<std::size_t>(d.FirstThunk) + i * 8, from = lookup + i * 8;
+            if (slot > size_ - 8 || from > size_ - 8 || ++total > max_imports) return fail("invalid import thunk table");
+            std::uint64_t thunk;
+            std::memcpy(&thunk, base_ + from, 8);
+            if (thunk == 0) break;
+            ImportRequest request{library, {}, 0};
+            if (thunk & IMAGE_ORDINAL_FLAG64) {
+                if (thunk & ~(IMAGE_ORDINAL_FLAG64 | 0xffffull)) return fail("invalid import ordinal");
+                request.ordinal = static_cast<std::uint16_t>(thunk & 0xffff);
+            } else {
+                if (thunk > size_ - sizeof(WORD)) return fail("import name outside image");
+                const char* name = image_string(base_, size_, static_cast<DWORD>(thunk + sizeof(WORD)));
+                if (!name) return fail("invalid import name");
+                request.name = name;
+            }
+            void* address = resolver ? resolver(request) : nullptr;
+            if (!address) { result.unresolved.push_back(std::move(request)); continue; }
+            const auto value = reinterpret_cast<std::uint64_t>(address);
+            std::memcpy(base_ + slot, &value, 8);
+            ++result.resolved;
+        }
+    }
+    if (!result.unresolved.empty())
+        return fail(std::to_string(result.unresolved.size()) + " import(s) have no host implementation");
+
+    // Unwind data is required for exceptions, stack walks and C++ EH in title code.
+    if (!dir(IMAGE_DIRECTORY_ENTRY_EXCEPTION, rva, bytes)) return fail("exception directory outside image");
+    if (rva && bytes >= sizeof(RUNTIME_FUNCTION)) {
+        auto* table = reinterpret_cast<PRUNTIME_FUNCTION>(base_ + rva);
+        if (!RtlAddFunctionTable(table, static_cast<DWORD>(bytes / sizeof(RUNTIME_FUNCTION)),
+                                 reinterpret_cast<DWORD64>(base_)))
+            return fail("unwind table registration failed");
+        function_table_ = table;
+    }
+
+    DWORD old = 0;
+    if (!VirtualProtect(base_, opt.SizeOfHeaders, PAGE_READONLY, &old)) return fail("header protection failed");
+    for (const auto& s : sections) {
+        const std::size_t span = (std::max)(s.Misc.VirtualSize, s.SizeOfRawData);
+        if (span && !VirtualProtect(base_ + s.VirtualAddress, span, protection(s.Characteristics), &old))
+            return fail("section protection failed");
+    }
+    FlushInstructionCache(GetCurrentProcess(), base_, size_);
+    if (opt.AddressOfEntryPoint >= size_) return fail("entry point outside image");
+    entry_ = opt.AddressOfEntryPoint ? base_ + opt.AddressOfEntryPoint : nullptr;
+    return true;
+}
+
+} // namespace xboxone::era

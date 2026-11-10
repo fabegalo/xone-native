@@ -21,7 +21,25 @@ std::vector<std::uint8_t> read(const char* path) {
 
 int main(int argc, char** argv) {
     using namespace xboxone::era;
-    if (argc != 2) { std::cerr << "usage: era_loader_tests <era_component.exe>\n"; return 2; }
+    if (argc != 3) { std::cerr << "usage: era_loader_tests <era_component.exe> <era_tls_component.exe>\n"; return 2; }
+    {
+        // Static TLS: one title per process, bound to xone-era-tls.dll's slot.
+        const auto tls_file = read(argv[2]);
+        LoadResult result;
+        {
+            Image image;
+            check(image.load(tls_file, resolve_kernelx, result), "TLS title loads");
+            for (const auto& e : result.errors) std::cerr << "  " << e << '\n';
+            if (image.entry()) {
+                image.process_attach();
+                const auto code = reinterpret_cast<unsigned long long (*)()>(image.entry())();
+                if (code) std::cerr << "  TLS title returned " << code << '\n';
+                check(code == 0, "TLS template, callbacks and per-thread isolation hold");
+            }
+        }
+        Image second;
+        check(!second.load(tls_file, resolve_kernelx, result), "slot is not silently reused by a second title");
+    }
     const auto file = read(argv[1]);
     check(file.size() > 512, "fixture readable");
 

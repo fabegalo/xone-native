@@ -4,7 +4,10 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include "era_tls_slot.h"
+
 #include <cstring>
+#include <string>
 
 namespace xboxone::era {
 namespace {
@@ -35,7 +38,14 @@ const char* image_string(const std::uint8_t* base, std::size_t size, DWORD rva) 
 
 Image::~Image() { release(); }
 
+void Image::process_attach() const {
+    for (auto* cb = static_cast<PIMAGE_TLS_CALLBACK*>(tls_callbacks_); cb && *cb; ++cb)
+        (*cb)(base_, DLL_PROCESS_ATTACH, nullptr);
+}
+
 void Image::release() {
+    if (tls_unbind_) reinterpret_cast<EraTlsUnbind>(tls_unbind_)();
+    tls_unbind_ = nullptr; tls_callbacks_ = nullptr;
     if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));
     if (base_) VirtualFree(base_, 0, MEM_RELEASE);
     base_ = nullptr; size_ = 0; entry_ = nullptr; function_table_ = nullptr;
@@ -68,8 +78,6 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
     if (count == 0 || count > 96 || !within<IMAGE_SECTION_HEADER>(sections_at, count, opt.SizeOfHeaders))
         return fail("invalid section table");
     const auto& dirs = opt.DataDirectory;
-    if (dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
-        return fail("static TLS directory: title TLS slot allocation not implemented");
     if (dirs[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress)
         return fail("delay-load imports not implemented");
     if (dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
@@ -168,6 +176,48 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
                                  reinterpret_cast<DWORD64>(base_)))
             return fail("unwind table registration failed");
         function_table_ = table;
+    }
+
+    // Static TLS: VAs in the directory are already relocated to this mapping.
+    if (!dir(IMAGE_DIRECTORY_ENTRY_TLS, rva, bytes)) return fail("TLS directory outside image");
+    if (rva) {
+        IMAGE_TLS_DIRECTORY64 tls;
+        if (bytes < sizeof tls) return fail("truncated TLS directory");
+        std::memcpy(&tls, base_ + rva, sizeof tls);
+        const auto start = reinterpret_cast<std::uint64_t>(base_), end = start + size_;
+        const auto inside = [&](std::uint64_t va, std::uint64_t n) { return va >= start && va <= end && n <= end - va; };
+        const unsigned align = (tls.Characteristics >> 20) & 0xf; // 1 = 1 byte ... 5 = 16 bytes
+        if (tls.EndAddressOfRawData < tls.StartAddressOfRawData ||
+            !inside(tls.StartAddressOfRawData, tls.EndAddressOfRawData - tls.StartAddressOfRawData) ||
+            !inside(tls.AddressOfIndex, sizeof(DWORD)) || (tls.AddressOfCallBacks && !inside(tls.AddressOfCallBacks, 8)))
+            return fail("TLS directory references outside image");
+        if (align > 5) return fail("TLS alignment above 16 bytes not supported");
+        const std::uint64_t needed = tls.EndAddressOfRawData - tls.StartAddressOfRawData + tls.SizeOfZeroFill;
+        if (needed > ERA_TLS_MAX_BYTES) return fail("title TLS block above 16 MiB");
+        for (std::uint64_t at = tls.AddressOfCallBacks; at; at += 8) {
+            if (!inside(at, 8)) return fail("unterminated TLS callback table");
+            std::uint64_t cb;
+            std::memcpy(&cb, reinterpret_cast<void*>(at), 8);
+            if (!cb) break;
+            if (!inside(cb, 1)) return fail("TLS callback outside image");
+        }
+        wchar_t module[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, module, MAX_PATH);
+        if (n == 0 || n == MAX_PATH) return fail("cannot locate launcher directory");
+        std::wstring slot_path(module, n);
+        slot_path.resize(slot_path.find_last_of(L"\\/") + 1);
+        slot_path += L"xone-era-tls.dll";
+        const HMODULE slot = LoadLibraryExW(slot_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        const auto bind = slot ? reinterpret_cast<EraTlsBind>(GetProcAddress(slot, "era_tls_bind")) : nullptr;
+        if (!bind) return fail("TLS slot module xone-era-tls.dll unavailable");
+        EraTlsTitle title{reinterpret_cast<const void*>(tls.StartAddressOfRawData),
+                          static_cast<SIZE_T>(tls.EndAddressOfRawData - tls.StartAddressOfRawData),
+                          static_cast<SIZE_T>(needed), reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls.AddressOfCallBacks), base_};
+        DWORD index = 0;
+        if (!bind(&title, &index)) return fail("TLS slot already bound to another title in this process");
+        tls_unbind_ = reinterpret_cast<void*>(GetProcAddress(slot, "era_tls_unbind"));
+        *reinterpret_cast<DWORD*>(tls.AddressOfIndex) = index;
+        tls_callbacks_ = reinterpret_cast<void*>(tls.AddressOfCallBacks);
     }
 
     DWORD old = 0;

@@ -38,6 +38,10 @@ public:
     // Maps, relocates, binds and protects the image; registers .pdata unwind data.
     // On failure the image is released and result explains every blocker found.
     bool load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result);
+    // Runs the title's TLS callbacks for DLL_PROCESS_ATTACH on the calling thread.
+    // Static TLS data is bound by load(); thread attach/detach is forwarded by
+    // xone-era-tls.dll, which must sit next to the launcher executable.
+    void process_attach() const;
     void* entry() const { return entry_; }
     std::uint8_t* base() const { return base_; }
     std::size_t size() const { return size_; }
@@ -48,6 +52,8 @@ private:
     std::size_t size_ = 0;
     void* entry_ = nullptr;
     void* function_table_ = nullptr;
+    void* tls_callbacks_ = nullptr;
+    void* tls_unbind_ = nullptr;
 };
 
 // Initial kernelx.dll contract. Only exports whose console semantics match the

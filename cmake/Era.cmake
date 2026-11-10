@@ -7,7 +7,7 @@ if(NOT (WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
 endif()
 
 add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJECT_SOURCE_DIR}/src/era_kernelx.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_host.cpp)
+            ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp)
 target_include_directories(xboxone_era PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(xboxone_era PUBLIC cxx_std_20)
 target_compile_options(xboxone_era PRIVATE /W4 /permissive-)

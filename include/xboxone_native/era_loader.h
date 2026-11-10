@@ -61,6 +61,12 @@ private:
 // Win32 API are forwarded; GetModuleHandleW(NULL) names the title image;
 // title-memory, storage and Xbox-specific exports stay unresolved.
 void* resolve_kernelx(const ImportRequest& request);
+// EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
+void* resolve_etwplus(const ImportRequest& request);
+// Writable title storage root for file mutation APIs (DeleteFileW). Empty (the
+// default) means no writable storage: mutations fail with ERROR_ACCESS_DENIED,
+// as for the read-only package. Paths outside the root fail the same way.
+void set_title_storage_root(const std::wstring& root);
 // PC builds with the title's ABI (VS2015+ CRT, vccorlib140, combase), System32 only.
 void* resolve_host_module(const ImportRequest& request);
 // Full title resolver: kernelx first, then audited host modules.

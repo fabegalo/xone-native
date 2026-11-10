@@ -38,6 +38,7 @@ void* resolve_host_module(const ImportRequest& request) {
 
 void* resolve_title_import(const ImportRequest& request) {
     if (void* address = resolve_kernelx(request)) return address;
+    if (void* address = resolve_etwplus(request)) return address;
     return resolve_host_module(request);
 }
 

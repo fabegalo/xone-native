@@ -47,7 +47,7 @@ void Image::release() {
     if (tls_unbind_) reinterpret_cast<EraTlsUnbind>(tls_unbind_)();
     tls_unbind_ = nullptr; tls_callbacks_ = nullptr;
     if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));
-    if (base_) VirtualFree(base_, 0, MEM_RELEASE);
+    if (base_) { set_title_module(nullptr); VirtualFree(base_, 0, MEM_RELEASE); }
     base_ = nullptr; size_ = 0; entry_ = nullptr; function_table_ = nullptr;
 }
 
@@ -230,6 +230,7 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
     FlushInstructionCache(GetCurrentProcess(), base_, size_);
     if (opt.AddressOfEntryPoint >= size_) return fail("entry point outside image");
     entry_ = opt.AddressOfEntryPoint ? base_ + opt.AddressOfEntryPoint : nullptr;
+    set_title_module(base_);
     return true;
 }
 

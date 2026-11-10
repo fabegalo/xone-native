@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // In-process GameOS/ERA image loader: the original AMD64 title image is mapped
@@ -56,8 +57,16 @@ private:
     void* tls_unbind_ = nullptr;
 };
 
-// Initial kernelx.dll contract. Only exports whose console semantics match the
-// same-named Win32 API are forwarded; Xbox-specific exports stay unresolved.
+// kernelx.dll contract. Exports whose console semantics match the same-named
+// Win32 API are forwarded; GetModuleHandleW(NULL) names the title image;
+// title-memory, storage and Xbox-specific exports stay unresolved.
 void* resolve_kernelx(const ImportRequest& request);
+// PC builds with the title's ABI (VS2015+ CRT, vccorlib140, combase), System32 only.
+void* resolve_host_module(const ImportRequest& request);
+// Full title resolver: kernelx first, then audited host modules.
+void* resolve_title_import(const ImportRequest& request);
+// Records the mapped title image (one per process); set by Image::load.
+void set_title_module(void* base);
+bool same_library(std::string_view a, std::string_view b); // ASCII case-insensitive.
 
 } // namespace xboxone::era

@@ -50,6 +50,12 @@ int main(int argc, char** argv) {
         for (const auto& e : result.errors) std::cerr << "  " << e << '\n';
         check(result.resolved == 2 && result.unresolved.empty(), "both kernelx imports bound");
         check(image.entry() != nullptr, "entry point mapped");
+        const auto module_handle = reinterpret_cast<HMODULE (WINAPI*)(LPCWSTR)>(
+            resolve_kernelx({"kernelx.dll", "GetModuleHandleW", 0}));
+        check(module_handle && module_handle(nullptr) == reinterpret_cast<HMODULE>(image.base()),
+              "GetModuleHandleW(NULL) names the title image, not the launcher");
+        check(module_handle && module_handle(L"kernel32.dll") == GetModuleHandleW(L"kernel32.dll"),
+              "named GetModuleHandleW stays a host lookup");
         if (image.entry()) {
             MEMORY_BASIC_INFORMATION info{};
             VirtualQuery(image.entry(), &info, sizeof info);
@@ -87,6 +93,17 @@ int main(int argc, char** argv) {
           "Xbox-specific export is not faked by a host forward");
     check(resolve_kernelx({"kernelx.dll", "VirtualAlloc", 0}) == nullptr, "title memory API is not forwarded blindly");
     check(resolve_kernelx({"kernel32.dll", "Sleep", 0}) == nullptr, "only kernelx.dll is handled");
+    check(resolve_kernelx({"kernelx.dll", "DeleteFileW", 0}) == nullptr, "title storage path API is not forwarded");
+    check(resolve_kernelx({"kernelx.dll", "EventRegister", 0}) ==
+              reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"advapi32.dll"), "EventRegister")),
+          "ETW provider API resolves to advapi32");
+    check(resolve_title_import({"UCRTBASE.dll", "malloc", 0}) ==
+              reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ucrtbase.dll"), "malloc")),
+          "CRT import binds to System32 ucrtbase");
+    check(resolve_title_import({"VCRUNTIME140.dll", "memcpy", 0}) != nullptr, "vcruntime140 bound");
+    check(resolve_title_import({"d3d11_x.dll", "D3D11CreateDevice", 0}) == nullptr,
+          "D3D11.X is not silently replaced by host D3D11");
+    check(resolve_title_import({"EtwPlus.dll", "EtxRegister", 0}) == nullptr, "Xbox telemetry stays unresolved");
 
     std::cout << (failures ? "era_loader: FAILED\n" : "era_loader: all checks passed\n");
     return failures ? 1 : 0;

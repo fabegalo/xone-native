@@ -22,7 +22,7 @@ int wmain(int argc, wchar_t** argv) {
 
     xboxone::era::Image image;
     xboxone::era::LoadResult result;
-    const bool ok = image.load(file, xboxone::era::resolve_kernelx, result);
+    const bool ok = image.load(file, xboxone::era::resolve_title_import, result);
     std::map<std::string, std::size_t> per_library;
     for (const auto& u : result.unresolved) ++per_library[u.library];
     std::cout << "resolved " << result.resolved << ", unresolved " << result.unresolved.size() << '\n';

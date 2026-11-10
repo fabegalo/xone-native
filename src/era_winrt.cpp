@@ -28,6 +28,7 @@ struct TitleClass {
 constexpr TitleClass title_classes[]{
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
     {L"Windows.Xbox.System.User", &xbox_user_factory},
+    {L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", &dlc_package_manager_factory},
 };
 
 void note(const wchar_t* text) {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/era_loader.h"
 #include "../src/era_winrt_classes.h"
+#include "../src/era_winrt_object.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -312,6 +313,47 @@ int main(int argc, char** argv) {
             check(reinterpret_cast<Remove>(vt[13])(user_statics, token) == S_OK &&
                   xboxone::era::xbox_user_removed_handlers() == 0, "UserRemoved handler removed");
         }
+        // DownloadableContentPackageManager: no DLC on this host, FindPackages is empty.
+        constexpr GUID vector_view_string{0x2f13c006, 0xa03a, 0x5f69, {0xb0, 0x90, 0x75, 0xa4, 0x3e, 0x33, 0x42, 0x3e}};
+        check(xboxone::era::winrt_pinterface_iid("pinterface({bbe1fa4c-b0e3-4583-baef-1f1b2e483e56};string)") ==
+                  vector_view_string, "pinterface IID of IVectorView<String>");
+        constexpr GUID iid_dlc_manager{0x971FEAAF, 0x98F8, 0x4038, {0xB8, 0xC1, 0x3A, 0x5F, 0x1A, 0x04, 0x3B, 0x97}};
+        IActivationFactory* dlc = nullptr;
+        check(activate(L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", __uuidof(IActivationFactory),
+                       reinterpret_cast<void**>(&dlc)) == S_OK && dlc, "DLC manager served by title layer");
+        IInspectable* dlc_instance = nullptr;
+        IInspectable* manager = nullptr;
+        if (dlc) check(dlc->ActivateInstance(&dlc_instance) == S_OK && dlc_instance, "DLC manager instance");
+        if (dlc_instance)
+            check(dlc_instance->QueryInterface(iid_dlc_manager, reinterpret_cast<void**>(&manager)) == S_OK && manager,
+                  "DLC manager default interface");
+        if (manager && host) {
+            auto** vt = *reinterpret_cast<void***>(manager);
+            using Find = HRESULT(STDMETHODCALLTYPE*)(void*, INT32, IInspectable**);
+            using Size = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32*);
+            using GetAt = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, void**);
+            using Add = HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*);
+            using Remove = HRESULT(STDMETHODCALLTYPE*)(void*, std::int64_t);
+            IInspectable* packages = nullptr;
+            check(reinterpret_cast<Find>(vt[6])(manager, 0, &packages) == S_OK && packages, "FindPackages returns a view");
+            if (packages) {
+                auto** pv = *reinterpret_cast<void***>(packages);
+                UINT32 size = 7;
+                void* item = &item;
+                check(reinterpret_cast<Size>(pv[7])(packages, &size) == S_OK && size == 0, "no DLC packages");
+                check(reinterpret_cast<GetAt>(pv[6])(packages, 0, &item) == E_BOUNDS && !item, "empty view is bounded");
+                IUnknown* typed = nullptr;
+                check(packages->QueryInterface(xboxone::era::winrt_pinterface_iid(xboxone::era::dlc_package_view_signature),
+                                               reinterpret_cast<void**>(&typed)) == S_OK && typed == packages,
+                      "view answers IVectorView<DownloadableContentPackage>");
+            }
+            std::int64_t token = 0;
+            check(reinterpret_cast<Add>(vt[7])(manager, host, &token) == S_OK && token &&
+                  reinterpret_cast<Remove>(vt[8])(manager, token) == S_OK, "install-completed event registration");
+        }
+        if (manager) manager->Release();
+        if (dlc_instance) dlc_instance->Release();
+        if (dlc) dlc->Release();
         if (user_statics) user_statics->Release();
         if (user) user->Release();
         if (host) host->Release();

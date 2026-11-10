@@ -34,6 +34,14 @@ struct WinrtObject {
 // Lifetime is process-wide for now (AddRef/Release do not free).
 std::array<const void*, winrt_slots> winrt_vtable();
 
+// IID of a parameterized interface instance from its WinRT type signature,
+// e.g. "pinterface({bbe1fa4c-b0e3-4583-baef-1f1b2e483e56};string)".
+GUID winrt_pinterface_iid(const char* signature);
+
+// Empty IVectorView<T> whose instance IID is `iid` (computed from T).
+// Slots 6 GetAt, 7 get_Size, 8 IndexOf, 9 GetMany per Windows.Foundation.
+WinrtObject* winrt_empty_vector_view(const wchar_t* runtime_class, const GUID& iid);
+
 // Event registration storage for add_X(handler, token*) / remove_X(token).
 class WinrtEvent {
 public:

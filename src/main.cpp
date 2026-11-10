@@ -82,11 +82,11 @@ void print_report(const xboxone::inspection::Report& report, bool json) {
 }
 
 void help() {
-    std::cout << "xboxone-native M0: read-only original content inspector\n"
-              << "Usage: xboxone-native inspect <file> [--json]\n"
-              << "       xboxone-native inventory <directory> [--json]\n"
+    std::cout << "xone-native M0: read-only original content inspector\n"
+              << "Usage: xone-native inspect <file> [--json]\n"
+              << "       xone-native inventory <directory> [--json]\n"
               << "           [--max-file-bytes N] [--max-total-bytes N]\n"
-              << "       xboxone-native inspect-xvd-header <declared-file-size> [--json]\n"
+              << "       xone-native inspect-xvd-header <declared-file-size> [--json]\n"
               << "           (archive adapter: reads exactly 0xE00 binary bytes from stdin)\n"
               << "Inventory: .exe/.dll/.sys/.xvd; SHA-256, imports, local candidates.\n"
               << "Defaults: 256 MiB/file, 1 GiB total, 10000 files, 100000 entries, depth 64.\n"

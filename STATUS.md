@@ -1,4 +1,4 @@
-# STATUS — xboxone-native
+# STATUS — xone-native
 
 ## 2026-11-07 — AppModel e ponte gráfica: contratos independentes de originais
 

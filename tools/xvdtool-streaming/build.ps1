@@ -110,7 +110,7 @@ if ($BuildTests) {
 Copy-Item (Join-Path $PSScriptRoot 'COPYING'), (Join-Path $PSScriptRoot 'NOTICE') $stage
 [ordered]@{ upstream_commit = $commit; release_sha256 = $zipHash; runtime = $runtime.Name;
     compiler = $CompilerPath; systemos_source_sha256 = (Get-FileHash (Join-Path $PSScriptRoot 'SystemOsExtractor.cs')).Hash;
-    release_dependency = 'External GPL tool; not linked to xboxone-native runtime' } |
+    release_dependency = 'External GPL tool; not linked to xone-native runtime' } |
     ConvertTo-Json | Set-Content (Join-Path $stage 'build-provenance.json')
 [IO.Directory]::Move($stage, $output)
 Write-Output ('Built external extractor: ' + (Join-Path $output 'bin/XvdTool.Streaming.exe'))

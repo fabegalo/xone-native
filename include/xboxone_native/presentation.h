@@ -96,7 +96,7 @@ struct BackendSupport {
 
 struct PresenterConfig {
     BackendKind backend = BackendKind::d3d12;
-    std::string window_title = "xboxone-native presentation test";
+    std::string window_title = "xone-native presentation test";
     std::uint32_t width = 1280;
     std::uint32_t height = 720;
     std::uint32_t buffer_count = 2;

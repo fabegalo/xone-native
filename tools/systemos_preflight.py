@@ -3,7 +3,7 @@
 """Verify pinned OSU ZIPs and plan Xbox One SystemOS inspection, without extraction.
 
 Usage: python tools/systemos_preflight.py OSU1.zip OSU2.zip OSU3.zip
-         --reference <previous-full-study.json> --inspector <built-xboxone-native>
+         --reference <previous-full-study.json> --inspector <built-xone-native>
 Stdout is JSON. Exit 1 means a valid diagnostic with dashboard blockers; exit 2
 means an invalid/mismatched input. This tool never mounts, launches or deletes
 content, and never treats an unencrypted header flag as readable executable code.

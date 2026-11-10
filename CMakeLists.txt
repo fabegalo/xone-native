@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(xboxone_native VERSION 0.1.0 LANGUAGES CXX)
+project(xone_native VERSION 0.1.0 LANGUAGES CXX)
 
 option(XBOXONE_NATIVE_BUILD_TESTS "Build M0 regression tests" ON)
 
@@ -36,8 +36,8 @@ if(WIN32)
     target_link_libraries(xboxone_presentation PRIVATE user32 d3d12 dxgi dxguid ole32)
 endif()
 
-add_executable(xboxone-native src/main.cpp)
-target_link_libraries(xboxone-native PRIVATE xboxone_inspection)
+add_executable(xone-native src/main.cpp)
+target_link_libraries(xone-native PRIVATE xboxone_inspection)
 
 if(XBOXONE_NATIVE_BUILD_TESTS)
     enable_testing()
@@ -58,15 +58,15 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
         add_test(NAME frame_pipe_regressions COMMAND xboxone_frame_pipe_tests)
         set_tests_properties(frame_pipe_regressions PROPERTIES TIMEOUT 45 LABELS "windows;synthetic;no-deployment")
     endif()
-    add_test(NAME cli_help COMMAND xboxone-native --help)
+    add_test(NAME cli_help COMMAND xone-native --help)
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME update_zip_and_cli_regressions
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/update_zip_tests.py"
-                    $<TARGET_FILE:xboxone-native>)
+                    $<TARGET_FILE:xone-native>)
         add_test(NAME systemos_preflight_regressions
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/systemos_preflight_tests.py"
-                    $<TARGET_FILE:xboxone-native>)
+                    $<TARGET_FILE:xone-native>)
     endif()
 endif()
 

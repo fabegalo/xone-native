@@ -1,4 +1,4 @@
-# Contributing to xboxone-native
+# Contributing to xone-native
 
 This is an experimental research project, **not** a game-ready emulator. Small, measurable contributions are welcome: synthetic regression tests, read-only binary inspection, architecture research based on public sources, build fixes, documentation and evidence-backed compatibility improvements.
 

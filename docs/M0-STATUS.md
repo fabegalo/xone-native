@@ -34,7 +34,7 @@ O catálogo usado foi `docs/research/osu-packages.metadata.json`, preservado sem
 `tools/systemos_preflight.py` implementa a próxima checagem do fluxo de conteúdo:
 
 1. Calcular SHA-256 do ZIP e encontrar exatamente uma referência correspondente, independentemente do nome atual do arquivo.
-2. Ler os prefixos sem extração com `study_update_zip.py`, que chama o parser nativo de `xboxone-native`.
+2. Ler os prefixos sem extração com `study_update_zip.py`, que chama o parser nativo de `xone-native`.
 3. Recusar referência incompleta, membro sem SHA-256 completo, mudança de arquivo, conjunto de membros divergente ou metadados adulterados.
 4. Criar **um perfil por pacote**, com referências aos membros do próprio ZIP; não buscar módulos ou recursos em outra revisão.
 5. Separar volumes SystemOS, referências de HostOS/templates e componentes fora desta etapa. Detectar divergência de revisão entre os candidatos SystemOS.
@@ -66,7 +66,7 @@ O retorno real do programa é **1**, com `diagnostic_completed: true` e `can_boo
 Ambiente: Windows x64, Python do runtime local e inspetor C++20 já compilado com MSVC 19.44. Não houve alteração C++ nesta retomada; o CMake foi reconfigurado para registrar somente o teste novo. As suítes anteriores e sessões gráficas não foram repetidas.
 
 ```powershell
-python tests/systemos_preflight_tests.py build-checked/xboxone-native.exe
+python tests/systemos_preflight_tests.py build-checked/xone-native.exe
 ```
 
 **9 testes aprovados** com conteúdo sintético: identidade por SHA-256 após renomeação, ZIP alterado, metadados de referência adulterados, referência incompleta/sem hash, catálogo malformado sem traceback, versão misturada, separação Scarlett/ERA, flag sem criptografia sem falso boot e CLI bloqueada sem candidatos à exclusão. Pacotes desconhecidos são indeterminados, não declarados ausentes do alvo One. O teste está disponível no CTest como `systemos_preflight_regressions`; `ctest --test-dir build-checked -N -R '^systemos_preflight_regressions$'` confirmou o registro.
@@ -74,7 +74,7 @@ python tests/systemos_preflight_tests.py build-checked/xboxone-native.exe
 Aplicação aos arquivos reais:
 
 ```powershell
-python tools/systemos_preflight.py 'C:\Users\fabeg\Downloads\OSU1.zip' 'C:\Users\fabeg\Downloads\OSU2.zip' 'C:\Users\fabeg\Downloads\OSU3.zip' --reference docs/research/osu-packages.metadata.json --inspector build-checked/xboxone-native.exe > build-checked/m0-systemos-preflight.json
+python tools/systemos_preflight.py 'C:\Users\fabeg\Downloads\OSU1.zip' 'C:\Users\fabeg\Downloads\OSU2.zip' 'C:\Users\fabeg\Downloads\OSU3.zip' --reference docs/research/osu-packages.metadata.json --inspector build-checked/xone-native.exe > build-checked/m0-systemos-preflight.json
 ```
 
 O JSON de diagnóstico está em saída de build ignorada, sem nova cópia de evidência em documentos estáveis. Nenhum arquivo original foi removido, movido, extraído ou executado. Próximo avanço delimitado em [NEXT-TASK.md](NEXT-TASK.md).

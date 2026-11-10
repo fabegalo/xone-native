@@ -4,7 +4,7 @@ Single policy for Claude, Codex and other agents. `CLAUDE.md` is only a pointer 
 
 ## 1. Shared architecture — mandatory
 
-**x360-native is the reference architecture for x360-native, ps2-native and xboxone-native. All three must use the same modules, boundaries and lifecycle, not merely similar goals.**
+**x360-native is the reference architecture for x360-native, ps2-native and xone-native. All three must use the same modules, boundaries and lifecycle, not merely similar goals.**
 
 | Module | Common responsibility |
 | --- | --- |

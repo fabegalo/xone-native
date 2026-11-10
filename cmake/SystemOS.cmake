@@ -51,7 +51,7 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     if(Python3_Interpreter_FOUND)
         add_test(NAME pe_dependency_regressions
             COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/pe_dependency_tests.py"
-                    $<TARGET_FILE:xboxone-native> $<TARGET_FILE:xboxone-systemos>)
+                    $<TARGET_FILE:xone-native> $<TARGET_FILE:xboxone-systemos>)
         set_tests_properties(pe_dependency_regressions PROPERTIES TIMEOUT 30)
     endif()
     if(WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
@@ -105,7 +105,7 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
             add_test(NAME bootstrap_cli_regressions
                 COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/bootstrap_cli_tests.py"
                         $<TARGET_FILE:xboxone-systemos> $<TARGET_FILE:bootstrap_component_ok>
-                        "${CMAKE_CURRENT_BINARY_DIR}/m1-bootstrap-evidence.json" $<TARGET_FILE:xboxone-native>
+                        "${CMAKE_CURRENT_BINARY_DIR}/m1-bootstrap-evidence.json" $<TARGET_FILE:xone-native>
                         $<TARGET_FILE:bootstrap_component_tls>)
             set_tests_properties(bootstrap_cli_regressions PROPERTIES TIMEOUT 20)
         endif()

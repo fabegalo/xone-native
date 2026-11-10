@@ -59,7 +59,7 @@ O build local exigiu debug information Embedded (`/Z7`) devido a C1902 do servi�
 Após compilar o inspetor, reproduzir a análise:
 
 ```powershell
-python tools/study_update_zip.py 'C:\Users\fabeg\Downloads\OSU1.zip' 'C:\Users\fabeg\Downloads\OSU2.zip' 'C:\Users\fabeg\Downloads\OSU3.zip' --inspector build-checked/xboxone-native.exe --hash-archives --hash-members > osu-metadata.json
+python tools/study_update_zip.py 'C:\Users\fabeg\Downloads\OSU1.zip' 'C:\Users\fabeg\Downloads\OSU2.zip' 'C:\Users\fabeg\Downloads\OSU3.zip' --inspector build-checked/xone-native.exe --hash-archives --hash-members > osu-metadata.json
 ```
 
 Omitir as opções de hash limita a leitura aos prefixos. Isso não verifica CRC ou integridade dos membros completos. Tamanhos vêm do diretório ZIP; nenhum executável de dentro do arquivo é iniciado. O programa externo chamado é somente o inspetor local explicitamente indicado.

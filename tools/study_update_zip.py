@@ -96,7 +96,7 @@ def study(path, inspector, hash_archive=False, hash_members=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("archives", nargs="+", type=Path)
-    parser.add_argument("--inspector", required=True, type=Path, help="locally built xboxone-native executable")
+    parser.add_argument("--inspector", required=True, type=Path, help="locally built xone-native executable")
     parser.add_argument("--hash-archives", action="store_true", help="stream full ZIPs for SHA-256")
     parser.add_argument("--hash-members", action="store_true", help="stream full members for SHA-256 and ZIP CRC checks")
     args = parser.parse_args()

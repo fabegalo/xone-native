@@ -1,7 +1,7 @@
 <div align="center">
-  <img src="docs/assets/xboxone-native-banner.svg" alt="Arte conceitual original do xboxone-native: SystemOS e GameOS separados, conectados a uma plataforma de compatibilidade nativa; não é captura da dashboard" width="100%" />
+  <img src="docs/assets/xone-native-banner.svg" alt="Arte conceitual original do xone-native: SystemOS e GameOS separados, conectados a uma plataforma de compatibilidade nativa; não é captura da dashboard" width="100%" />
 
-  # xboxone-native
+  # xone-native
 
   **Projeto aberto de pesquisa para executar componentes originais do Xbox One e jogos no PC, com a dashboard autêntica do SystemOS como objetivo central.**
 
@@ -15,7 +15,7 @@
 
 > **Pesquisa em estágio inicial — ainda não existem jogos jogáveis, boot do SystemOS original, dashboard funcional, launcher gráfico nem Release para usuários.** O banner acima é uma ilustração conceitual, não uma captura do Xbox One em funcionamento. Compilar o projeto ou ler um cabeçalho XVD não comprova compatibilidade com o console.
 
-## O que é o xboxone-native?
+## O que é o xone-native?
 
 O Xbox One executa código **x86-64**, mas seu ambiente original envolve HostOS, SystemOS e GameOS/ERA separados, com virtualização, serviços, dispositivos, APIs gráficas e mecanismos de segurança próprios. Ter uma CPU compatível **não** transforma seus executáveis automaticamente em aplicativos Windows comuns.
 
@@ -54,11 +54,11 @@ ctest --test-dir build -C Release --output-on-failure
 Analise somente arquivos que você possui legalmente e está autorizado a examinar:
 
 ```sh
-./build/xboxone-native inspect /caminho/para/system.xvd --json
-./build/xboxone-native inspect /caminho/para/componente.exe
+./build/xone-native inspect /caminho/para/system.xvd --json
+./build/xone-native inspect /caminho/para/componente.exe
 ```
 
-No Windows, com gerador multiconfiguração, o executável normalmente fica em `build\Release\xboxone-native.exe`; confirme o diretório de saída do gerador. O inspetor **não** copia, extrai, descriptografa, autentica, modifica nem executa o arquivo. Identificar PE32+ sozinho não comprova que o binário pertence ao Xbox One.
+No Windows, com gerador multiconfiguração, o executável normalmente fica em `build\Release\xone-native.exe`; confirme o diretório de saída do gerador. O inspetor **não** copia, extrai, descriptografa, autentica, modifica nem executa o arquivo. Identificar PE32+ sozinho não comprova que o binário pertence ao Xbox One.
 
 **Não existem Releases para usuários** neste estágio. O arquivo de código-fonte do GitHub não é um aplicativo jogável.
 
@@ -99,7 +99,7 @@ Objetivos, não afirmações de compatibilidade:
 ## Perguntas frequentes
 
 <details><summary><strong>“Nativo” significa que software de Xbox One já roda como aplicativo Windows?</strong></summary>
-Não. A CPU é semelhante, mas APIs Xbox, modelo de aplicativos, serviços de VM e shell original precisam ser implementados ou isolados. O xboxone-native ainda não executou código original do SystemOS.
+Não. A CPU é semelhante, mas APIs Xbox, modelo de aplicativos, serviços de VM e shell original precisam ser implementados ou isolados. O xone-native ainda não executou código original do SystemOS.
 </details>
 
 <details><summary><strong>Já consigo abrir a dashboard do Xbox One ou jogar?</strong></summary>
@@ -128,6 +128,6 @@ Correções focadas, testes sintéticos, relatos reproduzíveis, pesquisa de ref
 
 ## Licença e agradecimentos
 
-O código original do xboxone-native usa [BSD-3-Clause](LICENSE). Dependências externas mantêm as próprias licenças; nenhuma é incorporada ao código do M0. Referências: [Xbox One Research](https://github.com/xboxoneresearch/wiki), [WinDurango](https://github.com/WinDurango/WinDurango) e documentação pública do [Azimuth](https://almost-there-games.itch.io/azimuth). O código-fonte do Azimuth não está disponível para reutilização aqui. O [x360-native](https://github.com/fabegalo/x360-native) é um projeto independente que inspira a proposta.
+O código original do xone-native usa [BSD-3-Clause](LICENSE). Dependências externas mantêm as próprias licenças; nenhuma é incorporada ao código do M0. Referências: [Xbox One Research](https://github.com/xboxoneresearch/wiki), [WinDurango](https://github.com/WinDurango/WinDurango) e documentação pública do [Azimuth](https://almost-there-games.itch.io/azimuth). O código-fonte do Azimuth não está disponível para reutilização aqui. O [x360-native](https://github.com/fabegalo/x360-native) é um projeto independente que inspira a proposta.
 
 Sem afiliação, patrocínio ou endosso da Microsoft. Xbox e marcas relacionadas pertencem a seus titulares. O banner é uma arte conceitual original, **não** uma captura do sistema ou de jogos.

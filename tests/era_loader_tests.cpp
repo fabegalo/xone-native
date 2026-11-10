@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/era_loader.h"
+#include "../src/era_winrt_classes.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -284,10 +285,36 @@ int main(int argc, char** argv) {
         IActivationFactory* host = nullptr;
         check(activate(L"Windows.Foundation.Uri", __uuidof(IActivationFactory), reinterpret_cast<void**>(&host)) == S_OK && host,
               "host class forwarded to Windows");
-        if (host) host->Release();
         void* missing = &missing;
-        check(activate(L"Windows.Xbox.System.User", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
+        check(activate(L"Windows.Xbox.Input.Gamepad", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
               "unimplemented Xbox class keeps the real host error");
+        // Windows.Xbox.System.User statics: slots 12/13 (UserRemoved add/remove) observed from the title.
+        constexpr GUID iid_user_statics{0xB4F23A93, 0x7FC6, 0x4A50, {0xB1, 0x53, 0x95, 0x00, 0x16, 0x38, 0x9E, 0x50}};
+        IActivationFactory* user = nullptr;
+        check(activate(L"Windows.Xbox.System.User", __uuidof(IActivationFactory), reinterpret_cast<void**>(&user)) == S_OK && user,
+              "User served by title layer");
+        IInspectable* user_statics = nullptr;
+        if (user) {
+            check(user->QueryInterface(iid_user_statics, reinterpret_cast<void**>(&user_statics)) == S_OK && user_statics,
+                  "User factory answers IUserStatics");
+        }
+        if (user_statics && host) {
+            using Add = HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*);
+            using Remove = HRESULT(STDMETHODCALLTYPE*)(void*, std::int64_t);
+            auto** vt = *reinterpret_cast<void***>(user_statics);
+            HSTRING value = nullptr;
+            check(user_statics->GetRuntimeClassName(&value) == S_OK && text(value) == L"Windows.Xbox.System.User",
+                  "User runtime class name");
+            std::int64_t token = 0;
+            check(reinterpret_cast<Add>(vt[12])(user_statics, host, &token) == S_OK && token &&
+                  xboxone::era::xbox_user_removed_handlers() == 1, "UserRemoved handler stored");
+            check(reinterpret_cast<Add>(vt[12])(user_statics, nullptr, &token) == E_INVALIDARG, "null handler rejected");
+            check(reinterpret_cast<Remove>(vt[13])(user_statics, token) == S_OK &&
+                  xboxone::era::xbox_user_removed_handlers() == 0, "UserRemoved handler removed");
+        }
+        if (user_statics) user_statics->Release();
+        if (user) user->Release();
+        if (host) host->Release();
         DeleteFileW(manifest.c_str());
         RemoveDirectoryW(package.c_str());
         RoUninitialize();

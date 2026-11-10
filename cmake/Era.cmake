@@ -9,7 +9,8 @@ endif()
 add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJECT_SOURCE_DIR}/src/era_kernelx.cpp
             ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp
             ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp)
+            ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
+            ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp)
 target_link_libraries(xboxone_era PRIVATE d3d12 dxgi dxguid runtimeobject oleaut32 xmllite shlwapi ole32)
 # 2 x 512 trap thunks; /bigobj keeps the section count within COFF limits.
 set_source_files_properties(${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp PROPERTIES COMPILE_OPTIONS /bigobj)

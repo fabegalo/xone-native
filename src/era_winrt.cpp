@@ -27,6 +27,7 @@ struct TitleClass {
 };
 constexpr TitleClass title_classes[]{
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
+    {L"Windows.Xbox.System.User", &xbox_user_factory},
 };
 
 void note(const wchar_t* text) {
@@ -42,8 +43,9 @@ HRESULT WINAPI era_RoGetActivationFactory(HSTRING class_id, REFIID iid, void** f
     const wchar_t* name = WindowsGetStringRawBuffer(class_id, &length);
     bool served = false;
     for (const auto& c : title_classes) served = served || c.name == std::wstring_view(name, length);
-    wchar_t line[400];
-    wsprintfW(line, L"xone-era: activation %ls -> 0x%08lX%ls\n", name, static_cast<unsigned long>(hr),
+    wchar_t line[400], requested[40] = L"?";
+    StringFromGUID2(iid, requested, 40);
+    wsprintfW(line, L"xone-era: activation %ls %ls -> 0x%08lX%ls\n", name, requested, static_cast<unsigned long>(hr),
               served ? L" (title layer)" : L"");
     note(line);
     return hr;

@@ -61,6 +61,12 @@ private:
 // Win32 API are forwarded; GetModuleHandleW(NULL) names the title image;
 // title-memory, storage and Xbox-specific exports stay unresolved.
 void* resolve_kernelx(const ImportRequest& request);
+// d3d11_x.dll: D3D11.X objects with the title-visible Xbox layout over D3D12.
+// Unimplemented vtable slots call the trap handler (interface, slot); without
+// one they report and fail fast. A handler exists for tests only.
+using D3D11XTrapHandler = std::uintptr_t (*)(const char* interface_name, unsigned slot);
+void* resolve_d3d11x(const ImportRequest& request);
+void set_d3d11x_trap_handler(D3D11XTrapHandler handler);
 // EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
 void* resolve_etwplus(const ImportRequest& request);
 // Writable title storage root for file mutation APIs (DeleteFileW). Empty (the

@@ -7,7 +7,11 @@ if(NOT (WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
 endif()
 
 add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJECT_SOURCE_DIR}/src/era_kernelx.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp)
+            ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp
+            ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp)
+target_link_libraries(xboxone_era PRIVATE d3d12 dxgi dxguid)
+# 2 x 512 trap thunks; /bigobj keeps the section count within COFF limits.
+set_source_files_properties(${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 target_include_directories(xboxone_era PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(xboxone_era PUBLIC cxx_std_20)
 target_compile_options(xboxone_era PRIVATE /W4 /permissive-)

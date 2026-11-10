@@ -5,6 +5,8 @@
 #include <windows.h>
 
 #include <evntprov.h>
+#include <d3dcommon.h>
+#include <dxgi.h>
 
 #include <fstream>
 #include <string>
@@ -162,8 +164,65 @@ int main(int argc, char** argv) {
               reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ucrtbase.dll"), "malloc")),
           "CRT import binds to System32 ucrtbase");
     check(resolve_title_import({"VCRUNTIME140.dll", "memcpy", 0}) != nullptr, "vcruntime140 bound");
-    check(resolve_title_import({"d3d11_x.dll", "D3D11CreateDevice", 0}) == nullptr,
-          "D3D11.X is not silently replaced by host D3D11");
+    {
+        using Create = HRESULT (WINAPI*)(void*, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL*, UINT, UINT,
+                                         void**, D3D_FEATURE_LEVEL*, void**);
+        const auto create = reinterpret_cast<Create>(resolve_title_import({"d3d11_x.dll", "D3D11CreateDevice", 0}));
+        const HMODULE host_d3d11 = LoadLibraryW(L"d3d11.dll");
+        check(create && reinterpret_cast<void*>(create) != reinterpret_cast<void*>(GetProcAddress(host_d3d11, "D3D11CreateDevice")),
+              "D3D11.X bound to the D3D12 translation, not host D3D11");
+        check(resolve_title_import({"d3d11_x.dll", "D3D11XCreateDeviceX", 0}) == nullptr, "unobserved D3D11.X export not invented");
+        void* device = nullptr;
+        void* context = nullptr;
+        D3D_FEATURE_LEVEL level{};
+        HRESULT hr = create ? create(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, 7, &device, &level, &context) : E_FAIL;
+        if (FAILED(hr) && create) hr = create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, 7, &device, &level, &context);
+        check(SUCCEEDED(hr) && device && context, "D3D11.X device and immediate context created over D3D12");
+        if (device && context) {
+            using Query = HRESULT (STDMETHODCALLTYPE*)(void*, REFIID, void**);
+            using Count = ULONG (STDMETHODCALLTYPE*)(void*);
+            const auto vt = [](void* object) { return *static_cast<void* const* const*>(object); };
+            const auto refcount = [](void* object) { return *reinterpret_cast<const ULONG*>(static_cast<char*>(object) + 12); };
+            check(level >= D3D_FEATURE_LEVEL_10_0 && level <= D3D_FEATURE_LEVEL_11_1, "feature level capped at 11_1");
+            check(*reinterpret_cast<const ULONG*>(static_cast<char*>(device) + 8) == 0, "IGraphicsUnknown flags field zero");
+            check(refcount(device) == 2 && refcount(context) == 1, "title-visible refcounts (context holds the device)");
+            constexpr GUID device_x{0x177700F9, 0x876A, 0x4436, {0xB3, 0x68, 0x36, 0xA6, 0x04, 0xF8, 0x2C, 0xEF}};
+            constexpr GUID context_x{0x48800095, 0x7134, 0x4BE7, {0x91, 0x86, 0xB8, 0x6B, 0xEC, 0xB2, 0x64, 0x77}};
+            void* same = nullptr;
+            check(reinterpret_cast<Query>(vt(device)[0])(device, device_x, &same) == S_OK && same == device &&
+                  refcount(device) == 3, "QueryInterface(ID3D11DeviceX) returns the device with a reference");
+            check(reinterpret_cast<Count>(vt(device)[2])(device) == 2, "Release decrements the visible refcount");
+            same = &same;
+            check(reinterpret_cast<Query>(vt(device)[0])(device, context_x, &same) == E_NOINTERFACE && !same,
+                  "unknown interface rejected with E_NOINTERFACE");
+            check(reinterpret_cast<Query>(vt(context)[0])(context, context_x, &same) == S_OK && same == context,
+                  "context answers ID3D11DeviceContextX");
+            reinterpret_cast<Count>(vt(context)[2])(context);
+            *reinterpret_cast<ULONG*>(static_cast<char*>(context) + 12) += 1; // Inline title AddRef.
+            check(reinterpret_cast<Count>(vt(context)[2])(context) == 1, "Release honours an inline refcount change");
+
+            static const char* trapped_interface = nullptr;
+            static unsigned trapped_slot = 0;
+            set_d3d11x_trap_handler([](const char* name, unsigned slot) -> std::uintptr_t {
+                trapped_interface = name;
+                trapped_slot = slot;
+                return 0xdead;
+            });
+            using Any = std::uintptr_t (*)(void*);
+            check(reinterpret_cast<Any>(vt(device)[7])(device) == 0xdead && trapped_slot == 7 &&
+                  std::string(trapped_interface) == "ID3D11DeviceX", "unimplemented device slot reports interface and slot");
+            check(reinterpret_cast<Any>(vt(context)[300])(context) == 0xdead && trapped_slot == 300 &&
+                  std::string(trapped_interface) == "ID3D11DeviceContextX", "unimplemented context slot reports itself");
+            set_d3d11x_trap_handler(nullptr);
+            check(reinterpret_cast<Count>(vt(device)[2])(device) == 1, "title releases its device reference");
+            check(reinterpret_cast<Count>(vt(context)[2])(context) == 0, "last context release frees context and device");
+        }
+        D3D_FEATURE_LEVEL probe{};
+        check(create && create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, 7, nullptr, &probe, nullptr) == S_FALSE &&
+              probe != D3D_FEATURE_LEVEL{}, "level probe without outputs returns S_FALSE");
+        check(create && create(nullptr, D3D_DRIVER_TYPE_REFERENCE, nullptr, 0, nullptr, 0, 7, &device, nullptr, nullptr) ==
+              DXGI_ERROR_UNSUPPORTED && !device, "unsupported driver type rejected");
+    }
 
     std::cout << (failures ? "era_loader: FAILED\n" : "era_loader: all checks passed\n");
     return failures ? 1 : 0;

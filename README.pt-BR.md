@@ -1,11 +1,11 @@
 <div align="center">
-  <img src="docs/assets/xone-native-banner.svg" alt="Arte conceitual original do xone-native: SystemOS e GameOS separados, conectados a uma plataforma de compatibilidade nativa; não é captura da dashboard" width="100%" />
+  <img src="docs/assets/xone-native-banner.webp" alt="Arte conceitual do xone-native mostrando a transição de console para PC por camadas de compatibilidade; não é captura do sistema" width="100%" />
 
   # xone-native
 
   **Projeto aberto de pesquisa para executar componentes originais do Xbox One e jogos no PC, com a dashboard autêntica do SystemOS como objetivo central.**
 
-  [![CI/CD](https://img.shields.io/github/actions/workflow/status/fabegalo/xboxone-native/build.yml?branch=main&event=push&label=CI%2FCD)](https://github.com/fabegalo/xboxone-native/actions/workflows/build.yml?query=branch%3Amain)
+  [![CI/CD](https://img.shields.io/github/actions/workflow/status/fabegalo/xone-native/build.yml?branch=main&event=push&label=CI%2FCD)](https://github.com/fabegalo/xone-native/actions/workflows/build.yml?query=branch%3Amain)
   [![M0: apenas inspeção](https://img.shields.io/badge/marco-M0%20%7C%20inspe%C3%A7%C3%A3o-555)](#estado-atual)
   [![Experimental](https://img.shields.io/badge/estado-experimental-orange)](#estado-atual)
   [![BSD-3-Clause](https://img.shields.io/badge/licen%C3%A7a-BSD--3--Clause-blue)](LICENSE)

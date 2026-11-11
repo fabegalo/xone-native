@@ -1,5 +1,361 @@
-# Próxima tarefa — M1: ativação de um componente original legível
+# Roadmap de implementação — xone-native
 
+Atualizado em **2026-11-10**. Base inspecionada: `a5e927385aaf21f912f7d6b5cd2805307c4d68d5` e alterações locais concorrentes de CoreApplication/WinRT, ainda sem certificação por esta revisão. Este documento define a sequência técnica de trabalho; não declara os incrementos abaixo concluídos nem aprova escolhas arquiteturais internas.
+
+## Estado técnico de partida
+
+- `src/era_loader.cpp` / `include/xboxone_native/era_loader.h`: `Image::load` mapeia PE32+ AMD64, aplica realocações, resolve imports, protege seções e registra unwind. `process_attach()` executa callbacks TLS; `entry()` expõe a entrada. Delay imports continuam recusados explicitamente.
+- `src/era_tls_slot.cpp` / `src/era_tls_slot.h`: módulo `xone-era-tls` e contrato `EraTlsTitle` para template, zero-fill e callbacks de um título em processo. Não equivale a carregamento genérico de todas as DLLs de um pacote.
+- `src/era_main.cpp`: `xone-era check|run`; execução nativa na thread do launcher, diagnóstico de exceção e watchdog de 15 s por padrão, máximo de 600 s. Isso não constitui sandbox nem supervisor completo sistema/jogo.
+- `src/era_host.cpp`, `src/era_kernelx.cpp`, `src/era_winrt.cpp`: resolvedores de imports e ativação; encaminhamentos auditados e classes locais limitadas. `XboxLiveConfiguration` lê identidade do manifesto; `User` oferece parte dos eventos; DLC retorna coleção vazia no cenário sem conteúdo montado. Nenhuma conexão online decorre disso.
+- `src/era_core_application.cpp`: alteração local em andamento com `CreateView -> Initialize -> SetWindow -> Load -> Activated -> Run -> Uninitialize` e janela Win32. `CoreWindow` e outros slots ainda incompletos. A presença do código não prova execução correta nem frame de jogo.
+- `src/era_d3d11x.cpp`: `D3D11CreateDevice` cria device/context e fila D3D12. As vtables de device/context implementam apenas identificação e referências; os demais slots param com interface e número do slot. Ainda não é renderer de jogos.
+- `src/inspection.cpp`, `src/inventory.cpp`, `src/bootstrap.cpp` e AppModel já oferecem inspeção, identidade, grafo e supervisão em seus caminhos existentes. Esses controles ainda precisam ser integrados ao caminho ERA sem confundir os contratos de SystemOS e GameOS.
+- `Presenter` e `FramePipe` possuem infraestrutura de apresentação/transferência de pixels. Não traduzem comandos gráficos Xbox. Vulkan/Metal e execução ERA fora de Windows x64/MSVC permanecem lacunas.
+- Permanecem sem comprovação nesta revisão: frame de jogo, gameplay, dashboard original, retorno sistema/jogo, áudio/entrada de título e persistência completa. A trilha SystemOS continua dependente de componentes originais legíveis da revisão correta.
+
+## Regras de execução do roadmap
+
+A arquitetura comum mantém launcher, catálogo, execução, runtime/HLE, Original GPU/Native GPU, sistema original e supervisor/adaptadores. Compartilhar um estado lógico de console e reutilizar os módulos existentes. Não substituir o sistema original por uma interface própria nem transformar um jogo em implementação particular do produto.
+
+Antes de mudar fronteiras de serviços/HLE, backend de execução, modelo de processo, GPU ou exigência de VM, apresentar situação atual, proposta, alternativas, tradeoffs e impacto; aguardar validação do mantenedor. Registrar a decisão neste documento ou no documento autoritativo do subsistema. O roadmap autoriza planejamento, não decide automaticamente essas escolhas. Não reabrir decisões já aprovadas.
+
+Não bloquear o trabalho ERA independente pela ausência de insumo SystemOS. Não interpretar o avanço ERA como resolução do boot original. Usar contratos e evidência observados, preservando erros explícitos e sem substituir funcionalidade ausente por sucesso fictício.
+
+## Ordem e dependências
+
+| Etapa | Prioridade | Dependência | Resultado verificável |
+| --- | --- | --- | --- |
+| R0 — baseline e bloqueio atual | P0 | Nenhuma | Revisão efetiva e primeira parada reproduzível |
+| R1 — identidade e preparação ERA | P1 | R0 | Pacote/dependências conferidos antes de executar |
+| R2 — ciclo de aplicação e serviços | P1 | R0; R1 antes de execução original integrada | Inicialização, loop e encerramento verificáveis |
+| R3 — primeiro caminho gráfico completo | P2 | R2 para título; fixtures podem preceder | Comandos produzem pixels conferidos |
+| R4 — armazenamento, perfis e entrada | P2 | R1/R2; iniciar antes se forem o bloqueio real | Estado persistente e interação coerentes |
+| R5 — áudio e mídia | P3 | R2; antecipar se necessário ao caminho observado | Áudio com formato, canais e timing verificados |
+| R6 — cobertura gráfica e GPU modes | P3 | R3; decisões de fronteira validadas | Fidelidade e melhorias com o mesmo estado |
+| R7 — sistema original e supervisor | Paralela | Insumo original para execução SystemOS | Dashboard -> jogo -> retorno autênticos |
+| R8 — portabilidade e estabilização | Transversal | Contratos definidos; execução por backend validado | Evidência separada por host/ISA/backend |
+
+**Próxima ação:** reconciliar as alterações locais R2, identificar o executável efetivo e obter a primeira parada atual com revisão/hash e limite de tempo. Implementar o menor contrato bloqueante com teste próprio; não criar outro loader ou uma nova lista genérica de stubs. Não há cronograma temporal estimado sem medir esses bloqueios.
+
+## R0 — baseline reproduzível e diagnóstico
+
+**Pontos de implementação:** `src/era_main.cpp`, `cmake/Era.cmake`, `tests/era_loader_tests.cpp` e as fixtures `era_component`/`era_tls_component`.
+
+1. Conferir HEAD, diff local, configuração Release, executável usado e `xone-era-tls.dll` correspondente. Não sobrescrever alterações concorrentes. Reusar o build incremental compatível.
+2. Vincular cada evidência a hash do título, manifesto, módulos, runtime e configurações relevantes. Reusar fingerprint/inventário existentes, sem copiar conteúdo original.
+3. Registrar a primeira falha com biblioteca/símbolo ou classe/IID/slot, HRESULT/exception code e endereço relativo ao módulo. Conservar a falha original como controle negativo, quando reproduzível.
+4. Cobrir `run`, hook de ativação e watchdog com fixture própria em subprocesso: sucesso, falha de inicialização e timeout sem processo da tarefa remanescente. O watchdog não deve converter falha em sucesso nem matar processos alheios.
+
+**Aceite:** regressões sintéticas relevantes passam; uma execução original autorizada e limitada identifica o bloqueio atual ou demonstra avanço concreto. Não concluir pelo número de imports resolvidos.
+
+**R0 — Forza Horizon 2, 2026-11-10:** pacote `Anthem` 1.0.0.64, entrada `Mount/forza_durango_release_final.exe`, SHA-256 `3EC04C6163FB5614E3D351BA0570D39B846041A257715D6340ECEB03CCB7F0A3`; manifesto SHA-256 `61F0AA59C24B6D16F92755ADE9D51E5BF2814D8BC90E280EA58CC57545802370`. Em `9c3feac` com as alterações locais R2/GPU preservadas, build Release Windows x64 e `era_loader_regressions`/`era_check_cli` passaram. `xone-era check` resolve 75 imports e recusa 573: CRT/CX 2012 (440), kernelx (60), Winsock (45), AcpHal (9), XG (7), mídia/dispositivos (7), D3D11.X (3), EtwPlus (1) e bcrypt (1). Não houve chamada à entrada nem frame. Decisão do mantenedor aprovada em 2026-11-10: ampliar incrementalmente a compatibilidade/HLE dessa ABI nos módulos existentes, começando por CRT/CX 2012 e serviços observados, depois GPU e áudio, preservando a arquitetura comum e um único estado para Fiel/Enchanced. Módulos originais ou abordagem híbrida permanecem alternativas dependentes de ABI/proveniência verificadas; os modos gráficos continuam sem certificação.
+**Incremento R0/R2/R3 validado:** CRT/CX 110, WinRT 110/140, APIs kernelx, política de escrita na raiz de saves e Winsock auditado; verificação estrita atual: **619 imports resolvidos / 29 ausentes**, versus 75/573 inicialmente. `run --stop-on-missing` é diagnóstico opt-in: imports/classes/slots ausentes encerram com saída 125 e diagnóstico, sem retornar sucesso; continuam ausentes na contagem. Execução normal mantém a recusa de carregar com imports ausentes. Sete testes focados passaram em Release Windows x64: inspeção do catálogo, áudio sintético, loader/serviços, CLI de check, CLI negativa em subprocesso e memória em hardware/WARP. O cache local do MSVC tinha prefixo de includes com encoding incorreto; foi reconciliado com a saída real do compilador e os objetos ERA afetados foram reconstruídos. Ninja agora registra os headers locais como dependências.
+
+**Decisão do mantenedor, 2026-11-10 — memória CPU/GPU aprovada e implementada para buffers:** registro único em `src/era_kernelx.cpp`, contratos internos em `src/era_memory.h`; `XMemAllocDefault/FreeDefault` preservam atributos/alinhamento e ownership. A mesma região CPU é associada sob demanda a heap/buffer D3D12, sem cópia desconectada. Pins recusam uso concorrente e conservam memória até a fence; free com pin é adiado. Testes pequenos verificam bytes CPU→GPU e GPU→CPU, offsets, erros, estado de retirada e liberação após conclusão, separadamente na **NVIDIA GeForce RTX 4070** e no **Microsoft Basic Render Driver/WARP**. `OpenExistingHeapFromAddress` exigiu `ALLOW_CROSS_ADAPTER` no buffer aberto em heap compartilhado. Referência de API: [Microsoft](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromaddress). Páginas físicas/4 MiB, texturas/tile layouts e integração das chamadas gráficas do título permanecem sem suporte; esses testes não são frames do Forza. O mesmo estado atende Fiel/Enchanced; os modos ainda não estão certificados.
+
+**Avanço R1/R2 pela referência fornecida:** Ghidra, projeto existente em modo somente leitura, binário SHA-256 `56d2c9cb6ccf3ae1836dee9676b64285f3a247efa2d12cf02c6c742696b3b092`: funções `1404d0a70`/`1404d10e0` fundamentam o catálogo `hash.manifest` (registros LE de 12 bytes, ID no offset 8, sentinelas >= `0x3fffffff` excluídas). O pacote fornecido contém 2.415 registros, 1.394 IDs válidos distintos, incluindo 69. Parser limitado na inspeção e consulta no deployment existente substituem a parada em `IsChunkInstalled(69)`; catálogo ausente/malformado retorna erro, ID ausente retorna falso e rebinding invalida o cache. Isso interpreta metadados locais, sem autenticar todos os assets nem inventar instalação/entitlement. A extensão Xbox do enumerador de áudio usa canais do formato real do endpoint e notificações encaminhadas por worker; ABI de slots e callback confirmada no Ghidra, incluindo o callback do título em `141014730`. A ativação informa `ActivationKind::Launch`. Testes sintéticos cobrem erros, retenção e remoção de callbacks; não comprovam reprodução ou hotplug físico.
+
+**Avanço da ABI gráfica, 2026-11-10:** fábrica `D3D11XCreateDeviceX` vinculada explicitamente ao `combase.dll` original 6.2.11295.0, sem executar essa DLL. A entrada original `18000149c` e o helper `1800010e4` (SHA-256 `77a8812416b63ab0ba12390452519f4a4b00005561e31e43213bc8a2555a9d30`) confirmam descritor e duas saídas obrigatórias. Na `umd.dll` correspondente (SHA-256 `bca2d2d3dff9bd88926e5a2603bacbbcc203e67af77ce092db654ad7daa772f1`), `18002c770` exige SDK `0x1000b`; `1800228e0`/`180023110` mostram que a flag observada `0x04000000` desativa a thread de exclusão adiada. O runtime preserva liberação síncrona com fence, contadores públicos antigos em +8 e retenção interna separada; o contexto imediato conserva identidade após zero referências públicas. DXGI antigo tem slot extra em 5: GetAdapter em 8/GetParent em 7. Enumeração usa o adaptador D3D12 real por LUID. CoreDispatcher processa mensagens reais com afinidade à thread e valida as quatro opções. Parâmetros/slots não implementados continuam explícitos; o layout completo dos helpers inline de contexto não está certificado.
+
+**Compromisso gráfico compartilhado validado:** pedido observado `VirtualAlloc(..., 0x10000, 0x30001000, 0x10004)` em reserva própria agora substitui um placeholder por mapeamento de paginação compartilhado, conservando endereço e modo solicitado no registro único. `OpenExistingHeapFromAddress` sobre compromisso parcial falhou com `E_INVALIDARG` em hardware/WARP; a solução usa `OpenExistingHeapFromFileMapping`, sem cópia desconectada. Testes nos dois backends conferem CPU→GPU, GPU→CPU, spans independentes, pin/fence, recusa de sobreposição/mudança de modo e decommit/recommit/liberação da reserva. Sem suporte a aliases físicos/ESRAM ou outros modos de página. Referências de host: [MapViewOfFile3](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3), [heap compartilhado](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device3-openexistingheapfromfilemapping).
+
+**Primeira parada gráfica atual do Forza:** probe autorizado de até 10 s passa por dispositivo/contextos, monitores, compromisso gráfico, DMA 1/2, shaders, input layout, estados e buffers, inclusive armazenamento estruturado/UAV e argumentos indiretos. Para em **`CreateUnorderedAccessView`, slot 8, saída diagnóstica 125**: buffer de 280.000 bytes, stride 28, 10.000 elementos, APPEND, offset real `+16` no heap compartilhado. Esse offset não é divisível pelo stride; não arredondar o endereço nem fabricar view. Ghidra confirmou o alocador de sistema `0x80` em `1800c3930/1800c53f4`; corrigido o ID 3 indevido, mantendo os hooks. O controle negativo reproduz a falha com ID 3 e a regressão passa com `0x80`; o título continua retornando `+16` mesmo com o ID correto. Essa diferença real de representação do D3D12 exige o próximo incremento. Ainda não houve frame, gameplay ou áudio reproduzido confirmado; originais permaneceram sem patch/deployment.
+
+**Cobertura R3 comprovada:** DXBC VS/PS/CS 5.0 é validado e conservado em memória; input layout e estados depth/stencil, blend/rasterizer e sampler preservam dados e ownership. Buffers antigos têm descritor de entrada de 32 bytes, SRD em `+32`, alocação em `+48`, GetDescriptor 11 e GetDesc 12. UAVs estruturados alinhados possuem recurso/contador real de quatro bytes, prefixo e faixa conferidos, GetResource com retenção e IID correto; offsets incompatíveis são recusados. Sampler possui SRD em `+32`, GetDescX de 16 bytes e recusa de bordas personalizadas. Contexto mantém tabela em `+0x3d0`, GetType/GetContextFlags 112/113 e recusa FinishCommandList 114. Na RTX 4070 e no WARP, fixtures próprias conferem clear UAV e um pipeline CS 5.0 que faz Append: dados e contador 0→1 chegam à mesma memória CPU e ao readback após fence. Isso não é execução de shaders do FH2. Pipelines/comandos do jogo, scissor dinâmico, texturas e demais contratos seguem incompletos.
+
+**Decisão do mantenedor, 2026-11-10 — DMA aprovada e implementada para sincronização:** engines em filas de cópia D3D12 separadas, no mesmo dispositivo e registro CPU/GPU, com fences reais e dependências explícitas. Alternativa comparada: serialização na fila direta. Slots de criação/lifetime, GetType, InsertFence, WaitOnFence, Submit e IsFencePending estão ligados a operações reais; teste na RTX 4070 confirma espera entre filas, submissão diferida, retenção e reuso do engine sem resetar tokens. Cópias/codecs DMA ainda são recusados; testes de bytes hardware/WARP validam o registro de memória, não esses comandos.
+
+**Validação pendente — buffers desalinhados:** proposta de recursos GPU alinhados por buffer, associados ao mesmo registro CPU/GPU, com cópias sincronizadas, fences reais e coerência de aliases; alternativa: lowering dos shaders para buffers raw sobre a memória compartilhada. Preservar hooks, endereços do título e estado comum Fiel/Enchanced. A decisão específica de representação está aguardando o mantenedor conforme seção 2; não tratar como já implementada/aprovada. Enquanto isso, o caso `+16`/stride 28 fica como regressão negativa explícita.
+
+**Limites de reprodução:** sete regressões focadas passaram após esses incrementos. Uma rodada anterior do loader excedeu o timeout de 20 s; repetições passaram, sem causa isolada. Um probe falhou antes da criação gráfica, com recusa da reserva fixa de 4 GiB em `0xA00000000` (Win32 487), seguida de AV/corrupção de heap; o probe seguinte chegou ao sampler. Preservado reproducer compacto e adicionado diagnóstico limitado de região ocupada, sem remapear o endereço ou atribuir causa ainda não demonstrada.
+## R1 — catálogo, revisão e preparação para ERA
+
+**Pontos de implementação:** `src/inspection.cpp`, `src/inventory.cpp`, `src/bootstrap.cpp`, `include/xboxone_native/bootstrap.h`, `src/era_main.cpp`, `src/era_loader.cpp` e `src/era_host.cpp`.
+
+1. Projetar a integração dos controles de `Artifact`, `ImportBinding`, identidade e grafo com ERA, preservando os domínios existentes. A forma de compartilhamento deve ser validada antes de alterar a fronteira; não simplesmente tratar GameOS como SystemOS.
+2. Antes de `Image::load`, conferir EXE selecionado no manifesto, revisão, SHA-256, recursos e bindings por identidade. Rejeitar ambiguidades, traversal, links não autorizados, versões divergentes e dependências não auditadas. Preservar Unicode/caminhos longos.
+3. Para cada módulo privado efetivamente necessário, definir identidade, ordem de inicialização, exports/forwarders, ownership e descarregamento. Implementar suporte apenas após decidir sua integração ao loader existente.
+4. Estender delay imports somente quando exigidos e com cobertura de descritores truncados, RVA/VA, ordinais e resolução tardia. Até lá, manter a recusa `delay-load imports not implemented`.
+5. Se surgirem patches, exigir evidência do contrato, identidade/bytes esperados e rejeição de revisão diferente; avaliar primeiro uma implementação genérica do serviço. Não introduzir patches por offset sem essas garantias.
+
+**Aceite:** uma fixture válida prepara; alteração de hash, versão, binding ou módulo bloqueia antes da entrada. Preparação não executa título. Bibliotecas de terceiros mantêm licença/proveniência registradas.
+
+## R2 — CoreApplication, WinRT e serviços do runtime
+
+**Pontos de implementação:** `src/era_core_application.cpp`, `src/era_winrt.cpp`, `src/era_winrt_object.*`, `src/era_winrt_classes.h`, `src/era_xbox_services.cpp`, `src/era_xbox_system.cpp`, `src/era_xbox_deployment.cpp`, `src/compatibility.cpp` e `tests/era_loader_tests.cpp`.
+
+1. Validar a sequência `CreateView/Initialize/SetWindow/Load/Activated/Run/Uninitialize` com um `IFrameworkViewSource` próprio. Verificar HRESULT de cada etapa, limpeza após falha parcial, ownership COM, destruição da janela e reinicialização permitida pelo contrato.
+2. Completar somente os métodos observados de `CoreWindow`, view, argumentos de ativação e dispatcher. Documentar IID, assinatura, calling convention e slots a partir de ABI verificada; não assumir layouts equivalentes entre revisões.
+3. Definir thread dona da janela, bombeamento de mensagens, fechamento e cancelamento; preservar afinidade e evitar reentrância. Decidir integração com os adaptadores existentes antes de consolidar outro loop/janela permanente.
+4. Testar tokens de eventos, retenção/liberação de handlers, remoção durante dispatch e propagação de falhas. Eventos de suspensão/retomada só passam a funcionar quando houver transições reais correspondentes.
+5. Completar usuário local, coleções e resultados assíncronos conforme o caminho observado. Não considerar `UserAdded/UserRemoved` como sistema de perfis completo nem coleção DLC vazia como suporte a instalação/conteúdo.
+6. Reconciliar os diagnósticos de `compatibility::service_blocker` com os provedores ERA implementados, distinguindo domínio e cobertura por método. Não liberar genericamente serviços SystemOS porque uma classe GameOS foi implementada.
+7. Manter identidade e comportamento offline explícitos; classes não implementadas preservam erro ou trap diagnosticável. Nunca fabricar conexão ou entitlement.
+
+**Aceite:** fixture percorre ciclo normal e falhas parciais com limpeza; título ultrapassa o bloqueio identificado com ABI conferida. Janela aberta ainda não significa frame renderizado.
+
+## R3 — recursos, shaders, comandos e primeira imagem do jogo
+
+**Pontos de implementação:** `src/era_d3d11x.cpp`, `src/presentation*.cpp`, `src/presentation_backend.h`, `include/xboxone_native/presentation.h`, `tests/era_loader_tests.cpp` e `tests/presentation_tests.cpp`.
+
+1. A partir das chamadas reais, mapear interface/IID/slot e estruturas de recursos; manter o layout visível ao título e o ownership COM. As tabelas implementam apenas os métodos de criação/lifecycle/DXGI e getters verificados; adicionar métodos não equivale a preencher todos os 512 slots reservados.
+2. Implementar o menor conjunto coerente de buffers/texturas/views, descritores e uploads necessários ao primeiro draw. Definir formatos, pitches, subrecursos, alinhamento, aliasing e visibilidade CPU/GPU; não deduzir valores de hardware.
+3. Identificar o formato real de shader e separar leitura/validação, representação intermediária quando necessária e geração para o backend. Validar vertex/pixel e os estágios efetivamente exigidos; instrução desconhecida interrompe com diagnóstico, sem shader vazio.
+4. Implementar estados de rasterização, blend, profundidade/stencil, samplers e pipeline; preservar semântica de draw/dispatch. Não pular efeitos, comandos ou asserts para conseguir uma imagem.
+5. Implementar gravação/submissão, barriers, fences e vida útil de recursos em voo. Cobrir upload seguido de uso, render target seguido de leitura e liberação enquanto há trabalho pendente.
+6. Validar a fronteira entre tradução D3D11.X, janela do título e `Presenter`; `present_frame(ExternalFrameView)` serve para staging de pixels, não traduz comandos. Não marcar frame de jogo como `systemos_component` nem contar teste sintético como autenticidade original.
+
+**Aceite em dois níveis:** fixture pequena com readback de pixels esperados e controles negativos; depois frame original com origem, hash, estado e captura correspondentes. Relatar hardware e WARP separadamente. Primeira imagem não certifica gameplay ou fidelidade global.
+
+## R4 — armazenamento, perfis e entrada
+
+**Pontos de implementação:** política atual em `src/era_kernelx.cpp`, serviços de usuário em `src/era_xbox_system.cpp`, fronteira `src/era_winrt.cpp` e configuração/supervisão em `src/era_main.cpp`. Não há ainda backend completo de saves ou gamepads nesses módulos; nomes de arquivos futuros serão definidos na integração, sem tratá-los como existentes.
+
+1. Validar o contrato comum de usuário/título e raiz de armazenamento antes de implementar contêineres/blobs. `set_title_storage_root` e `DeleteFileW` são uma política parcial, não um sistema de saves.
+2. Modelar leitura, enumeração, quota, gravação, exclusão e publicação de revisão com uma identidade coerente. Definir commit/recuperação e preservar a última revisão válida; testar falha em cada fase com fixture pequena, nunca saves originais.
+3. Integrar perfil e permissões com armazenamento e input. Separar identidade local de autenticação online; preservar migrações e saves existentes.
+4. Implementar leitura de controles pelo adaptador de host e projetá-la nas interfaces esperadas pelo título: associação a usuário, botões/eixos, timestamps, hotplug e cancelamento. Definir vibração/force feedback somente com contrato observado.
+
+**Aceite:** save reaparece em nova sessão; falha interrompida não destrói a versão válida; caminhos externos não sofrem mutação pelos serviços implementados. Entrada validada por sequência de estados/eventos, incluindo desconexão. Isso não certifica sandbox de todo o processo.
+
+## R5 — áudio e mídia
+
+**Integração prevista:** resolvedor em `src/era_host.cpp`/`resolve_title_import`, runtime de serviços e adaptadores de host. A separação do módulo e dependências precisa ser validada antes da implementação.
+
+1. Inventariar imports/interfaces, formatos de entrada, codec, frequência e canais realmente usados. Não encaminhar structs/vtables Xbox a XAudio desktop sem conferir ABI.
+2. Implementar criação de engine/voices, submissão de buffers, callbacks, posição e encerramento; definir ownership e evitar alocação/bloqueio indevidos na thread de áudio.
+3. Integrar decodificação licenciada quando necessária; preservar mixagem, volume, matriz de canais, efeitos e sincronização. Rejeitar formato/grafo sem suporte com erro real.
+
+**Aceite:** fixtures de tom/impulso e buffer conhecido conferem duração, canais, callbacks e término; integração compara áudio e timing sob condições equivalentes. Build de codec não comprova reprodução de título.
+
+## R6 — cobertura e caminhos Original GPU / Native GPU
+
+1. Expandir após R3 os contratos efetivamente usados: compute, geometria/tessellation, DMA, layouts de textura, memória gráfica/ESRAM, queries e sincronização. Cada extensão precisa de caso observável e controle negativo; não inventar suporte por nome da API.
+2. Definir e validar as fronteiras dos dois modos, compartilhando recursos lógicos, memória, timing e estado de jogo. Melhorias de resolução/apresentação não podem alterar simulação ou remover efeitos.
+3. Ao introduzir caches, vincular identidade de shader, configuração, versão do tradutor/backend e dependências relevantes; validar invalidação, publicação interrompida e rejeição de entrada incompatível. Não criar cache antes de haver custo/necessidade demonstrados.
+4. Medir a rota real sob mesmas condições antes/depois. Instrumentação opcional fora do caminho normal; sem fast-math/SIMD global não justificados e sem benchmark simultâneo a build.
+
+**Aceite:** estado/pixels comparados em fronteiras equivalentes; diferenças conhecidas e títulos/revisões testados explícitos. Cobertura não é porcentagem de funções ou número de métodos preenchidos.
+
+## R7 — SystemOS, sessão e retorno ao sistema
+
+**Pontos de implementação:** `src/bootstrap.cpp`, `src/appmodel*.cpp`, `src/compatibility.cpp`, `src/frame_pipe.cpp`, `include/xboxone_native/presentation.h` e supervisor/adaptadores existentes.
+
+1. Obter componente original legível autorizado e recursos da mesma revisão; manter bloqueio explícito enquanto ausente. Não repetir montagem recusada no mesmo ambiente sem nova evidência nem contornar proteção.
+2. Concluir a fixture AppModel positiva no ambiente descartável previsto. Distinguir ativação desktop empacotada, serviços Xbox e execução original; sem deployment no host do usuário.
+3. Identificar o contrato real de shell/composição/serviços; estender por evidência. HLE seletivo, firmware e híbrido exigem comparação e decisão do mantenedor, preservando a interface original.
+4. Integrar saída real com `ExternalFrameView` ou, após implementação e validação, o handoff GPU descrito por `SystemOsSurfaceHandoffDesc`. O descritor sozinho não implementa importação de textura.
+5. Validar a fronteira de supervisão entre original e título: início, parada cooperativa, timeout/falha, flush de saves, drenagem de GPU/áudio, liberação de input e retorno real ao menu. Reusar o gerenciamento existente; watchdog sozinho não resolve essas transições.
+
+**Aceite:** dashboard/Guide e jogo originais com identidade registrada, entrada/saída e retorno observados; falha de título não corrompe estado persistente. Exigir origem real, logs e captura; contadores de autenticidade não são prova isolada. As instruções SystemOS anteriores permanecem abaixo para os insumos e bloqueios específicos.
+
+## R8 — portabilidade, integração e critérios de entrega
+
+- Manter interfaces compartilhadas e mover dependências Win32/COM/D3D12 para seus adaptadores ao implementar os outros hosts. Não criar uma segunda lógica de console por plataforma.
+- Para Windows ARM64, Linux x64/ARM64 e macOS Intel/Apple Silicon, avaliar backend de execução, ABI, threads/TLS/exceções e serviços. Execução direta AMD64 não resolve cross-ISA; comparar opções e aguardar decisão antes de implementação arquitetural. Steam Deck pertence ao alvo Linux.
+- Implementar Vulkan/Metal com contratos de recursos/sincronização equivalentes aos modos aprovados. Compilar um frontend ou apresentar um buffer não certifica execução de título nesse host.
+- Evoluir o launcher de gerenciamento existente a partir do CLI: importar/referenciar, conferir revisão/dependências, preparar, configurar e iniciar sessão. Não criar segunda interface de sistema ou duplicar catálogo, saves e runtime.
+- Testar por mudança: loader/ABI -> `era_loader_regressions` e `era_check_cli`; gráfico -> regressões ERA e `presentation_regressions`; transporte -> `frame_pipe_regressions`; bootstrap/AppModel -> grupos correspondentes já definidos no CMake. Recompilar dependências invalidadas; só ampliar suítes diante de nova superfície de risco.
+- Revisar licenças/proveniência antes de incorporar código/dependências. Não versionar firmware, jogos, traduções proprietárias, estado pessoal ou capturas proprietárias.
+
+**DoD por incremento:** código ligado ao caminho de produção, regressão focada, erro explícito para restante não suportado, evidência sintética separada da original, revisão e hosts testados identificados. Atualizar somente o menor trecho autoritativo que mudou; não replicar este roadmap em relatórios paralelos.
+
+**Orçamento operacional:** usar um scratch da tarefa, um build incremental necessário por toolchain/configuração e o limite de diagnóstico de 1 GiB/200 arquivos; dimensionar antes de trabalho pesado, limitar duração/logs e limpar apenas descartáveis comprovadamente próprios. Não apagar outputs ativos, saves ou originais.
+
+## Bibliotecas, SDKs e dependências por etapa
+
+Esta matriz distingue dependência existente de candidata. Não instalar nem integrar todas as candidatas por antecipação. Fixar versão/hash e opções de build quando uma necessidade real justificar a inclusão; conferir licença e redistribuição dessa configuração. Toolchains e compiladores de shader são ferramentas, não um runtime alternativo de console.
+
+| Estado | Biblioteca/SDK | Etapa e uso técnico | Integração e condição |
+| --- | --- | --- | --- |
+| Existente | C++20/STL, CMake e CTest; MSVC/Windows SDK no ERA | R0–R8: build, código e testes | Reusar targets atuais; Python 3 serve aos testes/ferramentas existentes |
+| Existente | `d3d12`, `dxgi`, `dxguid` | R3/R6: device, filas, recursos e apresentação Windows | `xboxone_era` e `xboxone_presentation`; falta implementar os contratos gráficos do título |
+| Existente | `user32`, `kernel32` | R2/R7: janela, mensagens, threads, TLS e processos | Adaptadores Windows; não estender encaminhamentos sem auditar semântica/ABI |
+| Existente | `runtimeobject`, `ole32`, `oleaut32` | R2: ativação WinRT, COM e tratamento de erros | Reusar a fronteira `get_title_activation_factory`; auditar referências e afinidade |
+| Existente | `xmllite`, `shlwapi`, `uuid` | R1/R2: leitura de manifestos e identidade | Reusar leitura limitada, sem DTD/resolver externo; compartilhar evidência verificada |
+| Existente | `bcrypt` | R0/R1: primitivas criptográficas necessárias no Windows | Não duplicar o SHA-256 já disponível no projeto sem necessidade |
+| Existente, uso delimitado | `advapi32` | Diagnóstico XVD e símbolos ETW auditados | Não transformar provedor de diagnóstico em backend de boot |
+| Carregamento dinâmico existente | UCRT/VC runtime, `msvcp140`, `concrt140`, `vccorlib140`, `combase` | ERA: exports com ABI conferida | `src/era_host.cpp`, busca System32; conferir módulos efetivos e termos de distribuição; não copiar DLLs de origens arbitrárias |
+| Candidata | [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler) (`dxcompiler`) | R3/R6: HLSL para DXIL ou SPIR-V, se a representação escolhida exigir | Não traduz automaticamente shaders de console; integrar após identificar a entrada e validar o caminho de tradução |
+| Candidatas | Vulkan SDK/loader e [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | R6/R8: backend Vulkan e validação de SPIR-V | Somente após fronteira de GPU aprovada; não adicionar ao build Windows D3D12 sem consumidor |
+| Candidatos/alternativas | Metal SDK e [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | R8: saída macOS; SPIRV-Cross apenas se SPIR-V -> MSL for necessário | Comparar geração MSL e demais rotas antes de escolher; não pressupor substituição automática de sincronização/layouts |
+| Candidata | [SDL3](https://wiki.libsdl.org/SDL3/FrontPage) | R4/R5/R8: gamepads, eventos e/ou áudio de host multiplataforma | zlib; avaliar um adaptador comum frente às APIs nativas, sem duplicar janela, mixer ou estado de input |
+| Candidatas/alternativas de host | Windows.Gaming.Input/XInput; XAudio 2.9/WASAPI | R4/R5: controle e áudio Windows | Escolher por contrato necessário; APIs desktop não implementam por si só a ABI Xbox. SDL3 pode atender parte desses adaptadores |
+| Candidata condicional | [FFmpeg](https://www.ffmpeg.org/legal.html): `libavcodec`, `libavutil`; `libswresample`/`libavformat` apenas se necessários | R5: codecs, conversão e demux realmente usados | Selecionar decoders e testar formatos; licença depende dos componentes/opções. Evitar GPL/nonfree não aprovados; registrar configuração e obrigações antes de distribuir |
+| Decisão pendente | Backend de execução cross-ISA | R8: hosts ARM64 | Não há biblioteca escolhida; avaliar tradução offline/nativa e alternativas com o mantenedor antes de introduzir LLVM ou outro motor |
+
+Não são dependências automáticas: novo loader PE, novo motor WinRT, framework de launcher, biblioteca de banco de dados, VM ou substituição do runtime. Reusar os componentes existentes até que uma lacuna concreta justifique mudança validada. DXC, SDL3 e FFmpeg têm papéis distintos; nenhum deles torna o runtime compatível sozinho.
+
+### Checklist de integração de cada dependência nova
+
+- [ ] Consumidor e contrato necessários identificados; alternativa já disponível avaliada.
+- [ ] Fronteira arquitetural e licença aprovadas quando aplicável.
+- [ ] Versão/commit, origem, hash, opções e dependências transitivas registrados no mecanismo de build existente.
+- [ ] Build opcional apenas nos backends/hosts consumidores; ausência produz diagnóstico explícito.
+- [ ] Fixture cobre o uso real e a falha esperada; ABI e ownership conferidos.
+- [ ] Distribuição reproduzível com avisos/licenças necessários, sem SDKs ou binários proprietários incorporados indevidamente.
+
+## Checklist de funcionalidades e metas do produto
+
+A meta é entregar cobertura ampla, fidelidade e experiência de uso competitivas, com melhorias verificáveis. Isso é um requisito de produto, não uma alegação de resultado atual. Uma caixa só deve ser marcada quando implementação e evidência do critério estiverem disponíveis. Base implementada significa existência do código; validação de um título ou plataforma permanece separada.
+
+### Base já identificada no código
+
+- [x] Inspeção/inventário e identificação por hash, com contratos de revisão no caminho SystemOS.
+- [x] Loader ERA AMD64 com imports normais, realocações, unwind e TLS de título.
+- [x] CLI ERA de check/run com limite de tempo e diagnóstico de bloqueios.
+- [x] Fronteira de ativação WinRT e primeiras classes locais de configuração/usuário/DLC, com cobertura parcial.
+- [x] Criação inicial de device/context D3D11.X sobre D3D12; demais operações gráficas ainda incompletas.
+- [x] Infraestrutura `Presenter`/`FramePipe` para apresentação e transporte, distinta de renderização de jogo.
+
+### Inicialização, catálogo e execução — R0/R1/R2
+
+- [ ] Perfil de execução ERA vincula manifesto, executável, revisão, módulos, recursos e hashes antes da entrada.
+- [ ] Pacote e originais permanecem read-only; configuração e dados mutáveis têm ownership definido.
+- [ ] Módulos privados e delay imports necessários funcionam com resolução explícita e rejeição de versões incompatíveis.
+- [ ] Ciclo CoreApplication completo e verificado, incluindo falha parcial, dispatcher, janela e encerramento.
+- [ ] Usuário local, eventos, coleções e async necessários funcionam sem simular conexão online.
+- [ ] Dependências ausentes produzem erro acionável: símbolo/classe/IID/método/revisão; nenhuma continuação fictícia.
+- [ ] Funcionalidade compartilhada entre títulos/revisões; não depender de um port individual para cada jogo.
+
+### Gráficos e apresentação — R3/R6
+
+- [ ] Buffers, texturas, views, formatos, layouts e descritores implementados com coerência CPU/GPU.
+- [ ] Tradução e validação de shaders dos estágios necessários, com erro para instrução sem suporte.
+- [ ] Estados, draw/dispatch, DMA, barriers, fences e vida útil dos recursos corretos.
+- [ ] Swapchain/apresentação do título com resize, fullscreen e recuperação de erro validados.
+- [ ] Primeira imagem original identificada e conferida; separada de qualquer fixture sintética.
+- [ ] Caminho Original preserva efeitos, estado e timing; caminho Native compartilha o estado e oferece melhorias aprovadas.
+- [ ] Resolução ampliada, HDR e MSAA oferecidos somente onde a semântica e suporte do jogo/backend forem validados.
+- [ ] Cache de shaders/pipelines reduz custo medido e invalida corretamente após mudança relevante.
+- [ ] Testes de pixels/estado e fronteiras sincronizadas demonstram que otimizações não retiram efeitos nem alteram lógica.
+
+### Persistência, perfil e interação — R4
+
+- [ ] Saves por usuário/título com contêineres/blobs, quotas e erros compatíveis.
+- [ ] Publicação/recuperação testadas com interrupção; preservar último estado válido e migrações.
+- [ ] Gamepad, teclado/mouse quando usados, hotplug e associação ao usuário validados.
+- [ ] Vibração/force feedback nos dispositivos e contratos suportados; limites explícitos nos demais.
+- [ ] Catálogo de conteúdo adicional reflete pacotes verificados; cenário sem DLC não vira suporte fictício de instalação.
+
+### Áudio e mídia — R5
+
+- [ ] Engine/voices e callbacks compatíveis; buffers com ownership e término corretos.
+- [ ] Decoders necessários testados com formatos reais e fixtures redistribuíveis.
+- [ ] Mixagem, canais, volume e efeitos preservados; operações sem suporte recusadas.
+- [ ] Áudio/vídeo sincronizados, sem alterar velocidade de simulação para compensar carga.
+
+### Sistema original e experiência de uso — R7/R8
+
+- [ ] Dashboard e Guide autênticos, com recursos originais da mesma revisão.
+- [ ] Sistema -> jogo -> retorno ao sistema, shutdown e recuperação verificados com estado preservado.
+- [ ] Launcher gerencia importação/referência, preparação, configuração, início, perfis e saves sem imitar a interface original.
+- [ ] Paths Unicode/longos e reinstalação/atualização preservam conteúdo, configurações e saves.
+- [ ] Windows x64/ARM64, Linux x64/ARM64 e macOS Intel/Apple Silicon têm evidência própria de execução e apresentação; Steam Deck validado no alvo Linux.
+- [ ] Pacote distribuível reproduzível, licenças corretas e diagnóstico claro para hardware/backend não suportado.
+
+### Critérios mensuráveis de qualidade
+
+- [ ] Matriz por título/revisão/host/backend registra: reconhece, prepara, inicia, apresenta, recebe input, reproduz áudio, salva/reabre e encerra/retorna.
+- [ ] Cobertura não depende só de um título; amostra adicional exige os mesmos contratos e preserva os testes negativos.
+- [ ] Fidelidade compara pixels, áudio, eventos e timing em fronteiras equivalentes com referência autorizada; diferenças materiais permanecem abertas.
+- [ ] Desempenho registra mediana e p95/p99 de frame time, stutter de preparação, latência aplicável e uso de CPU/GPU/memória sob condições comparáveis.
+- [ ] Metas numéricas são fixadas após baseline reproduzível, por carga/hardware; não prometer FPS universal nem classificar build/PID como gameplay.
+- [ ] Estabilidade cobre falha de serviço, timeout, fechamento, reinício e recuperação de saves sem processos ou recursos da tarefa remanescentes.
+- [ ] Melhorias demonstram ganho medido sem regressão de efeitos, lógica, física, áudio ou timing.
+
+## Modos do produto — Fiel e Enchanced
+
+**Diretriz do mantenedor, 2026-11-10:** Modo Fiel deve reproduzir o Xbox One original; Modo Enchanced deve oferecer todas as melhorias viáveis e validadas. Essa definição de produto está solicitada. Detalhes de fronteira de GPU, execução e processo continuam sujeitos às decisões arquiteturais previstas neste roadmap.
+
+A referência de organização é a separação de renderer, API gráfica e opções de melhoria já existente em `x360-native/src/supervisor/renderer_settings.h` e `.cpp`. Reaplicar o contrato comum, sem copiar valores específicos de outro console: não impor 30 FPS, resolução ou formato global a jogos Xbox One. Em identificadores de código/configuração, usar a grafia convencional `enhanced`; o nome de apresentação solicitado é **Modo Enchanced**.
+
+| Contrato | Modo Fiel | Modo Enchanced |
+| --- | --- | --- |
+| Objetivo | Comportamento audiovisual e temporal do hardware original para o título/revisão | Qualidade, desempenho e apresentação ampliados, preservando comportamento do jogo |
+| Renderização | Resolução interna, formatos, precisão, AA e efeitos conforme o contrato original | Escala interna maior, filtragem/AA ampliados e melhorias de apresentação onde corretos |
+| Timing | Cadência e regras de tempo do título original, sem limite universal inventado | FPS/apresentação ampliados apenas após demonstrar independência da simulação |
+| Imagem | Cor, gamma, aspect ratio, HDR/SDR e composição originais | Ultrawide, upscale, nitidez e HDR aprimorado opcionais, com suporte comprovado |
+| Áudio/input | Semântica e timing compatíveis com o original | Menor latência e melhores adaptadores sem mudar mixagem, eventos ou lógica |
+| Otimização | Permitida quando preserva o resultado e o timing contratados | Permitida com o mesmo requisito; melhorias visuais são controles explícitos |
+| Estado | Um runtime, usuário, armazenamento e estado lógico de console | Os mesmos; não criar segundo save, perfil ou simulação |
+| Suporte incompleto | Erro explícito e limite documentado | Opção indisponível/recusada com motivo; sem degradar silenciosamente a sessão |
+
+### Contrato de configuração e integração
+
+**Pontos:** `src/era_main.cpp`, `include/xboxone_native/era_loader.h`, `src/era_d3d11x.cpp`, `include/xboxone_native/presentation.h` e launcher/configuração a integrar. Os campos abaixo são propostas de esquema, não opções já implementadas.
+
+- [ ] Representar separadamente `mode` (`faithful`/`enhanced`), renderer/caminho GPU e API do host. Escolher D3D12, Vulkan ou Metal não significa habilitar melhorias automaticamente.
+- [ ] Definir configuração efetiva tipada: modo, escala interna, filtragem, AA, taxa de apresentação, limite de FPS quando suportado, aspect ratio, upscale/nitidez e saída de cor. Evitar flags contraditórias e unidades ambíguas.
+- [ ] Resolver opções em ordem documentada: defaults -> globais -> por título/revisão -> override explícito da sessão. Exibir valores efetivos, origem e opções incompatíveis antes de executar.
+- [ ] No Fiel, neutralizar melhorias incompatíveis e restaurar o contrato original observado; não sobrescrever as preferências Enchanced salvas do usuário.
+- [ ] No Enchanced, manter controles independentes, presets e restauração ao padrão; não ligar todo recurso indiscriminadamente nem pressupor suporte pelo nome da GPU.
+- [ ] Chavear caches pelos campos que afetam shaders, layouts ou pipelines; não invalidar por preferência sem efeito relevante. Preservar caches válidos entre sessões.
+- [ ] Classificar cada alteração como dinâmica ou dependente de reinício; recusar troca insegura com GPU em voo. Mudar de modo não deve resetar save/perfil nem disparar uma segunda simulação.
+- [ ] Testar a configuração efetiva enviada ao runtime, não apenas a interface. Registrar modo, backend, revisão e opções nas evidências.
+
+### Checklist do Modo Fiel
+
+- [ ] Contratos de GPU, CPU/memória, áudio e input conferidos para a revisão testada; nenhum efeito omitido para viabilizar execução.
+- [ ] Resolução interna, recursos dinâmicos, aspect ratio e composição preservados; escala da janela host não é confundida com resolução interna do jogo.
+- [ ] Frame pacing, intervalos de apresentação, relógios e velocidade de simulação originais validados em trechos comparáveis.
+- [ ] Cor, transparência, profundidade/stencil, sombras, pós-processamento, AA e efeitos necessários comparados com referência autorizada.
+- [ ] Dashboard/Guide originais e suas transições mantêm semântica original; launcher de gerenciamento permanece separado.
+- [ ] Ajustes de desempenho preservam resultado e semântica; fidelidade não exige reproduzir artificialmente desperdício de CPU/GPU do hardware.
+
+### Checklist do Modo Enchanced
+
+- [ ] Escala de resolução interna configurável e limitada pelas capacidades/recursos disponíveis, com HUD, telas intermediárias e efeitos verificados.
+- [ ] Filtragem anisotrópica e opções de AA aprimoradas quando equivalentes ou explicitamente selecionadas; não substituir efeitos necessários por ausência de efeito.
+- [ ] Upscale e sharpening opcionais; avaliar algoritmos e dependências apenas após medir qualidade/custo. Não confundir sharpening com recuperação garantida de detalhe.
+- [ ] Ultrawide/aspect ratio ampliado com enquadramento, culling, HUD e interfaces corretos; evitar imagem esticada como falso suporte.
+- [ ] FPS superior ou limite removido apenas para caminhos validados: física, animação, scripts, timers, áudio, input e streaming continuam em velocidade correta.
+- [ ] Separar FPS da simulação, cadência de renderização e taxa de apresentação; opções de VSync/VRR dependem de suporte do backend/display e de testes de pacing.
+- [ ] HDR e gestão de cor aprimorados opcionais; preservar referência SDR, evitar conversão automática sem calibração e rotular alterações criativas.
+- [ ] Redução de stutter por preparação/caches e menor latência de entrada/áudio demonstradas por medição; sem remover sincronização necessária.
+- [ ] Futuras melhorias adicionais entram como capacidades testadas, com custo, limites e desativação independentes; não prometer substituição de assets ou novos efeitos sem implementação/licença.
+- [ ] Cada melhoria possui controle negativo e comparação com o Fiel. Incompatibilidade de uma opção não autoriza corromper ou continuar silenciosamente.
+
+**Aceite dos modos:** mesmo título/revisão e ponto de comparação, configurações efetivas registradas, estado/saves preservados, pixels/áudio/eventos/timing verificados e desempenho medido. Manter matriz por melhoria, título e host; ambas as opções continuam planejadas enquanto não houver implementação e evidência próprias.
+
+## Recursos complementares — checklist de implementação
+
+Estes recursos complementam R1–R8. Não são pré-requisito para corrigir o primeiro bloqueio de inicialização. Priorizar configuração por título, dispositivos, preparação gráfica e formatos de áudio antes de personalização/galeria. Nenhum item abaixo é declarado funcional por esta documentação.
+
+| Grupo e prioridade | Trabalho técnico | Integração e aceite |
+| --- | --- | --- |
+| Configuração por título/revisão — P1 | Herança de opções, overrides por modo, validação, migração e reset seletivo | Reusar identidade de R1; round-trip e upgrade preservam opções, perfis e saves; valores efetivos entram na sessão |
+| Dispositivos e saída — P2 | Enumerar adaptador/display, fullscreen, resolução/refresh, SDR/HDR, saída de áudio e canais | Adaptadores R3/R5/R8; hotplug/falha mostram resultado real; não alternar dispositivo silenciosamente nem mudar a velocidade do jogo |
+| Preparação gráfica — P2 | Workers, progresso, cancelamento, retomada e publicação de cache | R3/R6; progresso deriva de trabalho conhecido, cancelamento preserva saída válida; não apresentar percentagem inventada de compatibilidade |
+| Formatos e engines de áudio — P2 quando bloqueantes | Inventariar XMA2/WMA e interfaces de engines como FMOD realmente usadas; mapear ABI e callbacks | R5; FFmpeg é candidato de decoder, não substitui engine/mixer. Validar cada formato/contrato e licenças; não assumir necessidade de SDK proprietário |
+| Volantes — P3 | Calibração, eixos, deadzones, inversão, pedais, mapeamento e force feedback quando suportado | Adaptador R4; identidade do dispositivo e perfil persistidos; desconexão cancela forças; limites e unidades documentados |
+| Diagnóstico exportável — P2 | Resumo de erros, capabilities, frame time e pipelines com limites por categoria | R0/R6; exportação explícita, conteúdo pessoal/proprietário excluído e orçamento respeitado; profiling desativado no caminho normal |
+| Saves e recuperação na interface — P3 | Listagem, backup/exportação e restauração verificadas, sem modificar originais durante inspeção | R4; snapshot coerente, importação valida identidade/formato, restauração transacional e sem sobrescrever a última cópia válida sem ação explícita |
+| Galeria e miniaturas — P4 | Captura solicitada, metadados de título/revisão/modo, índice, thumbnails e exclusão explícita | Reusar saída verificada de R3; geração limitada/lazy, sem dump por frame. Não exibir fixture como captura original; não versionar mídia proprietária |
+| Imagem de perfil — P4 | Escolha local, preview, recorte, escala e gravação atômica da imagem derivada | R4/launcher; limitar dimensões/bytes/formatos, preservar o arquivo original e manter identidade local sem alegação online |
+| Créditos e licenças — P3 antes da distribuição | Página de componentes, versões, licenças e avisos derivados do pacote distribuído | R8; correspondência com dependências efetivas, sem omissões nem lista fictícia de componentes não usados |
+
+### Checklist de recursos complementares
+
+- [ ] Configurações globais e por título/revisão/modo com migração e reset seletivo.
+- [ ] Seleção de GPU/display/áudio e capacidades efetivas conferidas, incluindo desconexão.
+- [ ] Preparação de pipelines com progresso real, cancelamento e retomada consistentes.
+- [ ] XMA2/WMA e contratos de engine de áudio necessários inventariados e testados individualmente.
+- [ ] Volantes com calibração, perfis e force feedback onde suportado.
+- [ ] Diagnósticos exportáveis, limitados e sem conteúdo pessoal/proprietário.
+- [ ] Gerenciamento de saves com backup/restauração seguros e recuperação testada.
+- [ ] Galeria, miniaturas e capturas sob ação explícita, com identificação de origem/modo.
+- [ ] Edição/recorte de imagem de perfil sem alterar original nem identidade do usuário.
+- [ ] Créditos/licenças acessíveis e correspondentes ao pacote efetivamente distribuído.
+
+**Dependências de interface:** reusar launcher e APIs existentes; não introduzir framework gráfico, banco de imagens ou biblioteca de captura apenas para esta lista. Se decodificação/redimensionamento de imagens exigir nova biblioteca, comparar primeiro APIs do host e dependências já aprovadas, registrando limites e licença antes da integração.
+
+## Contexto anterior — trilha SystemOS e insumos (2026-11-07)
+
+O conteúdo abaixo preserva instruções e evidências anteriores específicas de SystemOS. Não descreve toda a implementação ERA atual, não invalida R0–R8 e não torna a ausência de SystemOS um bloqueio universal dos serviços GameOS.
+
+### Objetivo anterior — M1: ativação de um componente original legível
 Atualização de infraestrutura em **2026-11-07**: AppModel agora usa observação `process_exit` por padrão; o handshake precisa de `appmodel_lifecycle owned_fixture`. O runner descartável exige as duas provas. `FramePipe` transporta pixels entre processos desktop próprios até o `Presenter`, com identificação do produtor e falhas limitadas; não importa texturas GPU nem certifica proveniência SystemOS. Próximo check AppModel continua sendo ativação positiva no guest descartável, sem deployment no host. A ligação de um produtor AppModel à ponte e a adaptação de composição original ainda precisam de validação própria. Evidência em [M1-STATUS.md](M1-STATUS.md).
 
 Estado atualizado em **2026-11-07**: o acesso a `xsapi.dll` foi resolvido pelo contexto oficial do pacote Gaming Services, sem alterar ACL/políticas. Com contexto e elevação, o adaptador abriu com `S_OK`; **as montagens somente leitura de `system.xvd` dos OSU1 e OSU2 retornaram `0x80070570`**, sem volume remanescente. A causa da recusa não foi determinada; não repetir elevação/carregamento como se ainda fossem o bloqueio. Diagnóstico reproduzível em `tools/probe_xvd_readonly.ps1`; não é inicializador SystemOS. Os 62 XVDs extraídos e conferidos permanecem em `build-osu/OSU1`, `build-osu/OSU2` e `build-osu/OSU3`, sem misturar perfis; ZIPs originais em Downloads. TLS PE32+ foi validado com fixture própria, sem estabelecer ABI Xbox. A próxima implementação de serviços/WinRT/composição depende de componente original legível e identificado ou de nova evidência que explique a recusa real do provedor; não criar outro loader PE, alterar proteções ou extrair chaves para contornar isso. Evidência em [M1-STATUS.md](M1-STATUS.md).

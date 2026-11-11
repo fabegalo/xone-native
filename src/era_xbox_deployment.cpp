@@ -97,4 +97,85 @@ HRESULT dlc_package_manager_factory(REFIID iid, void** out) {
         const_cast<void*>(self.vtable[0]))(&self, iid, out);
 }
 
+namespace transfer {
+// ABI facts from the public deployment IDL; local availability uses the active
+// package's chunk index. Other deployment operations still trap explicitly.
+constexpr wchar_t name[] = L"Windows.Xbox.Management.Deployment.PackageTransferManager";
+constexpr GUID iid_manager{0xc2d4b94b, 0x0413, 0x4380, {0xb2, 0xf2, 0xab, 0x98, 0x72, 0xd0, 0x82, 0x85}};
+constexpr GUID iid_statics{0xd6cf4cae, 0x9eb1, 0x4cbe, {0xb4, 0x26, 0x7e, 0x75, 0xd4, 0x29, 0xf8, 0x46}};
+
+HRESULT self_query(WinrtObject* self, REFIID iid, void** out) {
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IInspectable)) { *out = self; return S_OK; }
+    return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE is_chunk_installed(WinrtObject*, UINT32 chunk, boolean* out) {
+    if (!out) return E_POINTER;
+    *out = false;
+    bool installed = false;
+    const HRESULT hr = title_chunk_installed(chunk, installed);
+    if (SUCCEEDED(hr)) *out = installed;
+    return hr;
+}
+
+WinrtObject& current() {
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[7] = reinterpret_cast<const void*>(&is_chunk_installed);
+        return t;
+    }();
+    static WinrtObject object{vt.data(), name, iid_manager, &self_query};
+    return object;
+}
+
+HRESULT STDMETHODCALLTYPE get_current(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    std::wstring entry_point;
+    const HRESULT hr = title_entry_point(entry_point);
+    if (FAILED(hr)) return hr;
+    *out = reinterpret_cast<IInspectable*>(&current());
+    return S_OK;
+}
+
+WinrtObject& statics() {
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[6] = reinterpret_cast<const void*>(&get_current);
+        return t;
+    }();
+    static WinrtObject object{vt.data(), name, iid_statics, &self_query};
+    return object;
+}
+
+HRESULT STDMETHODCALLTYPE activate(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    return E_NOTIMPL; // No public constructor; Current binds the active package.
+}
+
+HRESULT query(WinrtObject* self, REFIID iid, void** out) {
+    if (iid == iid_statics) { *out = &statics(); return S_OK; }
+    return self_query(self, iid, out);
+}
+
+WinrtObject& activation() {
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[6] = reinterpret_cast<const void*>(&activate);
+        return t;
+    }();
+    static WinrtObject object{vt.data(), name, __uuidof(IActivationFactory), &query};
+    return object;
+}
+} // namespace transfer
+
+HRESULT package_transfer_manager_factory(REFIID iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    auto& self = transfer::activation();
+    return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(WinrtObject*, REFIID, void**)>(
+        const_cast<void*>(self.vtable[0]))(&self, iid, out);
+}
+
 } // namespace xboxone::era

@@ -11,9 +11,9 @@ add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJEC
             ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_deployment.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp)
-target_link_libraries(xboxone_era PRIVATE d3d12 dxgi dxguid runtimeobject oleaut32 xmllite shlwapi ole32 bcrypt)
-# 2 x 512 trap thunks; /bigobj keeps the section count within COFF limits.
+            ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp)
+target_link_libraries(xboxone_era PRIVATE xboxone_inspection d3d12 dxgi dxguid runtimeobject oleaut32 xmllite shlwapi ole32 bcrypt version)
+# Diagnostic vtable thunks need /bigobj to stay within COFF section limits.
 set_source_files_properties(${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
 target_include_directories(xboxone_era PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_compile_features(xboxone_era PUBLIC cxx_std_20)
@@ -39,7 +39,8 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
         DEPENDS "${PROJECT_SOURCE_DIR}/tests/era_kernelx_imports.def" VERBATIM)
     add_custom_target(era_kernelx_imports DEPENDS "${era_kernelx_lib}")
 
-    add_executable(era_component ${PROJECT_SOURCE_DIR}/tests/era_component.cpp)
+    enable_language(RC)
+    add_executable(era_component ${PROJECT_SOURCE_DIR}/tests/era_component.cpp ${PROJECT_SOURCE_DIR}/tests/era_component.rc)
     add_dependencies(era_component era_kernelx_imports)
     target_compile_options(era_component PRIVATE /GS- /Zl)
     target_link_libraries(era_component PRIVATE "${era_kernelx_lib}")
@@ -55,9 +56,25 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
 
     add_executable(xboxone_era_loader_tests ${PROJECT_SOURCE_DIR}/tests/era_loader_tests.cpp)
     target_link_libraries(xboxone_era_loader_tests PRIVATE xboxone_era)
+    add_executable(xboxone_era_memory_tests ${PROJECT_SOURCE_DIR}/tests/era_memory_tests.cpp)
+    add_executable(xboxone_era_audio_tests ${PROJECT_SOURCE_DIR}/tests/era_audio_tests.cpp)
+    target_link_libraries(xboxone_era_audio_tests PRIVATE xboxone_era)
+    add_test(NAME era_audio_regressions COMMAND xboxone_era_audio_tests)
+    set_tests_properties(era_audio_regressions PROPERTIES TIMEOUT 10 LABELS "windows;synthetic;era")
+    target_link_libraries(xboxone_era_memory_tests PRIVATE xboxone_era)
+    add_test(NAME era_memory_hardware COMMAND xboxone_era_memory_tests hardware)
+    add_test(NAME era_memory_warp COMMAND xboxone_era_memory_tests warp)
+    set_tests_properties(era_memory_hardware PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77 LABELS "windows;synthetic;era;hardware")
+    set_tests_properties(era_memory_warp PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era;software-gpu")
     add_test(NAME era_loader_regressions COMMAND xboxone_era_loader_tests $<TARGET_FILE:era_component>
              $<TARGET_FILE:era_tls_component>)
     set_tests_properties(era_loader_regressions PROPERTIES TIMEOUT 20 LABELS "windows;synthetic;era")
     add_test(NAME era_check_cli COMMAND xone-era check $<TARGET_FILE:era_component>)
     set_tests_properties(era_check_cli PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "resolved 2, unresolved 0")
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME era_diagnostic_cli
+            COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/tests/era_cli_tests.py"
+                    $<TARGET_FILE:xone-era> $<TARGET_FILE:era_component> $<TARGET_FILE:xboxone_era_loader_tests>)
+        set_tests_properties(era_diagnostic_cli PROPERTIES TIMEOUT 20 LABELS "windows;synthetic;era")
+    endif()
 endif()

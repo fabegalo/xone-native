@@ -91,6 +91,11 @@ struct Report {
 // false means error contains a specific reason; report is not trustworthy then.
 bool inspect(const std::filesystem::path& path, Report& report, std::string& error);
 
+// Local chunk-index format: repeated little-endian 64-bit file key + 32-bit
+// chunk ID. Reserved IDs >= 0x3fffffff are excluded. Not content authentication.
+bool inspect_chunk_catalog(const std::filesystem::path& path, std::vector<std::uint32_t>& chunks,
+                           std::string& error);
+
 // Archive adapters can supply this bounded prefix without extracting the XVD.
 // This probes metadata only, not the entire signed header or the payload. The
 // original size is declared by the caller and has not been independently read.

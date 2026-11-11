@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: BSD-3-Clause
+#pragma once
+#include <mmdeviceapi.h>
+
+namespace xboxone::era {
+// Observed Xbox extension: desktop enumerator slots 0-7, then channel counts
+// and channel-count callback registration/removal. Callback slot 3 receives both counts.
+struct __declspec(uuid("8B557ADC-555E-47A0-B223-43477E481DAD")) TitleAudioEnumerator : IMMDeviceEnumerator {
+    virtual HRESULT STDMETHODCALLTYPE GetChannelCounts(UINT32*, UINT32*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RegisterChannelCallback(IUnknown*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE UnregisterChannelCallback(IUnknown*) = 0;
+};
+struct ChannelCountNotification : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE OnChannelCountChanged(UINT32, UINT32) = 0;
+};
+// Takes its own reference; no host device or mixer state is changed.
+HRESULT wrap_audio_enumerator(IMMDeviceEnumerator* host, REFIID iid, void** out);
+}

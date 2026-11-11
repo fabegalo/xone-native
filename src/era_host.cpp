@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/era_loader.h"
+#include "era_audio.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -11,11 +12,25 @@
 namespace xboxone::era {
 namespace {
 
-// Libraries whose PC build has the same ABI as the title's copy: the VS2015+
-// CRT family, the C++/CX runtime and COM/WinRT base. Loaded from System32 only.
+HRESULT WINAPI title_CoCreateInstance(REFCLSID clsid, IUnknown* outer, DWORD context, REFIID iid, void** out) {
+    if (clsid != __uuidof(MMDeviceEnumerator)) return CoCreateInstance(clsid, outer, context, iid, out);
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (outer) return CLASS_E_NOAGGREGATION;
+    IMMDeviceEnumerator* host = nullptr;
+    HRESULT hr = CoCreateInstance(clsid, nullptr, context, IID_PPV_ARGS(&host));
+    if (SUCCEEDED(hr)) { hr = wrap_audio_enumerator(host, iid, out); host->Release(); }
+    return hr;
+}
+
+// Keep each CRT/CX major version: VS2012 objects must not bind to VS2015+.
+// Resolve named exports from the matching System32 runtime only.
 // WinRT class activation through them reaches host classes; Xbox-only classes
 // fail there with the host's real error until a title activation layer exists.
 constexpr std::pair<std::string_view, const wchar_t*> host_modules[]{
+    {"msvcr110.dll", L"msvcr110.dll"},
+    {"msvcp110.dll", L"msvcp110.dll"},
+    {"vccorlib110.dll", L"vccorlib110.dll"},
     {"ucrtbase.dll", L"ucrtbase.dll"},
     {"vcruntime140.dll", L"vcruntime140.dll"},
     {"vcruntime140_1.dll", L"vcruntime140_1.dll"},
@@ -23,6 +38,32 @@ constexpr std::pair<std::string_view, const wchar_t*> host_modules[]{
     {"concrt140.dll", L"concrt140.dll"},
     {"vccorlib140.dll", L"vccorlib140.dll"},
     {"combase.dll", L"combase.dll"}};
+
+// Ordinal/name pairs verified against this title revision's ws2_32 exports
+// and the desktop DLL. Resolve by name after validation, never an arbitrary ordinal.
+constexpr std::pair<unsigned, const char*> socket_ordinals[]{
+    {1,"accept"}, {2,"bind"}, {3,"closesocket"}, {4,"connect"}, {5,"getpeername"},
+    {6,"getsockname"}, {7,"getsockopt"}, {8,"htonl"}, {9,"htons"}, {10,"ioctlsocket"},
+    {11,"inet_addr"}, {12,"inet_ntoa"}, {13,"listen"}, {14,"ntohl"}, {15,"ntohs"},
+    {16,"recv"}, {17,"recvfrom"}, {18,"select"}, {19,"send"}, {20,"sendto"},
+    {21,"setsockopt"}, {22,"shutdown"}, {23,"socket"}, {51,"gethostbyaddr"}, {52,"gethostbyname"},
+    {111,"WSAGetLastError"}, {112,"WSASetLastError"}, {115,"WSAStartup"}, {116,"WSACleanup"}, {151,"__WSAFDIsSet"}};
+constexpr std::string_view socket_names[]{
+    "WSAWaitForMultipleEvents", "WSASend", "WSARecv", "WSAGetOverlappedResult", "WSAEventSelect",
+    "WSACloseEvent", "WSACreateEvent", "WSARecvFrom", "WSAResetEvent", "WSASendTo", "WSASetEvent",
+    "WSASocketW", "getaddrinfo", "freeaddrinfo", "getnameinfo"};
+
+void* socket_import(const ImportRequest& request) {
+    if (!same_library(request.library, "ws2_32.dll")) return nullptr;
+    const char* symbol = nullptr;
+    for (const auto& [ordinal, name] : socket_ordinals)
+        if ((request.name.empty() && request.ordinal == ordinal) || request.name == name) symbol = name;
+    for (const auto name : socket_names)
+        if (request.name == name) symbol = name.data();
+    if (!symbol) return nullptr;
+    const HMODULE module = LoadLibraryExW(L"ws2_32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return module ? reinterpret_cast<void*>(GetProcAddress(module, symbol)) : nullptr;
+}
 
 void fatal_note(const char* text) {
     DWORD written = 0;
@@ -65,12 +106,21 @@ HRESULT WINAPI era_RoReportUnhandledError(IUnknown* error) {
 } // namespace
 
 void* resolve_host_module(const ImportRequest& request) {
+    if (same_library(request.library, "ws2_32.dll")) return socket_import(request);
+    if (same_library(request.library, "bcrypt.dll") && request.name == "BCryptGenRandom") {
+        const HMODULE module = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return module ? reinterpret_cast<void*>(GetProcAddress(module, "BCryptGenRandom")) : nullptr;
+    }
     if (same_library(request.library, "combase.dll") && LoadLibraryExW(L"combase.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        if (request.name == "CoCreateInstance") return reinterpret_cast<void*>(&title_CoCreateInstance);
         if (request.name == "RoFailFastWithErrorContext") return reinterpret_cast<void*>(&era_RoFailFastWithErrorContext);
         if (request.name == "RoReportUnhandledError") return reinterpret_cast<void*>(&era_RoReportUnhandledError);
     }
     for (const auto& [library, file] : host_modules) {
         if (!same_library(request.library, library)) continue;
+        // Console and desktop export ordinals are not an ABI contract.
+        if (request.name.empty() && (library == "msvcr110.dll" || library == "msvcp110.dll" ||
+                                     library == "vccorlib110.dll")) return nullptr;
         const HMODULE module = LoadLibraryExW(file, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!module) return nullptr;
         const char* symbol = request.name.empty() ? MAKEINTRESOURCEA(request.ordinal) : request.name.c_str();

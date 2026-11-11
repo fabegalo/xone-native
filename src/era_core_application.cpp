@@ -18,6 +18,7 @@
 #include <winstring.h>
 
 #include <cstdio>
+#include <atomic>
 
 namespace xboxone::era {
 namespace {
@@ -83,12 +84,60 @@ WinrtObject& view() {
 // KeyDown, KeyUp, PointerMoved, PointerEntered, PointerExited, SizeChanged
 // (33/34), VisibilityChanged (35/36).
 HWND window = nullptr;
+std::atomic<DWORD> window_thread{0};
+bool dispatcher_quit = false; // Accessed only by the window thread.
 WinrtEvent window_closed;
+
+HRESULT STDMETHODCALLTYPE thread_access(WinrtObject*, boolean* value) {
+    if (!value) return E_POINTER;
+    *value = window_thread != 0 && GetCurrentThreadId() == window_thread;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE process_events(WinrtObject*, INT32 option) {
+    if (option < 0 || option > 3) return E_INVALIDARG;
+    if (!window_thread || GetCurrentThreadId() != window_thread) return RPC_E_WRONG_THREAD;
+    if (dispatcher_quit) return S_OK;
+    MSG message{};
+    bool wait = option == 0 || option == 2;
+    do {
+        if (wait) {
+            const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+            if (result == -1) return HRESULT_FROM_WIN32(GetLastError());
+            if (!result) { dispatcher_quit = true; return S_OK; }
+        } else if (!PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) return S_OK;
+        if (message.message == WM_QUIT) { dispatcher_quit = true; return S_OK; }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+        if (option == 1) return S_OK;
+        wait = option == 2;
+    } while (!dispatcher_quit);
+    return S_OK;
+}
+WinrtObject& dispatcher() {
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[6] = reinterpret_cast<const void*>(&thread_access);
+        t[7] = reinterpret_cast<const void*>(&process_events);
+        return t;
+    }();
+    static constexpr GUID iid{0x60db2fa8, 0xb705, 0x4fde, {0xa7, 0xd6, 0xeb, 0xbb, 0x18, 0x91, 0xd3, 0x9e}};
+    static WinrtObject object{vt.data(), L"Windows.UI.Core.CoreDispatcher", iid, &self_query};
+    return object;
+}
+HRESULT STDMETHODCALLTYPE get_dispatcher(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!window_thread) return RO_E_CLOSED;
+    *out = reinterpret_cast<IInspectable*>(&dispatcher());
+    (*out)->AddRef();
+    return S_OK;
+}
 
 HRESULT STDMETHODCALLTYPE add_closed(WinrtObject*, IUnknown* h, std::int64_t* t) { return window_closed.add(h, t); }
 HRESULT STDMETHODCALLTYPE remove_closed(WinrtObject*, std::int64_t t) { return window_closed.remove(t); }
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == WM_DESTROY && window_thread == GetCurrentThreadId()) PostQuitMessage(0);
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
 
@@ -104,12 +153,15 @@ HRESULT create_window() {
     AdjustWindowRect(&r, style, FALSE);
     window = CreateWindowExW(0, wc.lpszClassName, L"xone-era", style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                              r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+    window_thread = window ? GetCurrentThreadId() : 0;
+    dispatcher_quit = false;
     return window ? S_OK : HRESULT_FROM_WIN32(GetLastError());
 }
 
 WinrtObject& core_window() {
     static const auto vt = [] {
         auto t = winrt_vtable();
+        t[7] = reinterpret_cast<const void*>(&get_dispatcher);
         t[19] = reinterpret_cast<const void*>(&add_closed);
         t[20] = reinterpret_cast<const void*>(&remove_closed);
         return t;
@@ -119,8 +171,18 @@ WinrtObject& core_window() {
 }
 
 // --- Launch activation arguments --------------------------------------------
+HRESULT STDMETHODCALLTYPE activation_kind(WinrtObject*, INT32* kind) {
+    if (!kind) return E_POINTER;
+    *kind = 0; // ActivationKind::Launch: this event is dispatched by CoreApplication::Run.
+    return S_OK;
+}
+
 WinrtObject& launch_args() {
-    static const auto vt = winrt_vtable();
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[6] = reinterpret_cast<const void*>(&activation_kind);
+        return t;
+    }();
     static WinrtObject object{vt.data(), args_class, iid_activated_args, &self_query};
     return object;
 }
@@ -144,7 +206,12 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
     HSTRING entry_point = nullptr;
     if (SUCCEEDED(hr)) hr = title_entry_point(entry);
     if (SUCCEEDED(hr)) hr = WindowsCreateString(entry.c_str(), static_cast<UINT32>(entry.size()), &entry_point);
-    if (SUCCEEDED(hr)) { note("xone-era: view Initialize\n"); hr = call<HRESULT>(fv, 6, &view()); }
+    bool initialized = false;
+    if (SUCCEEDED(hr)) {
+        note("xone-era: view Initialize\n");
+        hr = call<HRESULT>(fv, 6, &view());
+        initialized = SUCCEEDED(hr);
+    }
     if (SUCCEEDED(hr)) hr = create_window();
     if (SUCCEEDED(hr)) { note("xone-era: view SetWindow\n"); hr = call<HRESULT>(fv, 7, &core_window()); }
     if (SUCCEEDED(hr)) { note("xone-era: view Load\n"); hr = call<HRESULT>(fv, 8, entry_point); }
@@ -158,10 +225,14 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
         }
     }
     if (SUCCEEDED(hr)) { note("xone-era: view Run\n"); hr = call<HRESULT>(fv, 9); }
-    note("xone-era: view Uninitialize\n");
-    const HRESULT un = call<HRESULT>(fv, 10);
-    if (SUCCEEDED(hr)) hr = un;
+    if (initialized) { // Uninitialize pairs with a successful Initialize, also after a later failure.
+        note("xone-era: view Uninitialize\n");
+        const HRESULT un = call<HRESULT>(fv, 10);
+        if (SUCCEEDED(hr)) hr = un;
+    }
     static_cast<IUnknown*>(fv)->Release();
+    window_thread = 0;
+    if (window) { DestroyWindow(window); window = nullptr; }
     WindowsDeleteString(entry_point);
     char line[100];
     std::snprintf(line, sizeof line, "xone-era: CoreApplication::Run -> 0x%08lX\n", static_cast<unsigned long>(hr));
@@ -229,6 +300,8 @@ HRESULT query(WinrtObject*, REFIID iid, void** out) {
 }
 
 } // namespace
+
+HWND core_window_hwnd(const void* object) { return object == &core_window() ? window : nullptr; }
 
 HRESULT core_application_factory(REFIID iid, void** out) {
     if (!out) return E_POINTER;

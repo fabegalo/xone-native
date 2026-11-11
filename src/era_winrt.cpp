@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // WinRT activation boundary of the title. The title's C++/CX runtime (host
-// vccorlib140) resolves classes through RoGetActivationFactory; that import is
+// vccorlib110/140) resolves classes through RoGetActivationFactory; that import is
 // redirected here. Classes the title layer implements are served here; every
 // other request is forwarded to the host and its real result returned. Every
 // activation is logged.
@@ -13,6 +13,7 @@
 #include <winstring.h>
 
 #include <cstring>
+#include <atomic>
 #include <string_view>
 
 namespace xboxone::era {
@@ -20,6 +21,7 @@ namespace {
 
 using GetFactory = HRESULT(WINAPI*)(HSTRING, REFIID, void**);
 GetFactory host_get_factory = nullptr;
+std::atomic<bool> stop_on_missing_activation{false};
 
 struct TitleClass {
     std::wstring_view name;
@@ -29,6 +31,7 @@ constexpr TitleClass title_classes[]{
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
     {L"Windows.Xbox.System.User", &xbox_user_factory},
     {L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", &dlc_package_manager_factory},
+    {L"Windows.Xbox.Management.Deployment.PackageTransferManager", &package_transfer_manager_factory},
     {L"Windows.ApplicationModel.Core.CoreApplication", &core_application_factory},
 };
 
@@ -70,9 +73,19 @@ HRESULT get_title_activation_factory(HSTRING class_id, REFIID iid, void** factor
     const wchar_t* name = WindowsGetStringRawBuffer(class_id, &length);
     for (const auto& c : title_classes)
         if (c.name == std::wstring_view(name, length)) return c.factory(iid, factory);
-    if (!host_get_factory) return RoGetActivationFactory(class_id, iid, factory);
-    return host_get_factory(class_id, iid, factory);
+    const HRESULT hr = host_get_factory ? host_get_factory(class_id, iid, factory) :
+        RoGetActivationFactory(class_id, iid, factory);
+    if (hr == REGDB_E_CLASSNOTREG && stop_on_missing_activation.load()) {
+        wchar_t line[400];
+        _snwprintf_s(line, _countof(line), _TRUNCATE, L"xone-era: unimplemented activation %ls; stopped\n", name);
+        note(line);
+        TerminateProcess(GetCurrentProcess(), 125);
+    }
+    return hr;
 }
+
+void set_stop_on_missing_activation(bool stop) { stop_on_missing_activation.store(stop); }
+bool stop_on_missing_service() { return stop_on_missing_activation.load(); }
 
 bool hook_winrt_activation(void* module_base) {
     auto* base = static_cast<std::uint8_t*>(module_base);

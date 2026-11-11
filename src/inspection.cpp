@@ -552,6 +552,30 @@ bool inspect_xvd_prefix(std::span<const std::uint8_t> prefix, std::uint64_t decl
     return true;
 }
 
+bool inspect_chunk_catalog(const std::filesystem::path& path, std::vector<std::uint32_t>& chunks,
+                           std::string& error) {
+    chunks.clear();
+    error.clear();
+    Reader file(path);
+    if (!file.valid()) { error = "cannot open chunk catalog"; return false; }
+    constexpr std::uint64_t max_bytes = 16u << 20;
+    if (!file.size() || file.size() > max_bytes || file.size() % 12) {
+        error = "invalid chunk catalog size (12-byte records, maximum 16 MiB)";
+        return false;
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(file.size()));
+    if (!file.read(0, bytes)) { error = "cannot read chunk catalog"; return false; }
+    std::vector<std::uint32_t> candidate;
+    for (std::size_t offset = 8; offset < bytes.size(); offset += 12) {
+        const auto id = u32(bytes.data() + offset);
+        if (id < 0x3fffffffu) candidate.push_back(id);
+    }
+    std::sort(candidate.begin(), candidate.end());
+    candidate.erase(std::unique(candidate.begin(), candidate.end()), candidate.end());
+    chunks = std::move(candidate);
+    return true;
+}
+
 bool inspect(const std::filesystem::path& path, Report& report, std::string& error) {
     error.clear();
     report = {};

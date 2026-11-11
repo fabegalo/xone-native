@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "era_winrt_object.h"
+#include "xboxone_native/era_loader.h"
 
 #include <winstring.h>
 #include <bcrypt.h>
@@ -12,7 +13,7 @@
 namespace xboxone::era {
 namespace {
 
-[[noreturn]] void trap(const WinrtObject* self, unsigned slot) {
+[[noreturn]] void trap(const WinrtObject* self, unsigned slot, std::uintptr_t first, std::uintptr_t second) {
     wchar_t iid[40] = L"?";
     StringFromGUID2(self->iid, iid, 40);
     char line[300];
@@ -21,12 +22,16 @@ namespace {
     OutputDebugStringA(line);
     std::fputs(line, stderr);
     std::fflush(stderr);
+    std::fprintf(stderr, "xone-era: raw WinRT integer args 0x%llX 0x%llX\n",
+                 static_cast<unsigned long long>(first), static_cast<unsigned long long>(second));
+    std::fflush(stderr);
+    if (stop_on_missing_service()) TerminateProcess(GetCurrentProcess(), 125);
     __fastfail(FAST_FAIL_FATAL_APP_EXIT); // Never continue with a fabricated result.
 }
 
 template <unsigned Slot>
-std::uintptr_t trap_slot(WinrtObject* self) {
-    trap(self, Slot);
+std::uintptr_t trap_slot(WinrtObject* self, std::uintptr_t first, std::uintptr_t second) {
+    trap(self, Slot, first, second);
 }
 
 template <std::size_t... I>

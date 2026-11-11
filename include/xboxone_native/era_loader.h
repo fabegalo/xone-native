@@ -65,7 +65,8 @@ private:
 
 // kernelx.dll contract. Exports whose console semantics match the same-named
 // Win32 API are forwarded; GetModuleHandleW(NULL) names the title image;
-// title-memory, storage and Xbox-specific exports stay unresolved.
+// Owned VirtualAlloc/VirtualFree, XMem callbacks and writable-root file APIs
+// are handled here; unsupported physical/GPU memory and services stay explicit.
 void* resolve_kernelx(const ImportRequest& request);
 // d3d11_x.dll: D3D11.X objects with the title-visible Xbox layout over D3D12.
 // Unimplemented vtable slots call the trap handler (interface, slot); without
@@ -73,20 +74,27 @@ void* resolve_kernelx(const ImportRequest& request);
 using D3D11XTrapHandler = std::uintptr_t (*)(const char* interface_name, unsigned slot);
 void* resolve_d3d11x(const ImportRequest& request);
 void set_d3d11x_trap_handler(D3D11XTrapHandler handler);
-// Redirects a loaded host module's RoGetActivationFactory import (vccorlib140)
+// Bind the graphics object ABI from the original package's system module,
+// without loading or executing that DLL. Unknown revisions stay unsupported.
+HRESULT bind_d3d11x_abi(const std::wstring& original_combase);
+// Redirects a loaded host module's RoGetActivationFactory import (vccorlib110/140)
 // to the title activation boundary, which logs and forwards to the host.
 bool hook_winrt_activation(void* module_base);
 // Title activation: title-layer classes first, then the host (real result).
 HRESULT get_title_activation_factory(HSTRING class_id, REFIID iid, void** factory);
+// Opt-in launcher diagnostic: stop on an unregistered class instead of retry loops.
+void set_stop_on_missing_activation(bool stop);
+bool stop_on_missing_service(); // Shared diagnostic policy for fatal WinRT slots.
 // Package directory holding the title's AppxManifest.xml; read once per process.
 void set_title_package_root(const std::wstring& root);
 // EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
 void* resolve_etwplus(const ImportRequest& request);
-// Writable title storage root for file mutation APIs (DeleteFileW). Empty (the
+// Writable title storage root for file mutation APIs. Empty (the
 // default) means no writable storage: mutations fail with ERROR_ACCESS_DENIED,
 // as for the read-only package. Paths outside the root fail the same way.
 void set_title_storage_root(const std::wstring& root);
-// PC builds with the title's ABI (VS2015+ CRT, vccorlib140, combase), System32 only.
+// Matching CRT/CX versions, UCRT, combase and audited Winsock/crypto exports,
+// loaded from System32 only; unknown symbols/ordinals remain unresolved.
 void* resolve_host_module(const ImportRequest& request);
 // Full title resolver: kernelx first, then audited host modules.
 void* resolve_title_import(const ImportRequest& request);

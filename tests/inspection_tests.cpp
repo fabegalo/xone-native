@@ -144,6 +144,31 @@ int main() {
         write_file(dir / "unknown.dat", unknown);
         check(!xboxone::inspection::inspect(dir / "unknown.dat", report, err), "reject unknown format");
     }
+    {
+        std::vector<std::uint8_t> catalog(6 * 12);
+        const std::uint32_t ids[]{69, 7, 69, 0x3fffffff, 0xffffffff, 0x01020304};
+        for (std::size_t i = 0; i < 6; ++i) {
+            put64(catalog, i * 12, 0x123456789abcdef0ull + i);
+            put32(catalog, i * 12 + 8, ids[i]);
+        }
+        check(write_file(dir / "chunks.manifest", catalog), "write chunk catalog fixture");
+        std::vector<std::uint32_t> chunks;
+        check(xboxone::inspection::inspect_chunk_catalog(dir / "chunks.manifest", chunks, err) &&
+              chunks == std::vector<std::uint32_t>{7, 69, 0x01020304}, "little-endian chunk IDs sorted, unique and reserved IDs excluded");
+        catalog.pop_back();
+        check(write_file(dir / "truncated.manifest", catalog), "write truncated chunk catalog");
+        check(!xboxone::inspection::inspect_chunk_catalog(dir / "truncated.manifest", chunks, err) && chunks.empty(),
+              "partial record rejected and stale results cleared");
+        check(write_file(dir / "empty.manifest", {}), "write empty chunk catalog");
+        check(!xboxone::inspection::inspect_chunk_catalog(dir / "empty.manifest", chunks, err), "empty catalog rejected");
+        check(!xboxone::inspection::inspect_chunk_catalog(dir / "absent.manifest", chunks, err), "missing catalog rejected");
+        {
+            std::ofstream out(dir / "oversized.manifest", std::ios::binary);
+            out.seekp((16u << 20) + 7);
+            out.put('\0'); // Whole records beyond the cap must still be rejected.
+        }
+        check(!xboxone::inspection::inspect_chunk_catalog(dir / "oversized.manifest", chunks, err), "oversized catalog rejected");
+    }
     check(!xboxone::inspection::inspect(dir / "missing.xvd", report, err), "reject missing file");
     std::vector<std::uint8_t> after(x.size());
     {

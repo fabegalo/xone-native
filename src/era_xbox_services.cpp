@@ -6,6 +6,8 @@
 // order) follows WinDurango's public IDL; the implementation is ours.
 #include "xboxone_native/era_loader.h"
 #include "era_winrt_classes.h"
+#include "xboxone_native/inspection.h"
+#include "file_path.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -17,6 +19,8 @@
 #include <xmllite.h>
 
 #include <mutex>
+#include <algorithm>
+#include <new>
 #include <string>
 
 namespace xboxone::era {
@@ -35,6 +39,8 @@ constexpr wchar_t retail_sandbox[] = L"RETAIL";
 
 std::mutex package_mutex;
 std::wstring package_root;
+std::vector<std::uint32_t> installed_chunks;
+bool chunks_loaded = false;
 
 struct Identity {
     HRESULT status = E_FAIL;
@@ -152,6 +158,28 @@ private:
 void set_title_package_root(const std::wstring& root) {
     std::lock_guard lock(package_mutex);
     package_root = root;
+    installed_chunks.clear();
+    chunks_loaded = false;
+}
+
+HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed) {
+    installed = false;
+    std::lock_guard lock(package_mutex);
+    if (package_root.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
+    if (!chunks_loaded) {
+        const auto path = detail::file_path(std::filesystem::path(package_root) / L"hash.manifest");
+        WIN32_FILE_ATTRIBUTE_DATA info{};
+        if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info))
+            return HRESULT_FROM_WIN32(GetLastError());
+        std::string error;
+        try {
+            if (!inspection::inspect_chunk_catalog(path, installed_chunks, error))
+                return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        chunks_loaded = true; // Immutable package revision; reset on an explicit package binding.
+    }
+    installed = std::binary_search(installed_chunks.begin(), installed_chunks.end(), chunk);
+    return S_OK;
 }
 
 HRESULT title_entry_point(std::wstring& entry_point) {

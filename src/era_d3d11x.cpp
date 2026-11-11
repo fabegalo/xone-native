@@ -121,11 +121,12 @@ struct DmaOperation { ID3D12Fence* fence; UINT64 value; bool wait; };
 struct Shader : GraphicsObject {
     Device* device = nullptr;
     void* private_data = nullptr;
+    UINT native_flags = 0; // Original GS factory 180029ef0 clears public +0x20.
     UINT stage = 0;
     // D3D12 consumes this original DXBC when the complete pipeline is created.
     std::vector<std::uint8_t> code;
 };
-static_assert(offsetof(Shader, device) == 16 && offsetof(Shader, private_data) == 24);
+static_assert(offsetof(Shader, device) == 16 && offsetof(Shader, private_data) == 24 && offsetof(Shader, native_flags) == 32);
 struct InputLayout : GraphicsObject {
     Device* device = nullptr;
     void* private_data = nullptr;
@@ -183,7 +184,7 @@ struct alignas(16) Buffer : GraphicsObject {
     ~Buffer();
 };
 static_assert(offsetof(Buffer, descriptor) == 32 && offsetof(Buffer, allocation_start) == 48);
-struct alignas(16) Uav : GraphicsObject {
+struct alignas(16) BufferView : GraphicsObject {
     Device* device = nullptr;
     void* private_data = nullptr;
     Buffer* resource = nullptr;
@@ -191,13 +192,14 @@ struct alignas(16) Uav : GraphicsObject {
     std::array<UINT32, 8> descriptor{};
     void* allocation_start = nullptr;
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{}; // Same native view prefix, type 2.
     Buffer* counter_buffer = nullptr;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_CPU_DESCRIPTOR_HANDLE host{};
-    ~Uav();
+    ~BufferView();
 };
-static_assert(offsetof(Uav, resource) == 32 && offsetof(Uav, view_type) == 40 &&
-              offsetof(Uav, descriptor) == 48 && offsetof(Uav, allocation_start) == 80);
+static_assert(offsetof(BufferView, resource) == 32 && offsetof(BufferView, view_type) == 40 &&
+              offsetof(BufferView, descriptor) == 48 && offsetof(BufferView, allocation_start) == 80);
 struct Dma : GraphicsObject {
     Device* device = nullptr;
     void* private_data = nullptr; // Old ID3D11DeviceChild prefix, at +24.
@@ -228,8 +230,8 @@ std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
     __fastfail(FAST_FAIL_FATAL_APP_EXIT); // Never continue with a fabricated result.
 }
 
-enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav };
-constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView"};
+enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv };
+constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView"};
 
 void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
     if (!address || bytes < 32 || bytes > (16u << 20)) return;
@@ -274,8 +276,17 @@ std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std:
         // missing methods together. The reporting thread terminates this process.
         if (diagnostic_gpu_stop.test_and_set()) Sleep(INFINITE);
         std::fprintf(stderr, "xone-era: graphics caller %p\n", _ReturnAddress());
-        std::fprintf(stderr, "xone-era: raw graphics integer args 0x%llX 0x%llX 0x%llX\n",
-                     static_cast<unsigned long long>(a), static_cast<unsigned long long>(b), static_cast<unsigned long long>(c));
+        std::fprintf(stderr, "xone-era: raw graphics integer args 0x%llX 0x%llX 0x%llX 0x%llX\n",
+                     static_cast<unsigned long long>(a), static_cast<unsigned long long>(b), static_cast<unsigned long long>(c),
+                     static_cast<unsigned long long>(d));
+        if constexpr (K == kind_device && Slot == 64) {
+            std::array<UINT32, 13> desc{}; // 18002b460/18002d720 read the original 52-byte texture descriptor.
+            SIZE_T read = 0;
+            if (a && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), desc.data(), sizeof desc, &read) && read == sizeof desc)
+                std::fprintf(stderr, "xone-era: placement texture %ux%u mips %u array %u format %u samples %u quality %u usage %u bind 0x%X cpu 0x%X misc 0x%X extra 0x%X 0x%X; tile %llu flags 0x%llX base 0x%llX\n",
+                    desc[0], desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12],
+                    static_cast<unsigned long long>(b), static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
+        }
         if constexpr (K == kind_device && Slot == 3) {
             D3D11_BUFFER_DESC desc{};
             SIZE_T read = 0;
@@ -292,7 +303,13 @@ std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std:
             if (b && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(b), desc.data(), sizeof desc, &read) && read == sizeof desc)
                 std::fprintf(stderr, "xone-era: view format %u dimension %u union %u %u 0x%X\n", desc[0], desc[1], desc[2], desc[3], desc[4]);
         }
-        if constexpr (K == kind_device && (Slot == 11 || Slot == 12 || Slot == 15 || Slot == 18)) {
+        if constexpr (K == kind_device && Slot == 7) {
+            std::array<UINT32, 6> desc{};
+            SIZE_T read = 0;
+            if (b && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(b), desc.data(), sizeof desc, &read) && read == sizeof desc)
+                std::fprintf(stderr, "xone-era: SRV format %u dimension %u union %u %u %u 0x%X\n", desc[0], desc[1], desc[2], desc[3], desc[4], desc[5]);
+        }
+        if constexpr (K == kind_device && (Slot == 11 || Slot == 12 || Slot == 13 || Slot == 15 || Slot == 18)) {
             const auto address = Slot == 11 ? c : a;
             const auto input_bytes = Slot == 11 ? d : b;
             std::array<DWORD, 8> header{};
@@ -431,7 +448,7 @@ void release_device(Device* device) {
 constexpr GUID shader_iids[]{
     {0xEA82E40D,0x51DC,0x4F33,{0x93,0xD4,0xDB,0x7C,0x91,0x25,0xAE,0x8C}}, // Pixel
     {0x3B301D64,0xD678,0x4289,{0x88,0x97,0x22,0xF8,0x92,0x8B,0x72,0xF3}}, // Vertex
-    {}, {}, {},
+    __uuidof(ID3D11GeometryShader), {}, {},
     {0x4F5B196E,0xC2BD,0x495E,{0xBD,0x01,0x1F,0xDE,0xD3,0x8E,0x49,0x69}} // Compute
 };
 HRESULT STDMETHODCALLTYPE shader_query(Shader* self, REFIID iid, void** out) {
@@ -981,11 +998,14 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
     const auto& d = desc.standard;
     if (!d.ByteWidth || static_cast<UINT>(d.Usage) > D3D11_USAGE_STAGING) return E_INVALIDARG;
     const bool structured = (d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0;
+    const bool dynamic = d.Usage == D3D11_USAGE_DYNAMIC;
     if (structured && ((d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS) || (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER))) return E_INVALIDARG;
     if (structured && (!d.StructureByteStride || d.StructureByteStride > D3D11_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES ||
                        d.ByteWidth % d.StructureByteStride)) return E_INVALIDARG;
     constexpr UINT supported_misc = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
-    if (desc.extension || d.Usage > D3D11_USAGE_IMMUTABLE || d.CPUAccessFlags || (d.MiscFlags & ~supported_misc) ||
+    if (desc.extension || d.Usage > D3D11_USAGE_DYNAMIC ||
+        (dynamic ? d.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE || d.MiscFlags || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS) : d.CPUAccessFlags != 0) ||
+        (d.MiscFlags & ~supported_misc) ||
         (!structured && d.StructureByteStride) ||
         (d.BindFlags & ~(D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS))) {
         if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 3>(self,
@@ -1011,7 +1031,7 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
         if (initial && (!ReadProcessMemory(GetCurrentProcess(), data.pSysMem, buffer->allocation_start, d.ByteWidth, &read) || read != d.ByteWidth))
             return E_INVALIDARG;
         hr = acquire_title_gpu_buffer(buffer->allocation_start, d.ByteWidth, self->d3d12, buffer->gpu,
-            d.BindFlags & D3D11_BIND_UNORDERED_ACCESS ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+            d.BindFlags & D3D11_BIND_UNORDERED_ACCESS ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE, true);
         if (FAILED(hr)) return hr;
         const UINT64 address = reinterpret_cast<std::uintptr_t>(buffer->allocation_start);
         if (address > 0xffffffffffull) return DXGI_ERROR_UNSUPPORTED;
@@ -1024,38 +1044,55 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
-Uav::~Uav() {
+BufferView::~BufferView() {
     if (counter_buffer) buffer_release(counter_buffer);
     if (resource) buffer_release(resource);
 }
-HRESULT STDMETHODCALLTYPE uav_query(Uav* self, REFIID iid, void** out) {
+HRESULT STDMETHODCALLTYPE view_query(BufferView* self, REFIID iid, void** out) {
+    if (self->view_type == 2)
+        return query(self, iid, out, {iid_unknown, iid_graphics_unknown, iid_device_child,
+            __uuidof(ID3D11View), __uuidof(ID3D11ShaderResourceView)});
     // The standard UAV IID is present in the original QI table at 1801192c8.
     return query(self, iid, out, {iid_unknown, iid_graphics_unknown, iid_device_child,
         __uuidof(ID3D11View), __uuidof(ID3D11UnorderedAccessView)});
 }
-ULONG STDMETHODCALLTYPE uav_add_ref(Uav* self) { return add_ref(self); }
-ULONG STDMETHODCALLTYPE uav_release(Uav* self) {
+ULONG STDMETHODCALLTYPE view_add_ref(BufferView* self) { return add_ref(self); }
+ULONG STDMETHODCALLTYPE view_release(BufferView* self) {
     const ULONG left = InterlockedDecrement(counter(self));
     if (!left) { auto* device = self->device; delete self; release_device(device); }
     return left;
 }
-void STDMETHODCALLTYPE uav_get_device(Uav* self, void** out) {
+void STDMETHODCALLTYPE view_get_device(BufferView* self, void** out) {
     if (!out) return;
     add_ref(self->device); *out = self->device;
 }
-void STDMETHODCALLTYPE uav_get_resource(Uav* self, void** out) {
+void STDMETHODCALLTYPE view_get_resource(BufferView* self, void** out) {
     if (!out) return;
     buffer_add_ref(self->resource); *out = self->resource;
 }
-void STDMETHODCALLTYPE uav_get_desc(Uav* self, D3D11_UNORDERED_ACCESS_VIEW_DESC* out) { if (out) *out = self->desc; }
+void STDMETHODCALLTYPE uav_get_desc(BufferView* self, D3D11_UNORDERED_ACCESS_VIEW_DESC* out) { if (out) *out = self->desc; }
+void STDMETHODCALLTYPE srv_get_desc(BufferView* self, D3D11_SHADER_RESOURCE_VIEW_DESC* out) { if (out) *out = self->srv_desc; }
+const std::array<const void*, vtable_slots>& srv_vtable() {
+    static const auto table = [] {
+        auto t = traps<kind_srv>();
+        t[0] = reinterpret_cast<const void*>(&view_query);
+        t[1] = reinterpret_cast<const void*>(&view_add_ref);
+        t[2] = reinterpret_cast<const void*>(&view_release);
+        t[3] = reinterpret_cast<const void*>(&view_get_device);
+        t[8] = reinterpret_cast<const void*>(&view_get_resource);
+        t[9] = reinterpret_cast<const void*>(&srv_get_desc);
+        return t;
+    }();
+    return table;
+}
 const std::array<const void*, vtable_slots>& uav_vtable() {
     static const auto table = [] {
         auto t = traps<kind_uav>();
-        t[0] = reinterpret_cast<const void*>(&uav_query);
-        t[1] = reinterpret_cast<const void*>(&uav_add_ref);
-        t[2] = reinterpret_cast<const void*>(&uav_release);
-        t[3] = reinterpret_cast<const void*>(&uav_get_device);
-        t[8] = reinterpret_cast<const void*>(&uav_get_resource);
+        t[0] = reinterpret_cast<const void*>(&view_query);
+        t[1] = reinterpret_cast<const void*>(&view_add_ref);
+        t[2] = reinterpret_cast<const void*>(&view_release);
+        t[3] = reinterpret_cast<const void*>(&view_get_device);
+        t[8] = reinterpret_cast<const void*>(&view_get_resource);
         t[9] = reinterpret_cast<const void*>(&uav_get_desc);
         return t;
     }();
@@ -1090,7 +1127,7 @@ HRESULT STDMETHODCALLTYPE device_create_uav(Device* self, Buffer* resource, cons
     if (resource->gpu.offset % source.StructureByteStride) return unsupported("suballocation offset is not divisible by stride");
     if (!out) return S_FALSE;
     try {
-        auto view = std::make_unique<Uav>();
+        auto view = std::make_unique<BufferView>();
         view->vtable = uav_vtable().data(); view->flags = 1; view->refcount = 0;
         view->device = self; view->desc = desc; view->allocation_start = resource->allocation_start;
         const UINT64 address = reinterpret_cast<std::uintptr_t>(resource->allocation_start) + UINT64(desc.Buffer.FirstElement) * source.StructureByteStride;
@@ -1121,6 +1158,55 @@ HRESULT STDMETHODCALLTYPE device_create_uav(Device* self, Buffer* resource, cons
         if (view->counter_buffer) native.Buffer.CounterOffsetInBytes = view->counter_buffer->gpu.offset;
         self->d3d12->CreateUnorderedAccessView(resource->gpu.resource,
             view->counter_buffer ? view->counter_buffer->gpu.resource : nullptr, &native, view->host);
+        buffer_add_ref(resource); view->resource = resource;
+        retain_device(self); *out = view.release();
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
+HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, Buffer* resource, const D3D11_SHADER_RESOURCE_VIEW_DESC* input, void** out) {
+    if (out) *out = nullptr;
+    if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self ||
+        !(resource->desc.standard.BindFlags & D3D11_BIND_SHADER_RESOURCE)) return E_INVALIDARG;
+    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+    SIZE_T read = 0;
+    const auto& source = resource->desc.standard;
+    if (input && (!ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc)) return E_INVALIDARG;
+    const auto unsupported = [&]() -> HRESULT {
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 7>(self,
+            reinterpret_cast<std::uintptr_t>(resource), reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(out)));
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    if (!(source.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) return unsupported();
+    const UINT records = source.ByteWidth / source.StructureByteStride;
+    if (!input) { desc.Format = DXGI_FORMAT_UNKNOWN; desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER; desc.Buffer.NumElements = records; }
+    if (desc.ViewDimension != D3D11_SRV_DIMENSION_BUFFER || desc.Format != DXGI_FORMAT_UNKNOWN) return unsupported();
+    const UINT count = !desc.Buffer.FirstElement && !desc.Buffer.NumElements ? records : desc.Buffer.NumElements;
+    if (!count || desc.Buffer.FirstElement >= records || count > records - desc.Buffer.FirstElement) return E_INVALIDARG;
+    if (resource->gpu.offset % source.StructureByteStride) return unsupported();
+    if (!out) return S_FALSE;
+    try {
+        auto view = std::make_unique<BufferView>();
+        view->vtable = srv_vtable().data(); view->flags = 1; view->refcount = 0;
+        view->view_type = 2; view->device = self; view->allocation_start = resource->allocation_start;
+        view->srv_desc.Format = desc.Format; view->srv_desc.ViewDimension = desc.ViewDimension;
+        view->srv_desc.Buffer = desc.Buffer;
+        const UINT64 address = reinterpret_cast<std::uintptr_t>(resource->allocation_start) + UINT64(desc.Buffer.FirstElement) * source.StructureByteStride;
+        if (address > 0xffffffffffull) return unsupported();
+        std::copy(resource->descriptor.begin(), resource->descriptor.end(), view->descriptor.begin());
+        view->descriptor[0] = static_cast<UINT32>(address);
+        view->descriptor[1] = (view->descriptor[1] & 0xffffff00) | static_cast<UINT32>(address >> 32);
+        view->descriptor[2] = count; // Native 180050660/1800af540 buffer SRD; upper half stays zero.
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const HRESULT hr = self->d3d12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view->heap));
+        if (FAILED(hr)) return hr;
+        view->host = view->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_SHADER_RESOURCE_VIEW_DESC native{};
+        native.Format = DXGI_FORMAT_UNKNOWN; native.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        native.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        native.Buffer.FirstElement = resource->gpu.offset / source.StructureByteStride + desc.Buffer.FirstElement;
+        native.Buffer.NumElements = count; native.Buffer.StructureByteStride = source.StructureByteStride;
+        self->d3d12->CreateShaderResourceView(resource->gpu.resource, &native, view->host);
         buffer_add_ref(resource); view->resource = resource;
         retain_device(self); *out = view.release();
         return S_OK;
@@ -1535,8 +1621,10 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
         t[1] = reinterpret_cast<const void*>(&device_add_ref);
         t[2] = reinterpret_cast<const void*>(&device_release);
         t[3] = reinterpret_cast<const void*>(&device_create_buffer);
+        t[7] = reinterpret_cast<const void*>(&device_create_srv);
         t[8] = reinterpret_cast<const void*>(&device_create_uav);
         t[12] = reinterpret_cast<const void*>(&device_create_shader<1>);
+        t[13] = reinterpret_cast<const void*>(&device_create_shader<2>);
         t[11] = reinterpret_cast<const void*>(&device_create_input_layout);
         t[15] = reinterpret_cast<const void*>(&device_create_shader<0>);
         t[18] = reinterpret_cast<const void*>(&device_create_shader<5>);
@@ -1600,9 +1688,42 @@ void STDMETHODCALLTYPE context_unbind_geometry_shader(Context* self, void* shade
     context_unbind_shader_stage<24, 0x1d0, 0x2800, 8>(self, shader);
     context_unbind_shader_stage<24, 0x1d8, 0x3000, 8>(self, shader);
 }
+HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
+        D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* out) {
+    if (!out) return E_INVALIDARG;
+    *out = {};
+    if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self->device || subresource ||
+        resource->desc.standard.Usage != D3D11_USAGE_DYNAMIC || resource->desc.standard.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE)
+        return E_INVALIDARG;
+    const auto unsupported = [&]() -> HRESULT {
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_context, 15>(self,
+            reinterpret_cast<std::uintptr_t>(resource), subresource, mode, flags));
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    if (self->deferred || flags) return unsupported();
+    if (mode != D3D11_MAP_WRITE_DISCARD && mode != D3D11_MAP_WRITE_NO_OVERWRITE) return E_INVALIDARG;
+    if (mode == D3D11_MAP_WRITE_NO_OVERWRITE &&
+        (!(resource->desc.standard.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER)) ||
+         (resource->desc.standard.BindFlags & D3D11_BIND_SHADER_RESOURCE))) return unsupported();
+    void* address = nullptr;
+    const HRESULT hr = map_title_gpu_buffer(resource->gpu, &address);
+    if (hr == E_PENDING) {
+        return unsupported(); // Blocking maps need the future command submission's fence ownership.
+    }
+    if (FAILED(hr)) return hr;
+    out->pData = address;
+    out->RowPitch = out->DepthPitch = resource->desc.standard.ByteWidth; // Original 180051690, buffer span from SRD stride/count.
+    return S_OK;
+}
+void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource, UINT subresource) {
+    if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self->device || subresource ||
+        FAILED(unmap_title_gpu_buffer(resource->gpu))) default_trap("ID3D11DeviceContextX", 16);
+}
 const std::array<const void*, vtable_slots>& legacy_context_vtable() {
     static const auto table = [] {
         auto t = context_vtable();
+        t[15] = reinterpret_cast<const void*>(&context_map_buffer); // Original 18000ff10, not desktop slot 14.
+        t[16] = reinterpret_cast<const void*>(&context_unmap_buffer); // Original 1800104f0.
         t[24] = reinterpret_cast<const void*>(&context_unbind_geometry_shader);
         t[60] = reinterpret_cast<const void*>(&context_unbind_shader_stage<60, 0x1c0, 0x2200, 2>);
         t[64] = reinterpret_cast<const void*>(&context_unbind_shader_stage<64, 0x1c8, 0x2400, 4>);

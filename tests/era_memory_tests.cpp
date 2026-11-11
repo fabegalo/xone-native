@@ -253,16 +253,40 @@ int main(int argc, char** argv) {
             readback->Unmap(0, nullptr);
         }
         check(same, "UAV readback matches the shared CPU allocation");
-        auto* counter = static_cast<UINT32*>(allocate(4, attributes));
-        if (!counter) return 1;
-        TitleGpuBuffer counter_pin;
-        hr = acquire_title_gpu_buffer(storage, 64, device.Get(), pin, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        if (SUCCEEDED(hr)) hr = acquire_title_gpu_buffer(counter, 4, device.Get(), counter_pin, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        // Actual title shape: seven DWORDs per record at canonical offset +16.
+        // The hidden counter deliberately shares the same parent allocation.
+        std::memset(storage + 4, 0x78, 56);
+        std::memset(storage + 18, 0x5b, 24);
+        auto* counter = storage + 24;
+        *counter = 0;
+        TitleGpuBuffer counter_pin, alias, duplicate;
+        hr = acquire_title_gpu_buffer(storage + 4, 56, device.Get(), pin, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true);
+        if (SUCCEEDED(hr)) hr = acquire_title_gpu_buffer(counter, 4, device.Get(), counter_pin, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true);
+        if (SUCCEEDED(hr)) hr = acquire_title_gpu_buffer(storage + 4, 28, device.Get(), alias, D3D12_RESOURCE_FLAG_NONE, true);
+        if (SUCCEEDED(hr)) hr = acquire_title_gpu_buffer(storage + 4, 56, device.Get(), duplicate, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, true);
+        check(SUCCEEDED(hr) && pin.offset == 0 && counter_pin.offset == 0 && pin.resource == duplicate.resource &&
+            pin.resource != alias.resource && pin.canonical_offset == 16 && counter_pin.canonical_offset == 96,
+            "aligned windows preserve canonical ranges, share exact bindings and retain independent aliases");
+        if (FAILED(hr)) return 1;
+        check(release_title_gpu_buffer(duplicate, fence.Get(), 4) == S_OK, "duplicate storage owner releases without GPU use");
+        check(acquire_title_gpu_buffer(storage, 4, device.Get(), second) == HRESULT_FROM_WIN32(ERROR_BUSY),
+              "direct GPU pin cannot bypass aligned representation coherence");
+        D3D12_COMMAND_QUEUE_DESC copy_desc{};
+        copy_desc.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        ComPtr<ID3D12CommandQueue> copy_queue;
+        ComPtr<ID3D12CommandAllocator> copy_allocator;
+        ComPtr<ID3D12GraphicsCommandList> copy_list;
+        ComPtr<ID3D12Fence> copy_fence;
+        hr = device->CreateCommandQueue(&copy_desc, IID_PPV_ARGS(&copy_queue));
+        if (SUCCEEDED(hr)) hr = device->CreateCommandAllocator(copy_desc.Type, IID_PPV_ARGS(&copy_allocator));
+        if (SUCCEEDED(hr)) hr = device->CreateCommandList(0, copy_desc.Type, copy_allocator.Get(), nullptr, IID_PPV_ARGS(&copy_list));
+        if (SUCCEEDED(hr)) hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&copy_fence));
         if (FAILED(hr)) return 1;
         const HMODULE compiler = LoadLibraryExW(L"d3dcompiler_47.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         const auto compile = compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler, "D3DCompile")) : nullptr;
         if (!compile) return 1;
-        constexpr char source[] = "AppendStructuredBuffer<uint> output:register(u0); [numthreads(1,1,1)] void main(){output.Append(0xCAFEBABEu);}";
+        constexpr char source[] = "struct Record{uint a,b,c,d,e,f,g;}; AppendStructuredBuffer<Record> output:register(u0);"
+            "[numthreads(1,1,1)] void main(){Record r={0xCAFEBABEu,2,3,4,5,6,7};output.Append(r);}";
         ComPtr<ID3DBlob> shader, errors, serialized;
         hr = compile(source, sizeof source - 1, nullptr, nullptr, nullptr, "main", "cs_5_0", 0, 0, &shader, &errors);
         D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 0};
@@ -283,23 +307,41 @@ int main(int argc, char** argv) {
         std::cout << "owned append compute pipeline hr=0x" << std::hex << hr << std::dec << '\n';
         check(SUCCEEDED(hr), "owned SM5 shader creates a native compute pipeline");
         if (FAILED(hr)) return 1;
-        view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.StructureByteStride = 4;
+        view.Format = DXGI_FORMAT_UNKNOWN; view.Buffer.StructureByteStride = 28; view.Buffer.NumElements = 2;
         device->CreateUnorderedAccessView(pin.resource, counter_pin.resource, &view, cpu);
         device->CopyDescriptorsSimple(1, gpu_heap->GetCPUDescriptorHandleForHeapStart(), cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), pipeline.Get()))) return 1;
         list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(root.Get());
         list->SetComputeRootDescriptorTable(0, gpu_heap->GetGPUDescriptorHandleForHeapStart());
-        barrier(list.Get(), pin.resource, pin.initial_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        barrier(list.Get(), counter_pin.resource, counter_pin.initial_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        check(begin_title_gpu_buffer(pin, list.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) == S_OK,
+              "begin uploads the unaligned payload to its aligned representation");
+        void* cpu_address = storage;
+        check(map_title_gpu_buffer(pin, &cpu_address) == E_PENDING && !cpu_address,
+              "CPU mapping cannot race an active GPU representation");
+        check(begin_title_gpu_buffer(alias, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
+              "simultaneous overlapping shader/copy aliases are explicitly refused");
+        check(begin_title_gpu_buffer(counter_pin, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
+              "another queue cannot transition the canonical parent while a list owns it");
+        check(begin_title_gpu_buffer(counter_pin, list.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) == S_OK,
+              "non-overlapping data and counter share one parent in the same command list");
+        check(release_title_gpu_buffer(pin, fence.Get(), 4) == E_PENDING && pin.resource,
+              "unfinished GPU use cannot retire through an older completed fence");
         list->Dispatch(1, 1, 1);
-        barrier(list.Get(), pin.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        barrier(list.Get(), counter_pin.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        list->CopyBufferRegion(readback.Get(), 0, pin.resource, pin.offset, 64);
+        check(end_title_gpu_buffer(pin, list.Get()) == S_OK && end_title_gpu_buffer(counter_pin, list.Get()) == S_OK,
+              "end copies actual append data and counter back before the completion fence");
+        check(end_title_gpu_buffer(pin, list.Get()) == E_INVALIDARG, "writeback cannot be recorded twice");
+        barrier(list.Get(), pin.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(list.Get(), counter_pin.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->CopyBufferRegion(readback.Get(), 0, pin.resource, pin.offset, 56);
         list->CopyBufferRegion(readback.Get(), 64, counter_pin.resource, counter_pin.offset, 4);
         barrier(list.Get(), pin.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, pin.initial_state);
         barrier(list.Get(), counter_pin.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, counter_pin.initial_state);
         if (FAILED(list->Close())) return 1;
         queue->ExecuteCommandLists(1, lists);
+        check(complete_title_gpu_buffer(pin, fence.Get(), 5) == E_PENDING,
+              "aligned use remains active until the actual completion fence");
+        check(begin_title_gpu_buffer(alias, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
+              "overlapping use stays blocked after recording writeback and before completion");
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!event) return 1;
         hr = queue->Signal(fence.Get(), 5);
@@ -308,16 +350,86 @@ int main(int argc, char** argv) {
         CloseHandle(event);
         check(appended, "GPU append and counter complete within deadline");
         if (!appended) return 1;
-        check(release_title_gpu_buffer(pin, fence.Get(), 5) == S_OK && release_title_gpu_buffer(counter_pin, fence.Get(), 5) == S_OK,
-              "data and append counter retire through the same completion boundary");
-        check(storage[0] == 0xcafebabe && storage[1] == values[0] && *counter == 1,
-              "native GPU append writes one element and increments actual shared counter");
+        check(complete_title_gpu_buffer(pin, fence.Get(), 5) == S_OK && complete_title_gpu_buffer(counter_pin, fence.Get(), 5) == S_OK,
+              "storage ownership survives completed GPU use for another dispatch");
+        check(storage[4] == 0xcafebabe && storage[5] == 2 && storage[10] == 7 && storage[11] == 0x78787878 && *counter == 1,
+              "native twenty-eight-byte append and hidden counter reach original unaligned CPU bytes");
+        bool neighbors = true;
+        for (UINT i = 0; i < 4; ++i) neighbors = neighbors && storage[i] == values[0];
+        for (UINT i = 18; i < 24; ++i) neighbors = neighbors && storage[i] == 0x5b5b5b5b;
+        check(neighbors, "writeback preserves the sixteen-byte allocator header and neighboring suballocations");
         hr = readback->Map(0, nullptr, &mapped);
         check(SUCCEEDED(hr) && static_cast<UINT32*>(mapped)[0] == 0xcafebabe && static_cast<UINT32*>(mapped)[16] == 1,
               "append data and counter readback match CPU-visible bytes");
         if (SUCCEEDED(hr)) readback->Unmap(0, nullptr);
-        release(counter, attributes);
+        // A different representation on a real COPY queue must observe both the
+        // preceding GPU write and CPU edits made at the completed boundary.
+        check(map_title_gpu_buffer(alias, &cpu_address) == S_OK && cpu_address == storage + 4,
+              "CPU map returns the original unaligned canonical payload");
+        void* overlapping = storage;
+        check(map_title_gpu_buffer(pin, &overlapping) == HRESULT_FROM_WIN32(ERROR_BUSY) && !overlapping,
+              "overlapping CPU maps are explicitly refused");
+        check(begin_title_gpu_buffer(pin, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
+              "GPU access cannot race a canonical CPU map");
+        check(release_title_gpu_buffer(alias, copy_fence.Get(), 0) == E_PENDING && alias.resource,
+              "mapped canonical memory cannot retire");
+        if (!cpu_address) return 1;
+        static_cast<UINT32*>(cpu_address)[1] = 0x0badf00d;
+        check(unmap_title_gpu_buffer(alias) == S_OK && unmap_title_gpu_buffer(alias) == E_INVALIDARG,
+              "CPU unmap publishes bytes once and rejects a second unmap");
+        check(begin_title_gpu_buffer(alias, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == S_OK,
+              "overlapping alias can refresh canonical bytes after the prior fence");
+        copy_list->CopyBufferRegion(readback.Get(), 128, alias.resource, 0, 28);
+        barrier(copy_list.Get(), alias.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_list->CopyBufferRegion(alias.resource, 24, upload.Get(), 0, 4);
+        barrier(copy_list.Get(), alias.resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        check(end_title_gpu_buffer(alias, copy_list.Get()) == S_OK, "copy-queue alias writes back the same canonical range");
+        if (FAILED(copy_list->Close())) return 1;
+        ID3D12CommandList* copy_lists[]{copy_list.Get()};
+        copy_queue->ExecuteCommandLists(1, copy_lists);
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) return 1;
+        hr = copy_queue->Signal(copy_fence.Get(), 1);
+        if (SUCCEEDED(hr)) hr = copy_fence->SetEventOnCompletion(1, event);
+        const bool copied = SUCCEEDED(hr) && WaitForSingleObject(event, 3000) == WAIT_OBJECT_0;
+        CloseHandle(event);
+        if (!copied) return 1;
+        check(complete_title_gpu_buffer(alias, copy_fence.Get(), 1) == S_OK && storage[10] == 0xa7a7a7a7,
+              "second queue completes its writeback through a real fence");
+        hr = readback->Map(0, nullptr, &mapped);
+        check(SUCCEEDED(hr) && static_cast<UINT32*>(mapped)[32] == 0xcafebabe && static_cast<UINT32*>(mapped)[33] == 0x0badf00d,
+              "alias refresh preserves prior GPU data and the latest CPU edit");
+        if (SUCCEEDED(hr)) readback->Unmap(0, nullptr);
+        if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), pipeline.Get()))) return 1;
+        list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(root.Get());
+        list->SetComputeRootDescriptorTable(0, gpu_heap->GetGPUDescriptorHandleForHeapStart());
+        check(begin_title_gpu_buffer(pin, list.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) == S_OK &&
+            begin_title_gpu_buffer(counter_pin, list.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS) == S_OK,
+            "persistent representations refresh CPU and overlapping-alias changes on reuse");
+        list->Dispatch(1, 1, 1);
+        check(end_title_gpu_buffer(pin, list.Get()) == S_OK && end_title_gpu_buffer(counter_pin, list.Get()) == S_OK,
+              "second append writes data and the persistent counter back");
+        if (FAILED(list->Close())) return 1;
+        queue->ExecuteCommandLists(1, lists);
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) return 1;
+        hr = queue->Signal(fence.Get(), 6);
+        if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(6, event);
+        const bool reused = SUCCEEDED(hr) && WaitForSingleObject(event, 3000) == WAIT_OBJECT_0;
+        CloseHandle(event);
+        if (!reused) return 1;
+        check(complete_title_gpu_buffer(pin, fence.Get(), 6) == S_OK && complete_title_gpu_buffer(counter_pin, fence.Get(), 6) == S_OK &&
+            storage[5] == 0x0badf00d && storage[10] == 0xa7a7a7a7 && storage[11] == 0xcafebabe && storage[17] == 7 && *counter == 2,
+            "repeated append preserves CPU/alias edits and increments the same counter from one to two");
         release(storage, attributes);
+        VirtualQuery(storage, &info, sizeof info);
+        check(info.State == MEM_COMMIT, "aligned storage owners defer canonical free");
+        check(FAILED(acquire_title_gpu_buffer(storage, 4, device.Get(), second, D3D12_RESOURCE_FLAG_NONE, true)),
+              "freed canonical allocation refuses new aligned bindings");
+        check(release_title_gpu_buffer(pin, fence.Get(), 6) == S_OK && release_title_gpu_buffer(counter_pin, fence.Get(), 6) == S_OK &&
+            release_title_gpu_buffer(alias, copy_fence.Get(), 1) == S_OK, "aligned owners retire through their actual queue fences");
+        VirtualQuery(storage, &info, sizeof info);
+        check(info.State == MEM_FREE, "last aligned owner frees canonical and GPU representations together");
     }
     return failures ? 1 : 0;
 }

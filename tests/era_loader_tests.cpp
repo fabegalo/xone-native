@@ -631,6 +631,47 @@ int main(int argc, char** argv) {
                         check((srd[1] & 0x3fff0000) == 0x100000 && srd[2] == 4, "constant SRD preserves sixteen-byte stride and record count");
                         reinterpret_cast<Count>(vt(buffer)[2])(buffer);
                     }
+                    desc.standard = {80, D3D11_USAGE_DYNAMIC, D3D11_BIND_CONSTANT_BUFFER, D3D11_CPU_ACCESS_READ, 0, 0};
+                    check(factory(device, &desc, nullptr, &buffer) == DXGI_ERROR_UNSUPPORTED && !buffer,
+                          "dynamic buffers refuse unimplemented CPU-read storage");
+                    desc.standard.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                    check(factory(device, &desc, nullptr, &buffer) == S_OK && buffer, "observed eighty-byte dynamic constant buffer created");
+                    if (buffer) {
+                        using Map = HRESULT (STDMETHODCALLTYPE*)(void*, void*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+                        using Unmap = void (STDMETHODCALLTYPE*)(void*, void*, UINT);
+                        const auto map = reinterpret_cast<Map>(vt(context)[15]);
+                        const auto unmap = reinterpret_cast<Unmap>(vt(context)[16]);
+                        struct { D3D11_MAPPED_SUBRESOURCE mapped{}; UINT64 guard = 0xabcdef; } result;
+                        check(map(context, buffer, 1, D3D11_MAP_WRITE_DISCARD, 0, &result.mapped) == E_INVALIDARG && !result.mapped.pData,
+                              "buffer mapping validates the subresource and clears its output");
+                        check(map(context, buffer, 0, D3D11_MAP_READ, 0, &result.mapped) == E_INVALIDARG,
+                              "write-only dynamic storage cannot be read-mapped");
+                        check(map(context, buffer, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &result.mapped) == DXGI_ERROR_UNSUPPORTED,
+                              "constant buffer no-overwrite feature is explicit until implemented");
+                        check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 1, &result.mapped) == DXGI_ERROR_UNSUPPORTED,
+                              "unknown Xbox map flags are not silently masked");
+                        check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &result.mapped) == S_OK && result.mapped.pData,
+                              "native context slot fifteen maps real dynamic storage");
+                        void* allocation = nullptr;
+                        std::memcpy(&allocation, static_cast<char*>(buffer) + 48, sizeof allocation);
+                        check(result.mapped.pData == allocation && result.guard == 0xabcdef && refs(buffer) == 1,
+                              "map preserves original buffer identity, address and output extent");
+                        if (result.mapped.pData) {
+                            auto* words = static_cast<UINT32*>(result.mapped.pData);
+                            for (UINT i = 0; i < 20; ++i) words[i] = 0xabc00000 + i;
+                            D3D11_MAPPED_SUBRESOURCE duplicate{};
+                            check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &duplicate) == HRESULT_FROM_WIN32(ERROR_BUSY) && !duplicate.pData,
+                                  "a second map cannot alias active CPU writes");
+                            unmap(context, buffer, 0);
+                            check(static_cast<UINT32*>(allocation)[19] == 0xabc00013, "unmap keeps CPU writes in canonical title bytes");
+                            check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, D3D11_MAP_FLAG_DO_NOT_WAIT, &result.mapped) == DXGI_ERROR_UNSUPPORTED && !result.mapped.pData,
+                                  "unimplemented map flag combinations remain explicit");
+                            check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &result.mapped) == S_OK,
+                                  "completed dynamic buffer can be mapped again");
+                            if (result.mapped.pData) unmap(context, buffer, 0);
+                        }
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                    }
                     desc.standard = {280000, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS,
                         0, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 28};
                     check(factory(device, &desc, nullptr, &buffer) == S_OK && buffer, "observed structured UAV buffer binds actual shared GPU resource");
@@ -712,11 +753,58 @@ int main(int argc, char** argv) {
                         view_desc.Buffer = {0, 10000, D3D11_BUFFER_UAV_FLAG_APPEND};
                         using CreateUav = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_UNORDERED_ACCESS_VIEW_DESC*, void**);
                         void* view = buffer;
-                        check(reinterpret_cast<CreateUav>(vt(device)[8])(device, buffer, &view_desc, &view) == DXGI_ERROR_UNSUPPORTED && !view && refs(buffer) == 1,
-                              "current shared mapping explicitly refuses a sixteen-byte offset with stride twenty-eight");
+                        check(reinterpret_cast<CreateUav>(vt(device)[8])(device, buffer, &view_desc, &view) == S_OK && view && refs(buffer) == 2,
+                              "aligned representation accepts actual sixteen-byte offset and stride twenty-eight");
                         bool header = (reinterpret_cast<std::uintptr_t>(allocation) & 65535) == 16;
                         for (unsigned i = 0; i < 16; ++i) header = header && static_cast<unsigned char*>(allocation)[int(i) - 16] == 0x5a;
-                        check(header, "refused view preserves original allocator address and metadata");
+                        check(header, "aligned view preserves original allocator address and metadata");
+                        if (view) reinterpret_cast<Count>(vt(view)[2])(view);
+                        using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
+                        const auto create_srv = reinterpret_cast<CreateSrv>(vt(device)[7]);
+                        D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+                        srv_desc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+                        srv_desc.Buffer = {1, 9999};
+                        check(create_srv(device, nullptr, &srv_desc, &view) == E_INVALIDARG && !view, "SRV requires an actual buffer");
+                        srv_desc.Buffer.NumElements = 10000;
+                        check(create_srv(device, buffer, &srv_desc, &view) == E_INVALIDARG && !view, "SRV range cannot exceed logical buffer");
+                        srv_desc.Buffer.NumElements = 9999;
+                        srv_desc.Format = DXGI_FORMAT_R32_UINT;
+                        check(create_srv(device, buffer, &srv_desc, &view) == DXGI_ERROR_UNSUPPORTED && !view, "structured SRV refuses typed reinterpretation");
+                        srv_desc.Format = DXGI_FORMAT_UNKNOWN;
+                        check(create_srv(device, buffer, &srv_desc, nullptr) == S_FALSE && refs(buffer) == 1,
+                              "SRV validation-only preserves resource ownership");
+                        check(create_srv(device, buffer, &srv_desc, &view) == S_OK && view && refs(buffer) == 2,
+                              "SRV and UAV share the original header-bearing logical buffer");
+                        if (view) {
+                            UINT type = 0;
+                            std::memcpy(&type, static_cast<char*>(view) + 40, sizeof type);
+                            std::array<UINT32, 8> descriptor{};
+                            std::memcpy(descriptor.data(), static_cast<char*>(view) + 48, sizeof descriptor);
+                            const UINT64 address = descriptor[0] | (UINT64(descriptor[1] & 255) << 32);
+                            check(type == 2 && address == reinterpret_cast<std::uintptr_t>(allocation) + 28 && descriptor[2] == 9999 &&
+                                descriptor[3] == 0x24fac && !descriptor[4] && !descriptor[5] && !descriptor[6] && !descriptor[7],
+                                "native SRV prefix and SRD preserve unaligned base, element range and upper zero bytes");
+                            using GetDesc = void (STDMETHODCALLTYPE*)(void*, D3D11_SHADER_RESOURCE_VIEW_DESC*);
+                            struct { D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; UINT32 guard = 0xabcdef; } actual;
+                            reinterpret_cast<GetDesc>(vt(view)[9])(view, &actual.desc);
+                            check(actual.desc.Buffer.FirstElement == 1 && actual.desc.Buffer.NumElements == 9999 && actual.guard == 0xabcdef,
+                                  "SRV GetDesc writes its actual twenty-four-byte descriptor");
+                            using QueryView = HRESULT (STDMETHODCALLTYPE*)(void*, REFIID, void**);
+                            void* queried = nullptr;
+                            check(reinterpret_cast<QueryView>(vt(view)[0])(view, __uuidof(ID3D11ShaderResourceView), &queried) == S_OK && queried == view,
+                                  "SRV IID returns its original identity");
+                            if (queried) reinterpret_cast<Count>(vt(queried)[2])(queried);
+                            check(reinterpret_cast<QueryView>(vt(view)[0])(view, __uuidof(ID3D11UnorderedAccessView), &queried) == E_NOINTERFACE && !queried,
+                                  "SRV does not claim UAV methods");
+                            using GetResource = void (STDMETHODCALLTYPE*)(void*, void**);
+                            void* retained = nullptr;
+                            reinterpret_cast<GetResource>(vt(view)[8])(view, &retained);
+                            check(retained == buffer && refs(buffer) == 3, "SRV GetResource retains the same buffer");
+                            if (retained) reinterpret_cast<Count>(vt(retained)[2])(retained);
+                            reinterpret_cast<Count>(vt(view)[2])(view);
+                        }
+                        check(create_srv(device, buffer, nullptr, &view) == S_OK && view, "null SRV descriptor uses the full structured range");
+                        if (view) reinterpret_cast<Count>(vt(view)[2])(view);
                         reinterpret_cast<Count>(vt(buffer)[2])(buffer);
                     }
                     graphics_force_header = false;
@@ -869,10 +957,12 @@ int main(int argc, char** argv) {
                     if (compile) {
                         using CreateShader = HRESULT (STDMETHODCALLTYPE*)(void*, const void*, SIZE_T, void*, void**);
                         const char* source[]{"float4 main(float4 p:POSITION):SV_Position { return p; }",
-                            "float4 main():SV_Target { return float4(1,0,0,1); }", "[numthreads(1,1,1)] void main() {}"};
-                        const char* profile[]{"vs_5_0", "ps_5_0", "cs_5_0"};
-                        const unsigned slots[]{12, 15, 18};
-                        for (unsigned i = 0; i != 3; ++i) {
+                            "float4 main():SV_Target { return float4(1,0,0,1); }", "[numthreads(1,1,1)] void main() {}",
+                            "struct V{float4 p:SV_Position;}; [maxvertexcount(3)] void main(triangle V input[3],inout TriangleStream<V> output)"
+                            "{output.Append(input[0]);output.Append(input[1]);output.Append(input[2]);}"};
+                        const char* profile[]{"vs_5_0", "ps_5_0", "cs_5_0", "gs_5_0"};
+                        const unsigned slots[]{12, 15, 18, 13};
+                        for (unsigned i = 0; i != 4; ++i) {
                             ID3DBlob* code = nullptr;
                             check(SUCCEEDED(compile(source[i], std::strlen(source[i]), nullptr, nullptr, nullptr,
                                 "main", profile[i], 0, 0, &code, nullptr)) && code, "compile owned shader fixture");
@@ -910,7 +1000,7 @@ int main(int argc, char** argv) {
                                   "truncated shader rejected and output cleared");
                             check(factory(device, code->GetBufferPointer(), code->GetBufferSize(), device, &shader) == DXGI_ERROR_UNSUPPORTED && !shader,
                                   "unimplemented dynamic linkage rejected");
-                            check(FAILED(reinterpret_cast<CreateShader>(vt(device)[slots[(i + 1) % 3]])(device,
+                            check(FAILED(reinterpret_cast<CreateShader>(vt(device)[slots[(i + 1) % 4]])(device,
                                 code->GetBufferPointer(), code->GetBufferSize(), nullptr, &shader)) && !shader, "wrong shader stage rejected");
                             check(factory(device, code->GetBufferPointer(), code->GetBufferSize(), nullptr, nullptr) == S_FALSE,
                                   "shader validation-only does not create an object");
@@ -918,6 +1008,16 @@ int main(int argc, char** argv) {
                                   "validated DXBC shader module created");
                             if (shader) {
                                 check(refs(shader) == 1 && refs(device) == 1, "shader owns internal device dependency");
+                                if (i == 3) {
+                                    UINT native_flags = 1;
+                                    std::memcpy(&native_flags, static_cast<char*>(shader) + 32, sizeof native_flags);
+                                    check(native_flags == 0, "original geometry shader public flag at plus thirty-two stays zero");
+                                    using QueryShader = HRESULT (STDMETHODCALLTYPE*)(void*, REFIID, void**);
+                                    void* queried = nullptr;
+                                    check(reinterpret_cast<QueryShader>(vt(shader)[0])(shader, __uuidof(ID3D11GeometryShader), &queried) == S_OK && queried == shader,
+                                          "geometry shader IID preserves original identity");
+                                    if (queried) reinterpret_cast<Count>(vt(queried)[2])(queried);
+                                }
                                 using Get = void (STDMETHODCALLTYPE*)(void*, void**);
                                 void* owner = nullptr;
                                 reinterpret_cast<Get>(vt(shader)[3])(shader, &owner);

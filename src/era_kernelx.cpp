@@ -56,6 +56,15 @@ constexpr std::string_view forwarded[]{
 std::atomic<HMODULE> title_module{nullptr};
 std::mutex storage_mutex;
 std::mutex memory_mutex;
+struct GpuWindow {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    unsigned owners = 0;
+    TitleGpuBuffer* active = nullptr;
+    TitleGpuBuffer* cpu = nullptr;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    bool copied_back = false;
+};
 struct GpuBacking {
     SIZE_T size;
     DWORD guest_protection = 0;
@@ -66,6 +75,7 @@ struct GpuBacking {
     Microsoft::WRL::ComPtr<IUnknown> device;
     Microsoft::WRL::Wrappers::FileHandle mapping{};
     D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON;
+    std::map<std::pair<SIZE_T, SIZE_T>, GpuWindow> windows; // Canonical offset and payload size.
 };
 struct TitleRegion : GpuBacking {
     bool graphics;
@@ -517,7 +527,7 @@ HMODULE WINAPI era_GetModuleHandleW(LPCWSTR name) {
 
 } // namespace
 
-HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* device, TitleGpuBuffer& out, D3D12_RESOURCE_FLAGS flags) {
+HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* device, TitleGpuBuffer& out, D3D12_RESOURCE_FLAGS flags, bool aligned) {
     if (!address || !size || !device || out.resource) return E_INVALIDARG;
     if (flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) return DXGI_ERROR_UNSUPPORTED;
     std::lock_guard lock(memory_mutex);
@@ -537,12 +547,13 @@ HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* 
     auto& region = *backing;
     const auto offset = at - base;
     if (region.retiring || offset >= region.size || size > region.size - offset) return E_INVALIDARG;
-    if (region.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if (region.gpu_pins && (!aligned || region.windows.empty())) return HRESULT_FROM_WIN32(ERROR_BUSY);
     Microsoft::WRL::ComPtr<IUnknown> identity;
     HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&identity));
     if (FAILED(hr)) return hr;
     if (region.device && region.device.Get() != identity.Get()) return DXGI_ERROR_INVALID_CALL;
-    if (region.buffer && (region.buffer->GetDesc().Flags & flags) != flags) return DXGI_ERROR_UNSUPPORTED;
+    const auto canonical_flags = aligned ? D3D12_RESOURCE_FLAG_NONE : flags;
+    if (region.buffer && (region.buffer->GetDesc().Flags & canonical_flags) != canonical_flags) return DXGI_ERROR_UNSUPPORTED;
     if (!region.buffer) {
         Microsoft::WRL::ComPtr<ID3D12Device3> device3;
         hr = device->QueryInterface(IID_PPV_ARGS(&device3));
@@ -554,14 +565,14 @@ HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* 
         const auto heap_desc = heap->GetDesc();
         const auto state = heap_desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD ?
             D3D12_RESOURCE_STATE_GENERIC_READ : D3D12_RESOURCE_STATE_COMMON;
-        if (state == D3D12_RESOURCE_STATE_GENERIC_READ && flags) return DXGI_ERROR_UNSUPPORTED;
+        if (state == D3D12_RESOURCE_STATE_GENERIC_READ && (flags || aligned)) return DXGI_ERROR_UNSUPPORTED;
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
         desc.Width = region.size;
         desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
         desc.SampleDesc.Count = 1;
         desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        desc.Flags = flags;
+        desc.Flags = canonical_flags;
         if (heap_desc.Flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER)
             desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
         Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
@@ -572,12 +583,160 @@ HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* 
         region.device = std::move(identity);
         region.initial_state = state;
     }
+    if (aligned) {
+        if (region.initial_state != D3D12_RESOURCE_STATE_COMMON) return DXGI_ERROR_UNSUPPORTED;
+        try {
+            const auto key = std::make_pair(static_cast<SIZE_T>(offset), static_cast<SIZE_T>(size));
+            auto window = region.windows.find(key);
+            if (window == region.windows.end()) {
+                D3D12_HEAP_PROPERTIES heap{};
+                heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+                D3D12_RESOURCE_DESC desc{};
+                desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                if (size > UINT64_MAX - 255) return E_INVALIDARG;
+                desc.Width = (size + 255) & ~UINT64{255}; // CBVs may cover a padded final 256-byte block.
+                desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+                desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; desc.Flags = flags;
+                GpuWindow entry;
+                hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, IID_PPV_ARGS(&entry.resource));
+                if (FAILED(hr)) return hr;
+                window = region.windows.emplace(key, std::move(entry)).first;
+            } else if ((window->second.resource->GetDesc().Flags & flags) != flags) return DXGI_ERROR_UNSUPPORTED;
+            ++window->second.owners;
+            ++region.gpu_pins;
+            out.resource = window->second.resource.Get(); out.resource->AddRef();
+            out.allocation = reinterpret_cast<void*>(base);
+            out.representation = &window->second;
+            out.canonical_offset = offset; out.size = size;
+            return S_OK;
+        } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    }
     ++region.gpu_pins;
     out.resource = region.buffer.Get();
     out.resource->AddRef();
     out.allocation = reinterpret_cast<void*>(base);
     out.offset = offset;
     out.initial_state = region.initial_state;
+    return S_OK;
+}
+
+namespace {
+GpuBacking* gpu_backing(const TitleGpuBuffer& buffer) {
+    const auto base = reinterpret_cast<std::uintptr_t>(buffer.allocation);
+    auto found = title_regions.upper_bound(base);
+    if (found == title_regions.begin()) return nullptr;
+    --found;
+    if (found->second.xmem) return found->first == base ? &found->second : nullptr;
+    auto commit = found->second.commits.find(base);
+    return commit == found->second.commits.end() ? nullptr : &commit->second;
+}
+GpuWindow* gpu_window(const TitleGpuBuffer& buffer, GpuBacking* backing) {
+    if (!backing || !buffer.representation || !buffer.resource) return nullptr;
+    const auto found = backing->windows.find({buffer.canonical_offset, buffer.size});
+    if (found == backing->windows.end() || &found->second != buffer.representation ||
+        found->second.resource.Get() != buffer.resource) return nullptr;
+    return &found->second;
+}
+HRESULT completed_fence(GpuBacking* backing, ID3D12Fence* fence, UINT64 value) {
+    if (!fence || value == UINT64_MAX) return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<IUnknown> device;
+    const HRESULT hr = fence->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(hr)) return hr;
+    if (device.Get() != backing->device.Get()) return DXGI_ERROR_INVALID_CALL;
+    const UINT64 completed = fence->GetCompletedValue();
+    if (completed == UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
+    return completed < value ? E_PENDING : S_OK;
+}
+void gpu_transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+    if (before == after) return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
+    list->ResourceBarrier(1, &barrier);
+}
+}
+
+HRESULT begin_title_gpu_buffer(TitleGpuBuffer& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state) {
+    if (!list || list->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE) return E_INVALIDARG;
+    if (list->GetType() == D3D12_COMMAND_LIST_TYPE_COPY && state != D3D12_RESOURCE_STATE_COMMON &&
+        state != D3D12_RESOURCE_STATE_COPY_SOURCE && state != D3D12_RESOURCE_STATE_COPY_DEST) return DXGI_ERROR_UNSUPPORTED;
+    std::lock_guard lock(memory_mutex);
+    auto* backing = gpu_backing(buffer);
+    auto* window = gpu_window(buffer, backing);
+    if (!window) return E_INVALIDARG;
+    if (backing->retiring) return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<IUnknown> device;
+    HRESULT hr = list->GetDevice(IID_PPV_ARGS(&device));
+    if (FAILED(hr)) return hr;
+    if (device.Get() != backing->device.Get()) return DXGI_ERROR_INVALID_CALL;
+    for (const auto& [range, alias] : backing->windows) {
+        if (alias.cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        // The canonical parent has one D3D12 state. Independent queues/lists
+        // must finish their fence before another list can transition it.
+        if (alias.active && alias.list.Get() != list) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (alias.active && buffer.canonical_offset < range.first + range.second &&
+            range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    if ((state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
+        !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
+    window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;
+    gpu_transition(list, backing->buffer.Get(), backing->initial_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(buffer.resource, 0, backing->buffer.Get(), buffer.canonical_offset, buffer.size);
+    gpu_transition(list, backing->buffer.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, backing->initial_state);
+    gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COPY_DEST, state);
+    return S_OK;
+}
+
+HRESULT end_title_gpu_buffer(TitleGpuBuffer& buffer, ID3D12GraphicsCommandList* list) {
+    std::lock_guard lock(memory_mutex);
+    auto* backing = gpu_backing(buffer);
+    auto* window = gpu_window(buffer, backing);
+    if (!window || window->active != &buffer || window->list.Get() != list || window->copied_back) return E_INVALIDARG;
+    gpu_transition(list, buffer.resource, window->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    gpu_transition(list, backing->buffer.Get(), backing->initial_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(backing->buffer.Get(), buffer.canonical_offset, buffer.resource, 0, buffer.size);
+    gpu_transition(list, backing->buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, backing->initial_state);
+    gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    window->copied_back = true;
+    return S_OK;
+}
+
+HRESULT complete_title_gpu_buffer(TitleGpuBuffer& buffer, ID3D12Fence* fence, UINT64 value) {
+    std::lock_guard lock(memory_mutex);
+    auto* backing = gpu_backing(buffer);
+    auto* window = gpu_window(buffer, backing);
+    if (!window || window->active != &buffer) return E_INVALIDARG;
+    if (!window->copied_back) return E_PENDING;
+    const HRESULT hr = completed_fence(backing, fence, value);
+    if (FAILED(hr)) return hr;
+    window->active = nullptr; window->list.Reset(); window->copied_back = false;
+    return S_OK;
+}
+
+HRESULT map_title_gpu_buffer(TitleGpuBuffer& buffer, void** address) {
+    if (!address) return E_INVALIDARG;
+    *address = nullptr;
+    std::lock_guard lock(memory_mutex);
+    auto* backing = gpu_backing(buffer);
+    auto* window = gpu_window(buffer, backing);
+    if (!window || backing->retiring) return E_INVALIDARG;
+    for (const auto& [range, alias] : backing->windows) {
+        if (alias.active) return E_PENDING;
+        if (alias.cpu && buffer.canonical_offset < range.first + range.second &&
+            range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    window->cpu = &buffer;
+    *address = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
+    return S_OK;
+}
+
+HRESULT unmap_title_gpu_buffer(TitleGpuBuffer& buffer) {
+    std::lock_guard lock(memory_mutex);
+    auto* window = gpu_window(buffer, gpu_backing(buffer));
+    if (!window || window->cpu != &buffer) return E_INVALIDARG;
+    window->cpu = nullptr;
     return S_OK;
 }
 
@@ -594,14 +753,17 @@ HRESULT release_title_gpu_buffer(TitleGpuBuffer& buffer, ID3D12Fence* fence, UIN
         if (commit == found->second.commits.end()) return E_INVALIDARG;
         backing = &commit->second;
     }
-    if (!backing->gpu_pins || backing->buffer.Get() != buffer.resource) return E_INVALIDARG;
-    Microsoft::WRL::ComPtr<IUnknown> device;
-    HRESULT hr = fence->GetDevice(IID_PPV_ARGS(&device));
+    if (!backing->gpu_pins) return E_INVALIDARG;
+    auto* window = gpu_window(buffer, backing);
+    if (buffer.representation ? !window : backing->buffer.Get() != buffer.resource) return E_INVALIDARG;
+    if (window && window->cpu) return E_PENDING;
+    if (window && window->active && (window->active != &buffer || !window->copied_back)) return E_PENDING;
+    const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;
-    if (device.Get() != backing->device.Get()) return DXGI_ERROR_INVALID_CALL;
-    const UINT64 completed = fence->GetCompletedValue();
-    if (completed == UINT64_MAX) return DXGI_ERROR_DEVICE_REMOVED;
-    if (completed < value) return E_PENDING;
+    if (window) {
+        window->active = nullptr; window->list.Reset(); window->copied_back = false;
+        if (!--window->owners) backing->windows.erase({buffer.canonical_offset, buffer.size});
+    }
     buffer.resource->Release();
     buffer = {};
     --backing->gpu_pins;

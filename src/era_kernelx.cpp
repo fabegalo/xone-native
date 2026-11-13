@@ -523,6 +523,27 @@ std::wstring full_path(LPCWSTR path) {
     n = GetFullPathNameW(path, n, out.data(), nullptr);
     if (!n || n >= out.size()) { SetLastError(ERROR_INVALID_NAME); return {}; }
     out.resize(n);
+    // Handle names are normalized to long names, while TEMP may contain 8.3 aliases.
+    // Expand the existing prefix only; creation may target a missing leaf.
+    std::size_t end = out.size();
+    while (end > 3 && end != std::wstring::npos) {
+        const auto prefix = out.substr(0, end);
+        const std::wstring extended = prefix.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + prefix.substr(2) : L"\\\\?\\" + prefix;
+        const DWORD capacity = GetLongPathNameW(extended.c_str(), nullptr, 0);
+        if (capacity) {
+            std::wstring expanded(capacity, L'\0');
+            const DWORD length = GetLongPathNameW(extended.c_str(), expanded.data(), capacity);
+            if (!length || length >= capacity) return {};
+            expanded.resize(length);
+            if (expanded.starts_with(L"\\\\?\\UNC\\")) expanded = L"\\\\" + expanded.substr(8);
+            else if (expanded.starts_with(L"\\\\?\\")) expanded.erase(0, 4);
+            out = expanded + out.substr(end);
+            break;
+        }
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return {};
+        end = out.rfind(L'\\', end - 1);
+    }
     return out;
 }
 
@@ -580,7 +601,6 @@ bool writable_handle(HANDLE handle) {
     n = GetFinalPathNameByHandleW(handle, path.data(), n, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
     if (!n || n >= path.size()) return false;
     path.resize(n);
-    if (path.starts_with(L"\\\\?\\")) path.erase(0, 4);
     return writable_path(path.c_str());
 }
 

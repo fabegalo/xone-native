@@ -1883,6 +1883,23 @@ int main(int argc, char** argv) {
             check(open(inside.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) == INVALID_HANDLE_VALUE &&
                       GetLastError() == ERROR_ACCESS_DENIED, "no storage: destructive open denied");
             set_title_storage_root(root);
+            std::wstring short_root(32768, L'\0');
+            const DWORD short_length = GetShortPathNameW(root.c_str(), short_root.data(), static_cast<DWORD>(short_root.size()));
+            check(short_length && short_length < short_root.size(), "storage root resolves its short-name alias");
+            if (short_length && short_length < short_root.size()) {
+                short_root.resize(short_length);
+                set_title_storage_root(short_root);
+            }
+            const auto created = root + L"\\new-save.bin";
+            HANDLE fresh = open(created.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+            check(fresh != INVALID_HANDLE_VALUE, "short-name root allows creation through its long-name alias");
+            if (fresh != INVALID_HANDLE_VALUE) {
+                DWORD bytes = 0;
+                check(write(fresh, "new", 3, &bytes, nullptr) && bytes == 3 && flush(fresh),
+                      "new save persists through normalized handle validation");
+                CloseHandle(fresh);
+            }
+            DeleteFileW(created.c_str());
             const DWORD mutation_access[]{GENERIC_WRITE, GENERIC_ALL, MAXIMUM_ALLOWED, DELETE, FILE_APPEND_DATA};
             for (DWORD access : mutation_access)
                 check(open(outside.c_str(), access, 0, nullptr, OPEN_EXISTING, 0, nullptr) == INVALID_HANDLE_VALUE &&

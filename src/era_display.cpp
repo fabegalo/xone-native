@@ -10,7 +10,8 @@ namespace xboxone::era {
 static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format, UINT samples,
         const char* source, const D3D_SHADER_MACRO* macros,
         Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline,
-        bool depth_target = false, UINT srv_count = 1, UINT stencil_bit = UINT_MAX) {
+        bool depth_target = false, UINT srv_count = 1, UINT stencil_bit = UINT_MAX,
+        DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
     if (!device) return E_INVALIDARG;
     struct CompilerModule {
         HMODULE handle;
@@ -61,7 +62,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
     desc.NumRenderTargets = 1; desc.RTVFormats[0] = output_format; desc.SampleDesc.Count = samples;
     if (depth_target) {
         desc.NumRenderTargets = 0; desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
-        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        desc.DSVFormat = depth_format;
         auto& state = desc.DepthStencilState;
         state.DepthEnable = TRUE; state.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
         state.StencilEnable = stencil_bit<8; state.StencilReadMask = 255;
@@ -127,6 +128,9 @@ HRESULT DisplayTransfer::record(ID3D12GraphicsCommandList* list, ID3D12Descripto
 HRESULT SampleTransfer::initialize(ID3D12Device* device, DXGI_FORMAT format, UINT samples) {
     if (samples < 2 || samples > 8 || (samples & (samples - 1))) return E_INVALIDARG;
     const bool depth_stencil = format==DXGI_FORMAT_R32G8X24_TYPELESS;
+    const bool depth_only = format==DXGI_FORMAT_R32_TYPELESS;
+    const bool integer_color = format==DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    const auto transport_format=integer_color ? DXGI_FORMAT_R16G16B16A16_UINT : format;
     static constexpr char source[] = R"(
 cbuffer Transfer : register(b0) { uint sample_index; };
 struct Vertex { float4 position : SV_Position; };
@@ -137,6 +141,12 @@ Vertex vs_main(uint id : SV_VertexID) {
     return v;
 }
 #ifdef INTO_MSAA
+#ifdef DEPTH_ONLY
+Texture2DArray<uint> image : register(t0);
+float ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Depth {
+    return asfloat(image.Load(int4(int2(v.position.xy), sample_id, 0)));
+}
+#else
 #ifdef DEPTH_STENCIL
 Texture2DArray<uint2> image : register(t0);
 #ifdef STENCIL_BIT
@@ -150,11 +160,23 @@ float ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Depth {
 }
 #endif
 #else
+#ifdef INTEGER_COLOR
+Texture2DArray<uint4> image : register(t0);
+uint4 ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Target {
+    return image.Load(int4(int2(v.position.xy), sample_id, 0));
+}
+#else
 Texture2DArray<float4> image : register(t0);
 float4 ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Target {
     return image.Load(int4(int2(v.position.xy), sample_id, 0));
 }
 #endif
+#endif
+#endif
+#else
+#ifdef DEPTH_ONLY
+Texture2DMS<float> image : register(t0);
+uint ps_main(Vertex v) : SV_Target { return asuint(image.Load(int2(v.position.xy), sample_index)); }
 #else
 #ifdef DEPTH_STENCIL
 Texture2DMS<float> depth_image : register(t0);
@@ -164,19 +186,29 @@ uint2 ps_main(Vertex v) : SV_Target {
     return uint2(asuint(depth_image.Load(xy, sample_index)),stencil_image.Load(xy, sample_index).y);
 }
 #else
+#ifdef INTEGER_COLOR
+Texture2DMS<uint4> image : register(t0);
+uint4 ps_main(Vertex v) : SV_Target {
+    return image.Load(int2(v.position.xy), sample_index);
+}
+#else
 Texture2DMS<float4> image : register(t0);
 float4 ps_main(Vertex v) : SV_Target {
     return image.Load(int2(v.position.xy), sample_index);
 }
 #endif
 #endif
+#endif
+#endif
 )";
     std::array<Microsoft::WRL::ComPtr<ID3D12RootSignature>, 2> roots;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 2> pipelines;
-    const D3D_SHADER_MACRO into[]{{"INTO_MSAA", "1"}, {depth_stencil ? "DEPTH_STENCIL" : nullptr,"1"}, {nullptr,nullptr}};
-    const D3D_SHADER_MACRO out[]{{depth_stencil ? "DEPTH_STENCIL" : nullptr,"1"}, {nullptr,nullptr}};
-    HRESULT hr = graphics_pipeline(device, format, samples, source, into, roots[0], pipelines[0],depth_stencil);
-    if (SUCCEEDED(hr)) hr = graphics_pipeline(device, depth_stencil ? DXGI_FORMAT_R32G32_UINT : format, 1, source, out,
+    const char* transport_macro=depth_stencil ? "DEPTH_STENCIL" : depth_only ? "DEPTH_ONLY" : integer_color ? "INTEGER_COLOR" : nullptr;
+    const D3D_SHADER_MACRO into[]{{"INTO_MSAA", "1"}, {transport_macro,"1"}, {nullptr,nullptr}};
+    const D3D_SHADER_MACRO out[]{{transport_macro,"1"}, {nullptr,nullptr}};
+    HRESULT hr = graphics_pipeline(device, transport_format, samples, source, into, roots[0], pipelines[0],depth_stencil || depth_only,
+        1,UINT_MAX,depth_only ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+    if (SUCCEEDED(hr)) hr = graphics_pipeline(device, depth_stencil ? DXGI_FORMAT_R32G32_UINT : depth_only ? DXGI_FORMAT_R32_UINT : transport_format, 1, source, out,
         roots[1], pipelines[1],false,depth_stencil ? 2 : 1);
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,8> stencil;
     if (depth_stencil) for (UINT bit=0;bit<8 && SUCCEEDED(hr);++bit) {
@@ -184,7 +216,7 @@ float4 ps_main(Vertex v) : SV_Target {
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
         hr=graphics_pipeline(device,format,samples,source,masks,root,stencil[bit],true,1,bit);
     }
-    if (SUCCEEDED(hr)) { roots_ = std::move(roots); pipelines_ = std::move(pipelines); stencil_pipelines_=std::move(stencil); samples_ = samples; depth_stencil_=depth_stencil; }
+    if (SUCCEEDED(hr)) { roots_ = std::move(roots); pipelines_ = std::move(pipelines); stencil_pipelines_=std::move(stencil); samples_ = samples; depth_stencil_=depth_stencil; depth_target_=depth_stencil || depth_only; }
     return hr;
 }
 HRESULT SampleTransfer::record(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* heap,
@@ -192,7 +224,7 @@ HRESULT SampleTransfer::record(ID3D12GraphicsCommandList* list, ID3D12Descriptor
         UINT width, UINT height, UINT sample, bool into_msaa) const {
     if (sample >= samples_) return E_INVALIDARG;
     const UINT index = into_msaa ? 0 : 1;
-    HRESULT hr=fullscreen(list, roots_[index].Get(), pipelines_[index].Get(), heap, source, target, width, height, sample,depth_stencil_ && into_msaa);
+    HRESULT hr=fullscreen(list, roots_[index].Get(), pipelines_[index].Get(), heap, source, target, width, height, sample,depth_target_ && into_msaa);
     if (SUCCEEDED(hr) && depth_stencil_ && into_msaa) {
         // Eight write masks reconstruct every stencil bit on hosts without the
         // optional PS stencil export. Sample-frequency shading preserves MSAA.

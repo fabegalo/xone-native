@@ -1329,10 +1329,10 @@ HRESULT STDMETHODCALLTYPE device_create_texture2d(Device* self, const LegacyText
     if ((!self->legacy && !modern_display_abi_bound) || initial || (!esram_request && (desc.extension[0] || desc.extension[1])) || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
         (dynamic && (d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.MiscFlags)) ||
         d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~(legacy_expanded_auxiliary | (esram_request ? 0x20000u : 0u))) || !d.BindFlags ||
-        ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & D3D11_BIND_RENDER_TARGET))) ||
-        (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & D3D11_BIND_RENDER_TARGET) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
+        ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & (D3D11_BIND_RENDER_TARGET|D3D11_BIND_DEPTH_STENCIL)))) ||
+        (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & (D3D11_BIND_RENDER_TARGET|D3D11_BIND_DEPTH_STENCIL)) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
         ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) && d.Format != DXGI_FORMAT_D32_FLOAT &&
-            !(self->legacy && d.Format==DXGI_FORMAT_R32_TYPELESS && d.SampleDesc.Count==1)) ||
+            !(self->legacy && (d.Format==DXGI_FORMAT_R32_TYPELESS || (d.Format==DXGI_FORMAT_R16_TYPELESS && !multisample)))) ||
         (d.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL))) return unsupported();
     TitleTextureLayout layout;
     HRESULT hr = create_xg_texture_layout(d.Width, d.Height, d.MipLevels, d.ArraySize, d.Format, UINT_MAX, layout, d.BindFlags, d.SampleDesc.Count);
@@ -1363,8 +1363,9 @@ HRESULT STDMETHODCALLTYPE device_create_placement_texture2d(Device* self, const 
     const bool depth_stencil=d.Format==DXGI_FORMAT_R32G8X24_TYPELESS && d.SampleDesc.Count==4 &&
         d.MipLevels==1 && d.ArraySize==1 && d.BindFlags==(D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE) &&
         d.MiscFlags==legacy_expanded_auxiliary && tile_mode==1;
+    const bool color=d.BindFlags && !(d.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS));
     if (!self->legacy || flags || desc.extension[0] || desc.extension[1] || !base ||
-        d.Usage != D3D11_USAGE_DEFAULT || (!depth_stencil && d.BindFlags != D3D11_BIND_SHADER_RESOURCE) || d.CPUAccessFlags ||
+        d.Usage != D3D11_USAGE_DEFAULT || (!depth_stencil && !color) || d.CPUAccessFlags ||
         (!depth_stencil && (d.MiscFlags || d.SampleDesc.Count != 1)) || d.SampleDesc.Quality ||
         reinterpret_cast<std::uintptr_t>(base) > 0xffffffffffull) return unsupported();
     try {
@@ -1493,18 +1494,20 @@ HRESULT STDMETHODCALLTYPE device_create_dsv(Device* self, GraphicsObject* resour
     if (texture->device != self) return E_INVALIDARG;
     const auto& d = texture->desc.standard;
     const bool depth_stencil=d.Format==DXGI_FORMAT_R32G8X24_TYPELESS && d.SampleDesc.Count==4;
-    const bool typeless_depth=d.Format==DXGI_FORMAT_R32_TYPELESS && d.SampleDesc.Count==1;
+    const bool typeless_depth=d.Format==DXGI_FORMAT_R32_TYPELESS || (d.Format==DXGI_FORMAT_R16_TYPELESS && d.SampleDesc.Count==1);
+    const bool multisample=d.SampleDesc.Count>1;
     if (texture->volume || (!depth_stencil && !typeless_depth && (d.Format != DXGI_FORMAT_D32_FLOAT || d.SampleDesc.Count != 1)) || d.ArraySize != 1 ||
         !(d.BindFlags & D3D11_BIND_DEPTH_STENCIL)) return DXGI_ERROR_UNSUPPORTED;
     D3D11_DEPTH_STENCIL_VIEW_DESC desc{}; SIZE_T read = 0;
     if (input && (!ReadProcessMemory(GetCurrentProcess(),input,&desc,sizeof desc,&read) || read != sizeof desc)) return E_INVALIDARG;
-    const auto format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : typeless_depth ? DXGI_FORMAT_D32_FLOAT : d.Format;
-    const auto dimension=depth_stencil ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+    const auto format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT :
+        d.Format==DXGI_FORMAT_R16_TYPELESS ? DXGI_FORMAT_D16_UNORM : typeless_depth ? DXGI_FORMAT_D32_FLOAT : d.Format;
+    const auto dimension=multisample ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
     if (!input) { desc.Format = format; desc.ViewDimension = dimension; }
     if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = format;
     if (desc.Format != format || desc.ViewDimension != dimension ||
         (desc.Flags & ~(D3D11_DSV_READ_ONLY_DEPTH | (depth_stencil ? D3D11_DSV_READ_ONLY_STENCIL : 0)))) return DXGI_ERROR_UNSUPPORTED;
-    if (!depth_stencil && desc.Texture2D.MipSlice >= d.MipLevels) return E_INVALIDARG;
+    if (!multisample && desc.Texture2D.MipSlice >= d.MipLevels) return E_INVALIDARG;
     if (!out) return S_FALSE;
     try {
         static const auto table = [] {
@@ -1518,9 +1521,9 @@ HRESULT STDMETHODCALLTYPE device_create_dsv(Device* self, GraphicsObject* resour
         if (FAILED(hr)) return hr;
         view->host = view->heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_DEPTH_STENCIL_VIEW_DESC native{};
-        native.Format = desc.Format; native.ViewDimension = depth_stencil ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
+        native.Format = desc.Format; native.ViewDimension = multisample ? D3D12_DSV_DIMENSION_TEXTURE2DMS : D3D12_DSV_DIMENSION_TEXTURE2D;
         native.Flags = static_cast<D3D12_DSV_FLAGS>(desc.Flags);
-        if (!depth_stencil) native.Texture2D.MipSlice = desc.Texture2D.MipSlice;
+        if (!multisample) native.Texture2D.MipSlice = desc.Texture2D.MipSlice;
         self->d3d12->CreateDepthStencilView(texture->gpu.resource,&native,view->host);
         texture_add_ref(texture); view->resource = resource; retain_device(self); *out = view.release(); return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -1537,6 +1540,30 @@ const std::array<const void*, vtable_slots>& rtv_vtable() {
         return t;
     }();
     return table;
+}
+bool typeless_color(DXGI_FORMAT format) {
+    return format==DXGI_FORMAT_R8_TYPELESS || format==DXGI_FORMAT_R10G10B10A2_TYPELESS;
+}
+bool typed_color_view(DXGI_FORMAT resource, DXGI_FORMAT view) {
+    return (resource==DXGI_FORMAT_R8_TYPELESS && (view==DXGI_FORMAT_R8_UINT || view==DXGI_FORMAT_R8_UNORM)) ||
+        (resource==DXGI_FORMAT_R10G10B10A2_TYPELESS && (view==DXGI_FORMAT_R10G10B10A2_UNORM || view==DXGI_FORMAT_R10G10B10A2_UINT));
+}
+HRESULT texture_view_descriptor(Texture* texture, DXGI_FORMAT format, std::array<UINT32,8>& descriptor, bool packed_uav=false) {
+    const auto& d=texture->desc.standard;
+    if (texture->volume) {
+        if (format!=texture->volume_desc.standard.Format) return DXGI_ERROR_UNSUPPORTED;
+        descriptor=texture->descriptor; return S_OK;
+    }
+    if (format==d.Format) { descriptor=texture->descriptor; return S_OK; }
+    const bool packed=packed_uav && d.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS && format==DXGI_FORMAT_R32_UINT;
+    if ((!typed_color_view(d.Format,format) && !packed) || texture->layout.tile_mode==UINT_MAX) return DXGI_ERROR_UNSUPPORTED;
+    TitleTextureLayout typed;
+    HRESULT hr=create_xg_texture_layout(d.Width,d.Height,d.MipLevels,d.ArraySize,format,texture->layout.tile_mode,typed,d.BindFlags,d.SampleDesc.Count);
+    if (FAILED(hr)) return hr;
+    if (typed.bytes!=texture->layout.bytes || typed.alignment!=texture->layout.alignment) return DXGI_ERROR_UNSUPPORTED;
+    descriptor=typed.guest_descriptor;
+    descriptor[0]+=static_cast<UINT32>(reinterpret_cast<std::uintptr_t>(texture->canonical)>>8);
+    return S_OK;
 }
 HRESULT STDMETHODCALLTYPE device_create_rtv(Device* self, GraphicsObject* resource, const D3D11_RENDER_TARGET_VIEW_DESC* input, void** out) {
     if (out) *out = nullptr;
@@ -1556,7 +1583,7 @@ HRESULT STDMETHODCALLTYPE device_create_rtv(Device* self, GraphicsObject* resour
     if (input && (!ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc)) return E_INVALIDARG;
     if (!input) { desc.Format = d.Format; desc.ViewDimension = dimension; }
     if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = d.Format;
-    if (desc.Format != d.Format || desc.ViewDimension != dimension) return unsupported();
+    if ((desc.Format != d.Format && !typed_color_view(d.Format,desc.Format)) || typeless_color(desc.Format) || desc.ViewDimension != dimension) return unsupported();
     if (!multisample && desc.Texture2D.MipSlice >= d.MipLevels) return E_INVALIDARG;
     if (!out) return S_FALSE;
     try {
@@ -1605,9 +1632,77 @@ const std::array<const void*, vtable_slots>& uav_vtable() {
     }();
     return table;
 }
-HRESULT STDMETHODCALLTYPE device_create_uav(Device* self, Buffer* resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC* input, void** out) {
+HRESULT create_texture_uav(Device* self, Texture* texture, const D3D11_UNORDERED_ACCESS_VIEW_DESC* input, void** out) {
+    if (texture->device!=self) return E_INVALIDARG;
+    const auto unsupported=[&]() -> HRESULT {
+        if (stop_on_missing_service()) {
+            D3D11_UNORDERED_ACCESS_VIEW_DESC view{}; SIZE_T bytes=0;
+            if (input) ReadProcessMemory(GetCurrentProcess(),input,&view,sizeof view,&bytes);
+            const auto& source=texture->desc.standard;
+            const auto& volume=texture->volume_desc.standard;
+            std::fprintf(stderr,"xone-era: texture UAV unsupported: resource format %u %ux%u mips %u array %u samples %u volume %u; view format %u dimension %u mip %u\n",
+                texture->volume ? volume.Format : source.Format,texture->volume ? volume.Width : source.Width,
+                texture->volume ? volume.Height : source.Height,texture->volume ? volume.MipLevels : source.MipLevels,
+                texture->volume ? 1u : source.ArraySize,texture->volume ? 1u : source.SampleDesc.Count,
+                texture->volume ? 1u : 0u,view.Format,view.ViewDimension,view.Texture2D.MipSlice);
+        }
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device,8>(self,
+            reinterpret_cast<std::uintptr_t>(texture),reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(out)));
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    const auto& d=texture->desc.standard;
+    const auto& v=texture->volume_desc.standard;
+    const auto format=texture->volume ? v.Format : d.Format;
+    const auto dimension=texture->volume ? D3D11_UAV_DIMENSION_TEXTURE3D : D3D11_UAV_DIMENSION_TEXTURE2D;
+    if (!((texture->volume ? v.BindFlags : d.BindFlags)&D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
+    if (texture->volume ? v.MipLevels!=1 : (d.ArraySize!=1 || d.MipLevels!=1 || d.SampleDesc.Count!=1)) return unsupported();
+    D3D11_UNORDERED_ACCESS_VIEW_DESC desc{}; SIZE_T read=0;
+    if (input && (!ReadProcessMemory(GetCurrentProcess(),input,&desc,sizeof desc,&read) || read!=sizeof desc)) return E_INVALIDARG;
+    if (!input) {
+        desc.Format=format; desc.ViewDimension=dimension;
+        if (texture->volume) desc.Texture3D.WSize=UINT_MAX;
+    }
+    if (desc.Format==DXGI_FORMAT_UNKNOWN) desc.Format=format;
+    const bool packed=!texture->volume && format==DXGI_FORMAT_R10G10B10A2_TYPELESS && desc.Format==DXGI_FORMAT_R32_UINT;
+    if (typeless_color(desc.Format) || (desc.Format!=format && !typed_color_view(format,desc.Format) && !packed) ||
+        desc.ViewDimension!=dimension) return unsupported();
+    if (desc.Texture2D.MipSlice) return E_INVALIDARG;
+    if (texture->volume) {
+        if (desc.Texture3D.FirstWSlice>=v.Depth || !desc.Texture3D.WSize ||
+            (desc.Texture3D.WSize!=UINT_MAX && desc.Texture3D.WSize>v.Depth-desc.Texture3D.FirstWSlice)) return E_INVALIDARG;
+        if (desc.Texture3D.FirstWSlice || (desc.Texture3D.WSize!=UINT_MAX && desc.Texture3D.WSize!=v.Depth)) return unsupported();
+    }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{desc.Format};
+    HRESULT hr=self->d3d12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&support,sizeof support);
+    if (FAILED(hr)) return hr;
+    if (!(support.Support1&D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) || !(support.Support2&D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) return unsupported();
+    if (!out) return S_FALSE;
+    try {
+        auto view=std::make_unique<BufferView>();
+        view->vtable=uav_vtable().data(); view->flags=self->legacy ? 1 : 0; view->refcount=self->legacy ? 0 : 1;
+        view->device=self; view->view_type=3; view->desc=desc; view->allocation_start=texture->canonical;
+        hr=texture_view_descriptor(texture,desc.Format,view->descriptor,packed);
+        if (FAILED(hr)) return hr;
+        view->descriptor[3]&=~0xff000u;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        hr=self->d3d12->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&view->heap));
+        if (FAILED(hr)) return hr;
+        view->host=view->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_UNORDERED_ACCESS_VIEW_DESC native{};
+        native.Format=desc.Format;
+        native.ViewDimension=texture->volume ? D3D12_UAV_DIMENSION_TEXTURE3D : D3D12_UAV_DIMENSION_TEXTURE2D;
+        if (texture->volume) native.Texture3D.WSize=v.Depth;
+        self->d3d12->CreateUnorderedAccessView(texture->gpu.resource,nullptr,&native,view->host);
+        texture_add_ref(texture); view->resource=texture;
+        retain_device(self); *out=view.release(); return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+HRESULT STDMETHODCALLTYPE device_create_uav(Device* self, GraphicsObject* input_resource, const D3D11_UNORDERED_ACCESS_VIEW_DESC* input, void** out) {
     if (out) *out = nullptr;
-    if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self ||
+    if (input_resource && input_resource->vtable==texture_vtable().data()) return create_texture_uav(self,static_cast<Texture*>(input_resource),input,out);
+    if (!input_resource || input_resource->vtable!=buffer_vtable().data()) return E_INVALIDARG;
+    auto* resource=static_cast<Buffer*>(input_resource);
+    if (resource->device != self ||
         !(resource->desc.standard.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) return E_INVALIDARG;
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
     SIZE_T read = 0;
@@ -1802,10 +1897,12 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
         }
         const bool depth_plane = (format==DXGI_FORMAT_R32G8X24_TYPELESS && multisample &&
             (desc.Format==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || desc.Format==DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)) ||
-            (format==DXGI_FORMAT_R32_TYPELESS && !multisample && desc.Format==DXGI_FORMAT_R32_FLOAT);
+            (format==DXGI_FORMAT_R32_TYPELESS && desc.Format==DXGI_FORMAT_R32_FLOAT) ||
+            (format==DXGI_FORMAT_R16_TYPELESS && !multisample && desc.Format==DXGI_FORMAT_R16_UNORM);
         const bool stencil_plane=depth_plane && desc.Format==DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
-        if ((format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS) && !depth_plane) return unsupported();
-        if (desc.ViewDimension != dimension || (!depth_plane && desc.Format != format)) return unsupported();
+        const bool color_plane=typed_color_view(format,desc.Format);
+        if ((format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R16_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS) && !depth_plane) return unsupported();
+        if (desc.ViewDimension != dimension || typeless_color(desc.Format) || (!depth_plane && !color_plane && desc.Format != format)) return unsupported();
         // Texture2D/Texture3D share the same two-UINT mip range in this ABI.
         if (!multisample) {
             if (desc.Texture2D.MostDetailedMip >= mips) return E_INVALIDARG;
@@ -1821,6 +1918,10 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
             view->srv_desc.Format = desc.Format; view->srv_desc.ViewDimension = desc.ViewDimension;
             if (!multisample) view->srv_desc.Texture2D = desc.Texture2D;
             view->allocation_start = texture->canonical; view->descriptor = texture->descriptor;
+            if (color_plane) {
+                const HRESULT hr=texture_view_descriptor(texture,desc.Format,view->descriptor);
+                if (FAILED(hr)) return hr;
+            }
             if (stencil_plane) {
                 view->descriptor=texture->layout.stencil_descriptor;
                 if (!view->descriptor[3]) return DXGI_ERROR_UNSUPPORTED;
@@ -3288,7 +3389,7 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
         // Validate every offset before touching the destination.
         for (UINT pass=0;pass<2;++pass) for (UINT plane=1;plane<(context->stencil.bytes ? 3u : 2u);++plane) {
             const auto& bounds = plane==1 ? context->depth : context->stencil;
-            const UINT element = plane==1 ? 4 : 1;
+            const UINT element = plane==1 ? (context->stencil.bytes ? 4 : context->bytes_per_block) : 1;
             auto* typed = context->typed_computers[plane-1];
             const auto address = reinterpret_cast<Address>((*static_cast<void***>(typed))[4]);
             for (UINT y=0;y<height;++y) for (UINT x=0;x<width;++x) for (UINT sample=0;sample<context->samples;++sample) {
@@ -3344,8 +3445,12 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
     if (!samples || samples > 8 || (samples & (samples - 1)) || (samples > 1 && (mips != 1 || depth))) return E_INVALIDARG;
     const bool bc7 = format == DXGI_FORMAT_BC7_TYPELESS || format == DXGI_FORMAT_BC7_UNORM || format == DXGI_FORMAT_BC7_UNORM_SRGB;
     if ((!bc7 && format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-         format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
-         format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB && format != DXGI_FORMAT_R32_FLOAT &&
+         format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R10G10B10A2_TYPELESS && format!=DXGI_FORMAT_R10G10B10A2_UINT &&
+         format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
+         format != DXGI_FORMAT_R8_TYPELESS && format != DXGI_FORMAT_R8_UNORM &&
+         format != DXGI_FORMAT_R16G16B16A16_FLOAT && format != DXGI_FORMAT_R16G16_FLOAT &&
+         format != DXGI_FORMAT_R16_TYPELESS && format != DXGI_FORMAT_R16_UNORM &&
+         format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB && format != DXGI_FORMAT_R32_FLOAT && format != DXGI_FORMAT_R32_UINT &&
          format != DXGI_FORMAT_B5G6R5_UNORM &&
          format != DXGI_FORMAT_R32G8X24_TYPELESS && format!=DXGI_FORMAT_R32_TYPELESS) ||
         ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
@@ -3357,14 +3462,16 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         if (context->modern && depth) return DXGI_ERROR_UNSUPPORTED; // The volume ABI is separately revision-bound.
         context->module = module; context->width = width; context->height = height;
         context->mips = mips; context->arrays = arrays; context->block = bc7 ? 4 : 1; context->bytes_per_block = bc7 ? 16 : 4;
-        if (format == DXGI_FORMAT_R8_UINT) context->bytes_per_block = 1;
+        if (format == DXGI_FORMAT_R8_UINT || format==DXGI_FORMAT_R8_UNORM || format==DXGI_FORMAT_R8_TYPELESS) context->bytes_per_block = 1;
         if (format == DXGI_FORMAT_B5G6R5_UNORM) context->bytes_per_block = 2;
+        if (format == DXGI_FORMAT_R16_TYPELESS || format==DXGI_FORMAT_R16_UNORM) context->bytes_per_block=2;
         if (format == DXGI_FORMAT_R32G8X24_TYPELESS) context->bytes_per_block = 8;
+        if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) context->bytes_per_block = 8;
         context->samples = samples;
         // 180052210 constructs the 60-byte XG descriptor independently of the
         // 52-byte public texture descriptor. Single-sample, default SRV storage.
         if (!depth && tile_mode == UINT_MAX) {
-            if (format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS) {
+            if (format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS || format==DXGI_FORMAT_R16_TYPELESS) {
                 if (context->modern) return DXGI_ERROR_UNSUPPORTED;
                 // 11295 180001350 consumes scalar argument 5 and writes modes
                 // through arguments 7/8. Other scalar arguments are unused.
@@ -3387,7 +3494,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         std::array<UINT, 15> desc{width, height, mips, arrays, static_cast<UINT>(format), samples, 0, 0, 0, 0, 0, 0, 0, tile_mode, 0};
         // Original 180052210 carries the depth bind into XG. Omitting it yields
         // E_INVALIDARG and conceals the real three-plane depth/stencil contract.
-        if (format == DXGI_FORMAT_R32G8X24_TYPELESS || format==DXGI_FORMAT_R32_TYPELESS) desc[8] = D3D11_BIND_DEPTH_STENCIL;
+        if (format == DXGI_FORMAT_R32G8X24_TYPELESS || format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R16_TYPELESS) desc[8] = D3D11_BIND_DEPTH_STENCIL;
         if (depth) {
             // Original 180052210: 52-byte volume descriptor; tile mode at +44.
             using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
@@ -3418,8 +3525,8 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         std::memcpy(&mip_count, layout + 16, 4); std::memcpy(&plane_count, layout + 20, 4);
         const bool depth_stencil = !context->modern && format==DXGI_FORMAT_R32G8X24_TYPELESS &&
             samples==4 && arrays==1 && mips==1 && plane_count==3;
-        const bool depth_only = !context->modern && format==DXGI_FORMAT_R32_TYPELESS &&
-            samples==1 && arrays==1 && mips==1 && plane_count==2;
+        const bool depth_only = !context->modern && (format==DXGI_FORMAT_R32_TYPELESS || (format==DXGI_FORMAT_R16_TYPELESS && samples==1)) &&
+            arrays==1 && mips==1 && plane_count==2;
         const bool depth_planes=depth_stencil || depth_only;
         if (!bytes || bytes > (1ull << 30) || !alignment || alignment > (1u << 21) || (alignment & (alignment - 1)) ||
             mip_count != mips || (plane_count != 1 && !depth_planes)) {
@@ -3435,7 +3542,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
                 std::memcpy(&usage,record,4); std::memcpy(&size,record+8,8);
                 std::memcpy(&offset,record+16,8); std::memcpy(&element,record+32,4);
                 if (usage!=(plane==0 ? 4u : plane==1 ? 7u : 8u) || !size || offset>bytes || size>bytes-offset ||
-                    (plane && element!=(plane==1 ? 4u : 1u)) || (!plane && size%4)) return DXGI_ERROR_UNSUPPORTED;
+                    (plane && element!=(plane==1 ? (format==DXGI_FORMAT_R16_TYPELESS ? 2u : 4u) : 1u)) || (!plane && size%4)) return DXGI_ERROR_UNSUPPORTED;
                 auto& target=plane==0 ? context->htile : plane==1 ? context->depth : context->stencil;
                 target={offset,size};
             }
@@ -3443,7 +3550,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
                 (depth_stencil && context->depth.offset+context->depth.bytes>context->stencil.offset)) return DXGI_ERROR_UNSUPPORTED;
             for (UINT plane=0;plane<plane_count-1;++plane) {
                 auto typed_desc=desc;
-                typed_desc[4]=plane==0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UINT; typed_desc[8]=0;
+                typed_desc[4]=plane==0 ? (format==DXGI_FORMAT_R16_TYPELESS ? DXGI_FORMAT_R16_UNORM : DXGI_FORMAT_R32_FLOAT) : DXGI_FORMAT_R8_UINT; typed_desc[8]=0;
                 auto*& typed=context->typed_computers[plane];
                 hr=create(typed_desc.data(),&typed);
                 if (FAILED(hr)) return hr;
@@ -3467,11 +3574,13 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
             }
         }
         out.bytes = static_cast<SIZE_T>(bytes); out.alignment = static_cast<SIZE_T>(alignment);
+        out.tile_mode=tile_mode;
         context->bytes = out.bytes;
         out.resource_desc.Dimension = depth ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         out.resource_desc.Width = width; out.resource_desc.Height = height;
         out.resource_desc.DepthOrArraySize = static_cast<UINT16>(depth ? depth : arrays); out.resource_desc.MipLevels = static_cast<UINT16>(mips);
         out.resource_desc.Format = format; out.resource_desc.SampleDesc.Count = samples;
+        if (format==DXGI_FORMAT_R16G16B16A16_FLOAT && samples>1) out.resource_desc.Format=DXGI_FORMAT_R16G16B16A16_TYPELESS;
         if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) out.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (bind_flags & D3D11_BIND_RENDER_TARGET) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         if (bind_flags & D3D11_BIND_DEPTH_STENCIL) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;

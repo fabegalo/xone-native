@@ -565,44 +565,44 @@ int main(int argc, char** argv) {
                     "original depth tile modes preserve scalar argument positions and output bounds");
             }
             depth_modes(0,0,0,0,1,0,nullptr,nullptr);
-            for (const auto dimensions:{std::array<UINT,2>{32,16},std::array<UINT,2>{1920,1080}}) {
-                std::array<UINT,15> descriptor{dimensions[0],dimensions[1],1,1,39,1,0,0,0x40,0,0,0,0,0,0};
+            for (const auto format:{DXGI_FORMAT_R32_TYPELESS,DXGI_FORMAT_R16_TYPELESS}) for (const auto dimensions:{std::array<UINT,2>{32,16},std::array<UINT,2>{1920,1080}}) {
+                const UINT element=format==DXGI_FORMAT_R16_TYPELESS ? 2 : 4, row=32*element, slice=row*16;
+                std::array<UINT,15> descriptor{dimensions[0],dimensions[1],1,1,UINT(format),1,0,0,0x40,0,0,0,0,0,0};
                 void* computer=nullptr;
                 hr=create_computer(descriptor.data(),&computer);
-                check(SUCCEEDED(hr) && computer,"original XG constructs the observed R32 depth descriptor");
+                check(SUCCEEDED(hr) && computer,"original XG constructs the observed scalar depth descriptor");
                 if (!computer) continue;
                 auto** table=*static_cast<void***>(computer);
                 std::array<unsigned char,0xd40> raw{};
                 hr=reinterpret_cast<HRESULT(*)(void*,void*)>(table[2])(computer,raw.data());
                 UINT64 bytes=0; UINT planes=0;
                 std::memcpy(&bytes,raw.data(),8);std::memcpy(&planes,raw.data()+20,4);
-                std::cout << "original R32 depth " << dimensions[0] << 'x' << dimensions[1] << " bytes=" << bytes << " planes=" << planes << '\n';
-                check(SUCCEEDED(hr) && planes==2,"R32 depth has separate HTILE and physical depth planes");
-                hr=create_xg_texture_layout(dimensions[0],dimensions[1],1,1,DXGI_FORMAT_R32_TYPELESS,UINT_MAX,layout,
+                std::cout << "original depth format=" << format << ' ' << dimensions[0] << 'x' << dimensions[1] << " bytes=" << bytes << " planes=" << planes << '\n';
+                check(SUCCEEDED(hr) && planes==2,"scalar depth has separate HTILE and physical depth planes");
+                hr=create_xg_texture_layout(dimensions[0],dimensions[1],1,1,format,UINT_MAX,layout,
                     D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE);
-                check(SUCCEEDED(hr) && layout.bytes==bytes,"R32 adapter preserves the exact original physical depth allocation");
+                check(SUCCEEDED(hr) && layout.bytes==bytes,"scalar depth adapter preserves the exact original physical depth allocation");
                 if (SUCCEEDED(hr) && dimensions[0]==32) {
-                    std::vector<UINT32> expected(32*16),actual(expected.size());
-                    for (UINT i=0;i<expected.size();++i) expected[i]=i*0x102037u;
+                    std::vector<unsigned char> expected(slice),actual(expected.size());
+                    for (UINT i=0;i<expected.size();++i) expected[i]=static_cast<unsigned char>(i*13+i/7);
                     std::vector<unsigned char> physical(layout.bytes+32,0x5a);
-                    hr=layout.copy(layout.context.get(),true,expected.data(),physical.data()+16,0,128,2048);
+                    hr=layout.copy(layout.context.get(),true,expected.data(),physical.data()+16,0,row,slice);
                     using Address=UINT64(*)(void*,UINT,UINT,UINT64,UINT,UINT,UINT);
                     const auto address=reinterpret_cast<Address>(table[4]);
                     bool exact=SUCCEEDED(hr);
                     for (UINT y=0;y<16;++y) for (UINT x=0;x<32;++x) {
                         const auto at=address(computer,1,0,x,y,0,0);
-                        if (at>bytes || bytes-at<4) { exact=false;continue; }
-                        UINT32 actual_bits=0;std::memcpy(&actual_bits,physical.data()+16+at,4);
-                        if (actual_bits!=expected[y*32+x]) exact=false;
+                        if (at>bytes || bytes-at<element) { exact=false;continue; }
+                        if (std::memcmp(physical.data()+16+at,expected.data()+(y*32+x)*element,element)) exact=false;
                     }
-                    check(exact,"R32 adapter matches the independent original depth computer at every pixel address");
-                    if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,128,2048);
-                    check(SUCCEEDED(hr) && actual==expected,"single-sample R32 depth preserves every physical bit through expanded HTILE");
+                    check(exact,"scalar depth adapter matches the independent original depth computer at every pixel address");
+                    if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice);
+                    check(SUCCEEDED(hr) && actual==expected,"single-sample scalar depth preserves every physical bit through expanded HTILE");
                     physical[16]^=1; const auto before=actual;
-                    check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,128,2048)==DXGI_ERROR_UNSUPPORTED && actual==before,
+                    check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice)==DXGI_ERROR_UNSUPPORTED && actual==before,
                         "single-sample depth refuses unknown HTILE without publishing partial pixels");
                     check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
-                        std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"R32 depth conversion preserves canonical guards");
+                        std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"scalar depth conversion preserves canonical guards");
                 }
                 reinterpret_cast<ULONG(*)(void*)>(table[1])(computer);
             }
@@ -826,6 +826,81 @@ int main(int argc, char** argv) {
                     "texture retirement preserves the physical pool and the title's mapping");
             }
             check(release_virtual(esram_mirror,0,MEM_RELEASE),"ESRAM fixture releases its own title mapping");
+            for (const auto storage_format:{DXGI_FORMAT_R8_TYPELESS,DXGI_FORMAT_R10G10B10A2_TYPELESS,DXGI_FORMAT_R16G16_FLOAT}) {
+                Desc color{};
+                color.standard={32,16,1,1,storage_format,{1,0},D3D11_USAGE_DEFAULT,
+                    D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS,0,0};
+                using CreateOwned=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                texture=nullptr;
+                check(reinterpret_cast<CreateOwned>(vt(device)[5])(device,&color,nullptr,&texture)==S_OK && texture,
+                    "typeless color has one native texture for typed SRV RTV and UAV aliases");
+                if (!texture) continue;
+                const DXGI_FORMAT formats[]{storage_format==DXGI_FORMAT_R16G16_FLOAT ? storage_format : storage_format==DXGI_FORMAT_R8_TYPELESS ? DXGI_FORMAT_R8_UNORM : DXGI_FORMAT_R10G10B10A2_UNORM,
+                    storage_format==DXGI_FORMAT_R16G16_FLOAT ? storage_format : storage_format==DXGI_FORMAT_R8_TYPELESS ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R10G10B10A2_UINT};
+                const std::array<DXGI_FORMAT,3> views{formats[0],formats[1],DXGI_FORMAT_R32_UINT};
+                for (const auto format:views) for (UINT kind=0;kind<3;++kind) {
+                    if (format==DXGI_FORMAT_R32_UINT && (storage_format!=DXGI_FORMAT_R10G10B10A2_TYPELESS || kind!=2)) continue;
+                    using Factory=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const void*,void**);
+                    const auto factory=reinterpret_cast<Factory>(vt(device)[kind==0 ? 7 : kind==1 ? 9 : 8]);
+                    D3D11_SHADER_RESOURCE_VIEW_DESC srv{}; srv.Format=format; srv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; srv.Texture2D.MipLevels=1;
+                    D3D11_RENDER_TARGET_VIEW_DESC rtv{}; rtv.Format=format; rtv.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC uav{}; uav.Format=format; uav.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
+                    const void* input=kind==0 ? static_cast<const void*>(&srv) : kind==1 ? static_cast<const void*>(&rtv) : &uav;
+                    void* view=nullptr;
+                    check(factory(device,texture,input,nullptr)==S_FALSE,"typed color view validates without taking ownership");
+                    check(factory(device,texture,input,&view)==S_OK && view,"typed color view owns a real native descriptor");
+                    if (!view) continue;
+                    alignas(8) std::array<unsigned char,32> result;
+                    result.fill(0x5a);
+                    const SIZE_T bytes=kind==0 ? sizeof srv : kind==1 ? sizeof rtv : sizeof uav;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(view)[9])(view,result.data());
+                    check(!std::memcmp(result.data(),input,bytes) && std::all_of(result.begin()+bytes,result.end(),[](auto x){return x==0x5a;}),
+                        "typed color view queries preserve their format dimension and ABI bounds");
+                    if (kind!=1) {
+                        std::array<UINT32,8> descriptor{}; void* canonical=nullptr;
+                        std::memcpy(descriptor.data(),static_cast<char*>(view)+48,sizeof descriptor);
+                        std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
+                        const bool integer=format==DXGI_FORMAT_R8_UINT || format==DXGI_FORMAT_R10G10B10A2_UINT || format==DXGI_FORMAT_R32_UINT;
+                        check(descriptor[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) &&
+                            ((descriptor[1]>>26)&15)==(integer ? 4u : format==DXGI_FORMAT_R16G16_FLOAT ? 7u : 0u),"typed SRV/UAV SRDs keep physical identity and native numeric interpretation");
+                    }
+                    void* parent=nullptr;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void**)>(vt(view)[8])(view,&parent);
+                    check(parent==texture,"typed color views retain the same logical parent");
+                    if (parent) reinterpret_cast<Count>(vt(parent)[2])(parent);
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                using CreateUav=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                const auto create_uav=reinterpret_cast<CreateUav>(vt(device)[8]);
+                D3D11_UNORDERED_ACCESS_VIEW_DESC invalid{};
+                invalid.Format=formats[1]; invalid.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D; invalid.Texture2D.MipSlice=1;
+                void* view=nullptr;
+                check(create_uav(device,texture,&invalid,&view)==E_INVALIDARG && !view,"texture UAV refuses an out-of-range mip");
+                invalid.Format=DXGI_FORMAT_R32_FLOAT; invalid.Texture2D.MipSlice=0;
+                check(create_uav(device,texture,&invalid,&view)==DXGI_ERROR_UNSUPPORTED && !view,"texture UAV refuses an incompatible format without replacing its parent");
+                reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            TitleTextureLayout placed_color;
+            const UINT color_binds=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS;
+            hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,14,placed_color,color_binds);
+            check(SUCCEEDED(hr),"placed half-float color keeps the original tile mode");
+            if (SUCCEEDED(hr)) {
+                void* storage=allocate(placed_color.bytes+placed_color.alignment+32,attributes);
+                check(storage!=nullptr,"placed color fixture owns its canonical allocation");
+                if (storage) {
+                    const SIZE_T total=placed_color.bytes+placed_color.alignment+32;
+                    std::memset(storage,0x5a,total);
+                    const auto address=(reinterpret_cast<std::uintptr_t>(storage)+16+placed_color.alignment-1)&~(placed_color.alignment-1);
+                    Desc color{}; color.standard={32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,{1,0},D3D11_USAGE_DEFAULT,color_binds,0,0};
+                    texture=nullptr;
+                    check(reinterpret_cast<CreateTexture>(vt(device)[64])(device,&color,14,0,reinterpret_cast<void*>(address),&texture)==S_OK && texture,
+                          "placed color binds native render and unordered access to existing storage");
+                    if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+                    check(std::all_of(static_cast<unsigned char*>(storage),static_cast<unsigned char*>(storage)+total,[](auto x){return x==0x5a;}),
+                          "placed color creation and retirement preserve borrowed pixels and guards");
+                    free_memory(storage,attributes);
+                }
+            }
             struct VolumeDesc { D3D11_TEXTURE3D_DESC standard; std::array<UINT, 2> extension{}; } volume_desc{};
             static_assert(sizeof(VolumeDesc) == 44);
             volume_desc.standard = {16, 16, 16, 1, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_USAGE_DEFAULT,
@@ -847,6 +922,41 @@ int main(int argc, char** argv) {
                 D3D11_RESOURCE_DIMENSION type{};
                 reinterpret_cast<GetType>(vt(texture)[8])(texture, &type);
                 check(type == D3D11_RESOURCE_DIMENSION_TEXTURE3D, "volume retains its real resource dimension");
+                using CreateUav = HRESULT (STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                const auto create_uav=reinterpret_cast<CreateUav>(vt(device)[8]);
+                void* uav=nullptr;
+                check(create_uav(device,texture,nullptr,nullptr)==S_FALSE,
+                      "default volume UAV validation does not acquire ownership");
+                check(create_uav(device,texture,nullptr,&uav)==S_OK && uav,
+                      "default volume UAV owns a native texture3D descriptor");
+                if (uav) {
+                    struct { D3D11_UNORDERED_ACCESS_VIEW_DESC desc{}; UINT guard=0xaabbccdd; } output;
+                    using GetUavDesc=void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*);
+                    reinterpret_cast<GetUavDesc>(vt(uav)[9])(uav,&output.desc);
+                    check(output.desc.Format==volume_desc.standard.Format && output.desc.ViewDimension==D3D11_UAV_DIMENSION_TEXTURE3D &&
+                          output.desc.Texture3D.MipSlice==0 && output.desc.Texture3D.FirstWSlice==0 &&
+                          output.desc.Texture3D.WSize==UINT_MAX && output.guard==0xaabbccdd,
+                          "volume UAV preserves its complete native view descriptor and output bounds");
+                    void* parent=nullptr;
+                    using GetResource=void(STDMETHODCALLTYPE*)(void*,void**);
+                    reinterpret_cast<GetResource>(vt(uav)[8])(uav,&parent);
+                    check(parent==texture,"volume UAV retains the original resource");
+                    if (parent) reinterpret_cast<Count>(vt(parent)[2])(parent);
+                    const auto* view_words=reinterpret_cast<const UINT32*>(static_cast<const unsigned char*>(uav)+48);
+                    void* canonical=nullptr;
+                    std::memcpy(&canonical,static_cast<const unsigned char*>(uav)+80,sizeof canonical);
+                    check(view_words[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) && (view_words[3]>>28)==10,
+                          "volume UAV preserves the physical XG base and native 3D resource type");
+                    reinterpret_cast<Count>(vt(uav)[2])(uav);
+                }
+                D3D11_UNORDERED_ACCESS_VIEW_DESC invalid{};
+                invalid.Format=volume_desc.standard.Format; invalid.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE3D;
+                invalid.Texture3D.WSize=17;
+                check(create_uav(device,texture,&invalid,&uav)==E_INVALIDARG && !uav,
+                      "volume UAV rejects a slice range outside the resource");
+                invalid.Texture3D.WSize=8;
+                check(create_uav(device,texture,&invalid,&uav)==DXGI_ERROR_UNSUPPORTED && !uav,
+                      "partial volume UAV remains an explicit unsupported case");
                 using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
                 void* view = nullptr;
                 check(reinterpret_cast<CreateSrv>(vt(device)[7])(device, texture, nullptr, &view) == S_OK && view,

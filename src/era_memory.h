@@ -8,6 +8,7 @@
 namespace xboxone::era {
 struct TitleTextureLayout {
     std::size_t bytes = 0, alignment = 0;
+    UINT tile_mode = UINT_MAX;
     D3D12_RESOURCE_DESC resource_desc{};
     std::array<UINT32, 8> guest_descriptor{}; // Produced by the pinned XG revision, before memory binding.
     std::array<UINT32, 8> stencil_descriptor{}; // Optional typed plane SRD, with relative physical base.

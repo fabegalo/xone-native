@@ -819,9 +819,10 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
     if (d.SampleDesc.Count != 1 && (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 ||
         d.DepthOrArraySize != 1 || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1)) ||
         !((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
-          (d.Format==DXGI_FORMAT_R32G8X24_TYPELESS && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) ||
+          ((d.Format==DXGI_FORMAT_R32G8X24_TYPELESS || d.Format==DXGI_FORMAT_R32_TYPELESS) && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) ||
         (d.Format != DXGI_FORMAT_R11G11B10_FLOAT && d.Format != DXGI_FORMAT_R10G10B10A2_UNORM &&
-         d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format!=DXGI_FORMAT_R32G8X24_TYPELESS)))
+         d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format!=DXGI_FORMAT_R32G8X24_TYPELESS &&
+         d.Format!=DXGI_FORMAT_R16G16B16A16_TYPELESS && d.Format!=DXGI_FORMAT_R32_TYPELESS)))
         return DXGI_ERROR_UNSUPPORTED;
     return acquire_gpu_resource(address, layout.bytes, device, out, D3D12_RESOURCE_FLAG_NONE, true, &layout);
 }
@@ -1000,16 +1001,23 @@ HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList
     return S_OK;
 }
 
+static UINT sample_pixel_bytes(DXGI_FORMAT format) {
+    return format==DXGI_FORMAT_R32G8X24_TYPELESS || format==DXGI_FORMAT_R16G16B16A16_TYPELESS ? 8 : 4;
+}
 static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D12_RESOURCE_DESC& desc) {
     const UINT samples = desc.SampleDesc.Count;
     const bool depth_stencil=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
-    const UINT64 bytes = desc.Width * desc.Height * samples * (depth_stencil ? 8 : 4);
+    const bool depth_only=desc.Format==DXGI_FORMAT_R32_TYPELESS;
+    const bool half_float=desc.Format==DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    const UINT64 bytes = desc.Width * desc.Height * samples * sample_pixel_bytes(desc.Format);
     if (!bytes || bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
     auto transfer = std::make_unique<SampleTransfer>();
     HRESULT hr = transfer->initialize(device, desc.Format, samples);
     if (FAILED(hr)) return hr;
     desc.SampleDesc = {1, 0}; desc.DepthOrArraySize = static_cast<UINT16>(samples); desc.Alignment = 0;
     if (depth_stencil) { desc.Format=DXGI_FORMAT_R32G32_UINT; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; }
+    else if (depth_only) { desc.Format=DXGI_FORMAT_R32_UINT; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; }
+    else if (half_float) desc.Format=DXGI_FORMAT_R16G16B16A16_UINT;
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> array;
     hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&array));
@@ -1026,7 +1034,7 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
     view.Format = desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; view.Texture2DArray.ArraySize = samples; view.Texture2DArray.MipLevels = 1;
     device->CreateShaderResourceView(array.Get(), &view, srv_handle);
-    view = {}; view.Format = depth_stencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view = {}; view.Format = depth_stencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : depth_only ? DXGI_FORMAT_R32_FLOAT : desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS; srv_handle.ptr += srv_step;
     device->CreateShaderResourceView(window.resource.Get(), &view, srv_handle);
     if (depth_stencil) {
@@ -1040,13 +1048,13 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
         target.Texture2DArray.FirstArraySlice = sample; target.Texture2DArray.ArraySize = 1;
         device->CreateRenderTargetView(array.Get(), &target, rtv_handle); rtv_handle.ptr += rtv_step;
     }
-    if (depth_stencil) {
+    if (depth_stencil || depth_only) {
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsv;
         const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
         hr=device->CreateDescriptorHeap(&dsv_desc,IID_PPV_ARGS(&dsv));
         if (FAILED(hr)) return hr;
         D3D12_DEPTH_STENCIL_VIEW_DESC target{};
-        target.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; target.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
+        target.Format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT; target.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
         device->CreateDepthStencilView(window.resource.Get(),&target,dsv->GetCPUDescriptorHandleForHeapStart());
         window.sample_dsv=std::move(dsv);
     } else {
@@ -1064,7 +1072,7 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
 static void interleave_samples(GpuWindow& window, void* mapped, bool into_array) {
     const auto& desc = window.texture.resource_desc;
     const UINT samples = desc.SampleDesc.Count;
-    const UINT element=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4;
+    const UINT element=sample_pixel_bytes(desc.Format);
     for (UINT sample = 0; sample < samples; ++sample) {
         const auto& footprint = window.footprints[sample];
         for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x) {
@@ -1114,10 +1122,10 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
         if (FAILED(hr)) return hr;
         if (window.sample_array) {
             const auto& desc = window.texture.resource_desc;
-            const UINT element=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4;
+            const UINT element=sample_pixel_bytes(desc.Format);
             const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * element;
             hr = window.texture.copy(window.texture.context.get(), false, window.sample_linear.data(), canonical, 0, row, row * desc.Height);
-            if (SUCCEEDED(hr) && element==8) for (SIZE_T at=0;at<window.sample_linear.size();at+=8) {
+            if (SUCCEEDED(hr) && (desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format==DXGI_FORMAT_R32_TYPELESS)) for (SIZE_T at=0;at<window.sample_linear.size();at+=element) {
                 UINT32 bits; std::memcpy(&bits,window.sample_linear.data()+at,4);
                 // SV_Depth cannot promise lossless NaN, signed-zero or denormal payloads.
                 if (bits>0x3f800000u || (bits && !(bits&0x7f800000u))) { hr=DXGI_ERROR_UNSUPPORTED; break; }
@@ -1238,7 +1246,7 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
                 else if (window->sample_array) {
                     interleave_samples(*window, mapped, false);
                     const auto& desc = window->texture.resource_desc;
-                    const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * (desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4);
+                    const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * sample_pixel_bytes(desc.Format);
                     converted = window->texture.copy(window->texture.context.get(), true, window->sample_linear.data(), commit.data(),
                         0, row, row * desc.Height);
                 } else for (UINT i = 0; i < window->footprints.size(); ++i) {

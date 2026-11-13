@@ -527,7 +527,7 @@ int main(int argc, char** argv) {
         check(info.State == MEM_FREE, "last aligned owner frees canonical and GPU representations together");
     }
     const auto texture_fixture = [&](TitleTextureLayout layout, UINT block, UINT bytes_per_block, UINT64 signal,
-                                     LinearTextureFixture* injected) -> bool {
+                                     LinearTextureFixture* injected, bool packed_uav=false) -> bool {
         const auto& d = layout.resource_desc;
         auto* storage = static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
         if (!storage) return false;
@@ -560,8 +560,10 @@ int main(int argc, char** argv) {
               "texture cannot bypass its layout conversion through the buffer path");
         const bool render_target = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
         const bool depth_target = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+        const bool integer_target=!render_target && !depth_target && (d.Flags&D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+            (d.Format==DXGI_FORMAT_R8_TYPELESS || d.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS);
         hr = begin_title_gpu_texture(texture, list.Get(), depth_target ? D3D12_RESOURCE_STATE_DEPTH_WRITE :
-            render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST);
+            render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET : integer_target ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_COPY_DEST);
         if (FAILED(hr)) return false;
         check(begin_title_gpu_buffer(alias, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
               "buffer alias cannot race a native texture using the same canonical bytes");
@@ -579,12 +581,12 @@ int main(int argc, char** argv) {
         source.pResource = upload.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = mutation;
         D3D12_TEXTURE_COPY_LOCATION destination{};
         destination.pResource = texture.resource; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; destination.SubresourceIndex = mutation_mip;
-        ComPtr<ID3D12DescriptorHeap> render_heap;
+        ComPtr<ID3D12DescriptorHeap> render_heap, clear_gpu_heap;
         if (depth_target) {
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
             if (FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&render_heap)))) return false;
             D3D12_DEPTH_STENCIL_VIEW_DESC view{};
-            view.Format = DXGI_FORMAT_D32_FLOAT; view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            view.Format = d.Format==DXGI_FORMAT_R16_TYPELESS ? DXGI_FORMAT_D16_UNORM : DXGI_FORMAT_D32_FLOAT; view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
             view.Texture2D.MipSlice = mutation_mip;
             device->CreateDepthStencilView(texture.resource,&view,render_heap->GetCPUDescriptorHandleForHeapStart());
             list->ClearDepthStencilView(render_heap->GetCPUDescriptorHandleForHeapStart(),D3D12_CLEAR_FLAG_DEPTH,.25f,0,0,nullptr);
@@ -592,19 +594,38 @@ int main(int argc, char** argv) {
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
             if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&render_heap)))) return false;
             D3D12_RENDER_TARGET_VIEW_DESC view{};
-            view.Format = d.Format; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D; view.Texture2D.MipSlice = mutation_mip;
+            view.Format = d.Format==DXGI_FORMAT_R8_TYPELESS ? DXGI_FORMAT_R8_UNORM :
+                d.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS ? DXGI_FORMAT_R10G10B10A2_UNORM : d.Format;
+            view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D; view.Texture2D.MipSlice = mutation_mip;
             device->CreateRenderTargetView(texture.resource, &view, render_heap->GetCPUDescriptorHandleForHeapStart());
             constexpr UINT packed = 0xa7a7a7a7;
             float color[]{float(packed & 1023) / 1023, float((packed >> 10) & 1023) / 1023,
                 float((packed >> 20) & 1023) / 1023, float(packed >> 30) / 3};
-            if (d.Format == DXGI_FORMAT_B8G8R8A8_UNORM) std::fill(std::begin(color),std::end(color),167.f/255.f);
+            if (d.Format == DXGI_FORMAT_B8G8R8A8_UNORM || d.Format==DXGI_FORMAT_R8_TYPELESS) std::fill(std::begin(color),std::end(color),167.f/255.f);
             list->ClearRenderTargetView(render_heap->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
+        } else if (integer_target) {
+            D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            if (FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&render_heap)))) return false;
+            heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            if (FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&clear_gpu_heap)))) return false;
+            D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+            view.Format=packed_uav ? DXGI_FORMAT_R32_UINT : d.Format==DXGI_FORMAT_R8_TYPELESS ? DXGI_FORMAT_R8_UINT : DXGI_FORMAT_R10G10B10A2_UINT;
+            view.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D; view.Texture2D.MipSlice=mutation_mip;
+            device->CreateUnorderedAccessView(texture.resource,nullptr,&view,render_heap->GetCPUDescriptorHandleForHeapStart());
+            device->CopyDescriptorsSimple(1,clear_gpu_heap->GetCPUDescriptorHandleForHeapStart(),render_heap->GetCPUDescriptorHandleForHeapStart(),heap.Type);
+            auto* bound_heap=clear_gpu_heap.Get(); list->SetDescriptorHeaps(1,&bound_heap);
+            constexpr UINT packed=0xa7a7a7a7;
+            const bool narrow=view.Format==DXGI_FORMAT_R8_UINT;
+            const UINT values[]{packed_uav ? packed : narrow ? 167u : packed&1023,narrow ? 167u : (packed>>10)&1023,narrow ? 167u : (packed>>20)&1023,narrow ? 167u : packed>>30};
+            list->ClearUnorderedAccessViewUint(clear_gpu_heap->GetGPUDescriptorHandleForHeapStart(),render_heap->GetCPUDescriptorHandleForHeapStart(),texture.resource,values,0,nullptr);
         } else list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         std::fill(expected[mutation_mip].begin(), expected[mutation_mip].end(), 0xa7);
         if (depth_target) {
             const float cleared = .25f;
-            for (SIZE_T offset=0;offset<expected[mutation_mip].size();offset+=4)
-                std::memcpy(expected[mutation_mip].data()+offset,&cleared,4);
+            const UINT16 d16=16384;
+            const bool narrow=d.Format==DXGI_FORMAT_R16_TYPELESS;
+            for (SIZE_T offset=0;offset<expected[mutation_mip].size();offset+=narrow ? 2 : 4)
+                std::memcpy(expected[mutation_mip].data()+offset,narrow ? static_cast<const void*>(&d16) : &cleared,narrow ? 2 : 4);
         }
         if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
         queue->ExecuteCommandLists(1, lists);
@@ -709,13 +730,16 @@ int main(int argc, char** argv) {
     }
     const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal, void* reserved = nullptr) -> bool {
         const bool depth_stencil=layout.resource_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
+        const bool half_float=layout.resource_desc.Format==DXGI_FORMAT_R16G16B16A16_TYPELESS;
+        const bool depth_only=layout.resource_desc.Format==DXGI_FORMAT_R32_TYPELESS;
+        const bool depth_target=depth_stencil || depth_only;
         if (depth_stencil) {
             D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
             const HRESULT feature=device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&options,sizeof options);
             std::cout << "depth/stencil features hr=0x" << std::hex << feature << std::dec
                       << " PSStencilRef=" << options.PSSpecifiedStencilRefSupported << '\n';
         }
-        const UINT words=depth_stencil ? 2 : 1, row=512*words, slice=8192*words;
+        const UINT words=depth_stencil || half_float ? 2 : 1, row=512*words, slice=8192*words;
         auto* storage = reserved ? nullptr : static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
         if (!reserved && !storage) return false;
         auto* canonical = reserved ? static_cast<unsigned char*>(reserved) :
@@ -724,12 +748,17 @@ int main(int argc, char** argv) {
         std::vector<UINT32> expected(32 * 16 * 4 * words), actual(expected.size());
         for (UINT i = 0; i < expected.size(); ++i) {
             const UINT sample = (i/words) % 4;
-            expected[i] = depth_stencil ? (i%2 ? ((i/2*17+3)&255) : 0x3e000000u+i*13) :
+            expected[i] = depth_stencil ? (i%2 ? ((i/2*17+3)&255) : 0x3e000000u+i*13) : depth_only ? 0x3e000000u+i*13 :
                 ((15 + sample) << 6) | (((16 + sample) << 6) << 11) | (((14 + sample) << 5) << 22);
         }
-        if (depth_stencil) {
+        if (depth_target) {
             const UINT32 edges[]{0,0x00800000u,0x3f7fffffu,0x3f800000u};
-            for (UINT sample=0;sample<4;++sample) expected[sample*2]=edges[sample];
+            for (UINT sample=0;sample<4;++sample) expected[sample*words]=edges[sample];
+        }
+        if (half_float) {
+            for (UINT i=0;i<expected.size();++i) expected[i]=((i*13)&65535)|(((i*17+3)&65535)<<16);
+            const UINT16 edges[]{0,0x8000,1,0x3ff,0x400,0x3c00,0x7bff,0x7c00,0xfc00,0x7e00,0x7fff,0xfe01,0x3555,0xb555,0x401,0x83ff};
+            std::memcpy(expected.data(),edges,sizeof edges);
         }
         if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, row, slice))) return false;
         TitleGpuResource texture;
@@ -738,37 +767,38 @@ int main(int argc, char** argv) {
         if (FAILED(hr)) return false;
         check(texture.resource->GetDesc().SampleDesc.Count == 4, "MSAA storage retains all four hardware samples");
         ComPtr<ID3D12DescriptorHeap> targets;
-        const D3D12_DESCRIPTOR_HEAP_DESC heap{depth_stencil ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{depth_target ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&targets)))) return false;
         D3D12_RENDER_TARGET_VIEW_DESC view{};
-        view.Format = DXGI_FORMAT_R11G11B10_FLOAT; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
-        if (depth_stencil) {
+        view.Format = half_float ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R11G11B10_FLOAT; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        if (depth_target) {
             D3D12_DEPTH_STENCIL_VIEW_DESC depth_view{};
-            depth_view.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; depth_view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
+            depth_view.Format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT; depth_view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
             device->CreateDepthStencilView(texture.resource,&depth_view,targets->GetCPUDescriptorHandleForHeapStart());
         } else device->CreateRenderTargetView(texture.resource, &view, targets->GetCPUDescriptorHandleForHeapStart());
         for (UINT iteration = 0; iteration < 3; ++iteration) {
             if (iteration == 2) {
                 void* cpu = nullptr;
                 if (FAILED(map_title_gpu_resource(texture, &cpu))) return false;
-                for (UINT i = 0; i < expected.size(); ++i) if (!depth_stencil || i>=8 || i%2)
+                for (UINT i = 0; i < expected.size(); ++i) if (!depth_target || i>=4*words || (depth_stencil && i%2))
                     expected[i] ^= ((i/words) % 4 + 1) << 1; // Distinct finite mantissas in each sample.
                 hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, row, slice);
                 if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
             }
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
-            hr = begin_title_gpu_texture(texture, list.Get(), depth_stencil ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
+            hr = begin_title_gpu_texture(texture, list.Get(), depth_target ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
             if (FAILED(hr)) std::cerr << "MSAA upload format=" << layout.resource_desc.Format << " hr=0x" << std::hex << hr << std::dec << '\n';
             check(SUCCEEDED(hr), "sample upload uses per-sample GPU shading without resolve");
             if (FAILED(hr)) return false;
             if (iteration == 1) {
                 const float color[]{.5f, 1, 2, 1};
-                if (depth_stencil) {
-                    list->ClearDepthStencilView(targets->GetCPUDescriptorHandleForHeapStart(),D3D12_CLEAR_FLAG_DEPTH|D3D12_CLEAR_FLAG_STENCIL,.375f,0xa7,0,nullptr);
-                    for (UINT i=0;i<expected.size();++i) expected[i]=i%2 ? 0xa7 : 0x3ec00000u;
+                if (depth_target) {
+                    list->ClearDepthStencilView(targets->GetCPUDescriptorHandleForHeapStart(),depth_stencil ? D3D12_CLEAR_FLAG_DEPTH|D3D12_CLEAR_FLAG_STENCIL : D3D12_CLEAR_FLAG_DEPTH,.375f,0xa7,0,nullptr);
+                    for (UINT i=0;i<expected.size();++i) expected[i]=depth_stencil && i%2 ? 0xa7 : 0x3ec00000u;
                 } else {
                     list->ClearRenderTargetView(targets->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
-                    std::fill(expected.begin(), expected.end(), (14u << 6) | ((15u << 6) << 11) | ((16u << 5) << 22));
+                    if (half_float) for (UINT i=0;i<expected.size();++i) expected[i]=i%2 ? 0x3c004000u : 0x3c003800u;
+                    else std::fill(expected.begin(), expected.end(), (14u << 6) | ((15u << 6) << 11) | ((16u << 5) << 22));
                 }
             }
             if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
@@ -786,6 +816,25 @@ int main(int argc, char** argv) {
                 "all four distinct MSAA samples survive GPU upload/readback and CPU reuse");
             for (UINT i = 0; i < 16; ++i)
                 check(canonical[int(i) - 16] == 0x5a && canonical[layout.bytes + i] == 0x5a, "MSAA coherence preserves neighboring bytes");
+        }
+        if (depth_target) {
+            const std::vector<unsigned char> before(canonical,canonical+layout.bytes);
+            void* cpu=nullptr;
+            if (FAILED(map_title_gpu_resource(texture,&cpu))) return false;
+            const auto valid=expected;
+            expected[0]=0x7fc00001u;
+            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice);
+            if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr))) return false;
+            check(begin_title_gpu_texture(texture,list.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE)==DXGI_ERROR_UNSUPPORTED,
+                "MSAA depth rejects unrepresentable NaN payloads before submitting GPU work");
+            if (FAILED(list->Close())) return false;
+            check(map_title_gpu_resource(texture,&cpu)==S_OK && cpu==canonical,"failed MSAA depth upload releases CPU and physical alias gates");
+            expected=valid;
+            if (!cpu) return false;
+            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice);
+            if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
+            check(!std::memcmp(canonical,before.data(),before.size()),"failed MSAA upload can restore every canonical plane without stale GPU data");
         }
         if (FAILED(release_title_gpu_resource(texture, fence.Get(), signal + 2))) return false;
         if (storage) release(storage, attributes);
@@ -808,6 +857,31 @@ int main(int argc, char** argv) {
             D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
         check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout),33),
             "original XG depth/stencil preserves all sample bits through native GPU transfers and independent clears");
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT,UINT_MAX,sample_layout,
+            D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,4);
+        check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout),36),
+            "half-float MSAA preserves raw NaNs, signed zeros, subnormals and samples through integer transport and real float clears");
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R32_TYPELESS,UINT_MAX,sample_layout,
+            D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
+        check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout),39),
+            "D32 MSAA preserves four depth samples, independent clears and CPU reuse without requiring a stencil plane");
+        TitleTextureLayout typed_layout;
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16_TYPELESS,UINT_MAX,typed_layout,D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(typed_layout),1,2,45,nullptr),
+            "D16 depth preserves packed bits, native clear quantization and canonical reuse");
+        UINT64 typed_signal=48;
+        for (const auto format:{DXGI_FORMAT_R8_TYPELESS,DXGI_FORMAT_R10G10B10A2_TYPELESS}) for (const UINT bind:{UINT(D3D11_BIND_RENDER_TARGET),UINT(D3D11_BIND_UNORDERED_ACCESS)}) {
+            hr=create_xg_texture_layout(32,16,1,1,format,UINT_MAX,typed_layout,D3D11_BIND_SHADER_RESOURCE|bind);
+            check(SUCCEEDED(hr) && texture_fixture(std::move(typed_layout),1,format==DXGI_FORMAT_R8_TYPELESS ? 1 : 4,typed_signal,nullptr),
+                "typeless color preserves native typed RTV/UAV writes and aliases through canonical reuse");
+            typed_signal+=3;
+        }
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R10G10B10A2_TYPELESS,UINT_MAX,typed_layout,D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(typed_layout),1,4,typed_signal,nullptr,true),
+            "packed R32_UINT UAV writes preserve all R10G10B10A2 bits through canonical reuse and aliases");
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,UINT_MAX,typed_layout,D3D11_BIND_SHADER_RESOURCE);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(typed_layout),1,4,typed_signal+3,nullptr),
+            "two-channel half-float preserves all packed bits through original XG and GPU copies");
     }
     // Independent pixel oracle: source samples include both transfer breakpoints,
     // out-of-range RGB, distinct rows, and all four two-bit alpha values.

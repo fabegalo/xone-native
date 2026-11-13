@@ -3,6 +3,7 @@
 #include "era_memory.h"
 #include "era_audio.h"
 #include "era_display.h"
+#include "era_winrt_classes.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -1354,9 +1355,13 @@ void set_title_module(void* base) { title_module.store(static_cast<HMODULE>(base
 void set_title_storage_root(const std::wstring& root) {
     std::wstring full = root.empty() ? std::wstring{} : full_path(root.c_str());
     if (!full.empty() && full.back() != L'\\') full += L'\\';
-    std::lock_guard lock(storage_mutex);
-    storage_root = std::move(full);
+    {
+        std::lock_guard lock(storage_mutex);
+        storage_root = std::move(full);
+    }
+    reset_title_users();
 }
+std::wstring title_storage_root() { std::lock_guard lock(storage_mutex); return storage_root; }
 
 void* resolve_kernelx(const ImportRequest& request) {
     if (!same_library(request.library, "kernelx.dll") || request.name.empty()) return nullptr;

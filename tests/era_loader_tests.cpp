@@ -745,6 +745,16 @@ int main(int argc, char** argv) {
                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_DEPTH_STENCIL_VIEW_DESC*)>(vt(view)[9])(view,&actual_view.desc);
                     check(!std::memcmp(&actual_view.desc,&depth_view,sizeof depth_view) && actual_view.guard==0xaabbccdd,
                         "MSAA DSV description preserves both read-only aspects and its ABI extent");
+                    using SetDepthTarget=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
+                    using GetDepthTarget=void(STDMETHODCALLTYPE*)(void*,UINT,void**,void**);
+                    reinterpret_cast<SetDepthTarget>(vt(context)[33])(context,0,nullptr,view);
+                    void* retained_depth=nullptr;
+                    reinterpret_cast<GetDepthTarget>(vt(context)[89])(context,0,nullptr,&retained_depth);
+                    check(retained_depth==view,"legacy OM depth-only query returns the bound MSAA DSV");
+                    reinterpret_cast<SetDepthTarget>(vt(context)[33])(context,0,nullptr,nullptr);
+                    check(reinterpret_cast<Count>(vt(view)[1])(view)==3,"queried DSV survives unbinding with independent caller ownership");
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                    if(retained_depth)reinterpret_cast<Count>(vt(retained_depth)[2])(retained_depth);
                     check(reinterpret_cast<Count>(vt(texture)[2])(texture)==1,"MSAA DSV retains its original parent storage");
                     texture=nullptr;
                     reinterpret_cast<Count>(vt(view)[2])(view);
@@ -989,9 +999,21 @@ int main(int argc, char** argv) {
                         bind_targets(context,1,targets,nullptr);
                         check(reinterpret_cast<Count>(vt(view)[1])(view)==3,"legacy slot 33 retains its real render target view");
                         reinterpret_cast<Count>(vt(view)[2])(view);
+                        using GetTargets=void(STDMETHODCALLTYPE*)(void*,UINT,void**,void**);
+                        const auto get_targets=reinterpret_cast<GetTargets>(vt(context)[89]);
+                        void* returned[9]{};returned[8]=reinterpret_cast<void*>(1);void* returned_depth=reinterpret_cast<void*>(1);
+                        get_targets(context,8,returned,&returned_depth);
+                        check(returned[0]==view && !returned[1] && !returned[7] && returned[8]==reinterpret_cast<void*>(1) && !returned_depth,
+                              "legacy OMGetRenderTargets returns retained bindings, null holes and preserves the output guard");
+                        check(reinterpret_cast<Count>(vt(view)[1])(view)==4,"OMGetRenderTargets owns a reference independent of the context binding");
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                        if(returned[0])reinterpret_cast<Count>(vt(returned[0])[2])(returned[0]);
+                        get_targets(context,0,nullptr,nullptr);
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
                         check(reinterpret_cast<Count>(vt(view)[1])(view)==2,"ClearState releases the render binding while retaining caller view ownership");
                         reinterpret_cast<Count>(vt(view)[2])(view);
+                        returned[0]=reinterpret_cast<void*>(1);get_targets(context,1,returned,nullptr);
+                        check(!returned[0],"OMGetRenderTargets observes ClearState through the same binding state");
                         constexpr FLOAT white[]{1,1,1,1};
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
                         void* alias=nullptr;
@@ -1019,6 +1041,9 @@ int main(int argc, char** argv) {
                                 if (deferred) {
                                     const std::vector<unsigned char> before(static_cast<unsigned char*>(alias),static_cast<unsigned char*>(alias)+pixels.bytes);
                                     reinterpret_cast<SetTargets>(vt(deferred)[33])(deferred,1,targets,nullptr);
+                                    void* deferred_view=reinterpret_cast<void*>(1);void* deferred_depth=reinterpret_cast<void*>(1);
+                                    reinterpret_cast<GetTargets>(vt(deferred)[89])(deferred,1,&deferred_view,&deferred_depth);
+                                    check(!deferred_view && !deferred_depth,"original deferred OM query exposes no immediate render target bindings");
                                     static UINT clear_slot=0;
                                     set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{clear_slot=slot;return 0;});
                                     const FLOAT black[]{0,0,0,0};
@@ -2356,6 +2381,12 @@ int main(int argc, char** argv) {
                             actual.FrontFace.StencilPassOp == desc.FrontFace.StencilPassOp && actual.BackFace.StencilFunc == desc.BackFace.StencilFunc &&
                             actual.StencilReadMask == 0x7f && actual.StencilWriteMask == 0xf0, "depth and both stencil faces preserved");
                         if (duplicate) reinterpret_cast<Count>(vt(duplicate)[2])(duplicate);
+                        using SetDepth=void(STDMETHODCALLTYPE*)(void*,void*,UINT);
+                        const auto set_depth=reinterpret_cast<SetDepth>(vt(context)[36]);
+                        set_depth(context,state,0x7a);set_depth(context,state,0x5c);
+                        check(refs(state)==2,"legacy depth binding retains exactly one state reference across stencil-reference changes");
+                        set_depth(context,nullptr,0);
+                        check(refs(state)==1,"legacy depth unbinding releases the context state owner");
                         check(reinterpret_cast<Count>(vt(state)[2])(state) == 0, "depth state cache entry retires with final reference");
                     }
                     desc.BackFace.StencilFunc = static_cast<D3D12_COMPARISON_FUNC>(9);
@@ -2554,6 +2585,22 @@ int main(int argc, char** argv) {
                     check(!pending(device, final), "last DMA release drains translated fence work");
                 }
                 using CreateDeferred = HRESULT (STDMETHODCALLTYPE*)(void*, UINT, void**);
+                using SetViewports=void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*);
+                using GetViewports=void(STDMETHODCALLTYPE*)(void*,UINT*,D3D11_VIEWPORT*);
+                const auto set_viewports=reinterpret_cast<SetViewports>(vt(context)[44]);
+                const auto get_viewports=reinterpret_cast<GetViewports>(vt(context)[95]);
+                const D3D11_VIEWPORT viewport_values[]{{2,3,32,16,0.2f,0.8f},{4,5,64,32,0,1}};
+                set_viewports(context,2,viewport_values);
+                struct { D3D11_VIEWPORT value{};UINT guard=0x12345678; } viewport_result;
+                UINT viewport_capacity=1;get_viewports(context,&viewport_capacity,&viewport_result.value);
+                check(viewport_capacity==1 && !std::memcmp(&viewport_result.value,viewport_values,sizeof(D3D11_VIEWPORT)) && viewport_result.guard==0x12345678,
+                      "legacy viewport query respects capacity, origin, extent, depth and its output guard");
+                viewport_capacity=0;get_viewports(context,&viewport_capacity,nullptr);
+                check(viewport_capacity==2,"legacy viewport count-only query returns all active viewports");
+                set_viewports(context,0,nullptr);viewport_capacity=1;get_viewports(context,&viewport_capacity,&viewport_result.value);
+                const D3D11_VIEWPORT zero_viewport{};
+                check(viewport_capacity==1 && !std::memcmp(&viewport_result.value,&zero_viewport,sizeof zero_viewport),
+                      "original zero-count viewport setter substitutes one all-zero viewport");
                 const auto create_deferred = reinterpret_cast<CreateDeferred>(vt(device)[27]);
                 void* deferred = nullptr;
                 check(create_deferred(device, 0, nullptr) == E_POINTER, "deferred context output required");
@@ -2563,6 +2610,10 @@ int main(int argc, char** argv) {
                     check(create_deferred(device, flags, &deferred) == S_OK && deferred && deferred != context,
                           "deferred context has independent identity");
                     if (deferred) {
+                        reinterpret_cast<SetViewports>(vt(deferred)[44])(deferred,2,viewport_values);
+                        viewport_capacity=1;reinterpret_cast<GetViewports>(vt(deferred)[95])(deferred,&viewport_capacity,&viewport_result.value);
+                        check(!viewport_capacity && !std::memcmp(&viewport_result.value,&zero_viewport,sizeof zero_viewport),
+                              "original deferred viewport query returns zero and clears only the requested output");
                         using State = UINT (STDMETHODCALLTYPE*)(void*);
                         const auto data = static_cast<unsigned char*>(deferred);
                         check((reinterpret_cast<std::uintptr_t>(deferred) & 63) == 0 &&
@@ -2796,8 +2847,12 @@ int main(int argc, char** argv) {
                 view->Release();
             }
             struct InputHandler : IUnknown {
-                ULONG refs = 1;
-                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override { if(!out)return E_POINTER; *out=this; AddRef(); return S_OK; }
+                std::atomic<ULONG> refs{1};bool agile=true;
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+                    if(!out)return E_POINTER;*out=nullptr;
+                    if(iid!=__uuidof(IUnknown) && !(agile && iid==__uuidof(IAgileObject)))return E_NOINTERFACE;
+                    *out=this;AddRef();return S_OK;
+                }
                 ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
                 ULONG STDMETHODCALLTYPE Release() override { return --refs; }
                 virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable*) { return S_OK; }
@@ -2810,6 +2865,19 @@ int main(int argc, char** argv) {
                     "input subscription retains the real handler");
                 check(reinterpret_cast<RemoveInput>(vt[8])(input,token) == S_OK && handler.refs == 1,
                     "input unsubscription releases handler ownership");
+                HRESULT worker_add=E_FAIL,worker_poll=S_OK,nonagile_add=S_OK;INT64 worker_token=0,rejected_token=99;
+                InputHandler nonagile;nonagile.agile=false;
+                std::thread input_worker([&] {
+                    worker_add=reinterpret_cast<AddInput>(vt[7])(input,&handler,&worker_token);
+                    worker_poll=poll_title_input();
+                    nonagile_add=reinterpret_cast<AddInput>(vt[7])(input,&nonagile,&rejected_token);
+                });input_worker.join();
+                check(worker_add==S_OK && worker_token && handler.refs==2 && worker_poll==RPC_E_WRONG_THREAD,
+                    "worker subscription of an agile delegate preserves dispatcher polling ownership");
+                check(nonagile_add==RPC_E_WRONG_THREAD && rejected_token==0 && nonagile.refs==1,
+                    "non-agile worker delegate is refused without a marshaling path or leaked reference");
+                check(reinterpret_cast<RemoveInput>(vt[8])(input,worker_token)==S_OK && handler.refs==1 && poll_title_input()==S_OK,
+                    "worker event token can be removed while polling remains on the dispatcher");
                 check(reinterpret_cast<AddInput>(vt[11])(input,&handler,&token) == S_OK && handler.refs == 2,
                     "observed pairing subscription preserves its callback");
                 stop_title_input();
@@ -2884,6 +2952,124 @@ int main(int argc, char** argv) {
                   "User factory answers IUserStatics");
         }
         if (user_statics && host) {
+            {
+                using Users=HRESULT(STDMETHODCALLTYPE*)(void*,void**);
+                const auto users=reinterpret_cast<Users>((*reinterpret_cast<void***>(user_statics))[9]);
+                const auto previous_root=xboxone::era::title_storage_root();
+                wchar_t temporary[MAX_PATH]{}; GetTempPathW(MAX_PATH,temporary);
+                const auto root=std::filesystem::path(temporary)/(L"xone-profile-test-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
+                const auto second=std::filesystem::path(root.wstring()+L"-second");
+                xboxone::era::set_title_storage_root(L"");
+                void* missing=reinterpret_cast<void*>(1);
+                check(users(user_statics,&missing)==HRESULT_FROM_WIN32(ERROR_NOT_READY) && !missing,
+                      "missing profile storage remains explicit rather than returning an invented user or empty success");
+                xboxone::era::set_title_storage_root(root.wstring());
+                GUID identity{};UINT32 local_id=0;
+                check(xboxone::era::title_local_user_identity(&identity,&local_id)==S_OK && identity!=GUID{} && local_id==1,
+                      "offline profile persists a genuine local identity in the session storage root");
+                const auto profile=root/L".xone-local-profile";
+                check(std::filesystem::file_size(profile)==32,"profile publication is bounded to its versioned record");
+                IInspectable* view=nullptr;
+                check(users(user_statics,reinterpret_cast<void**>(&view))==S_OK && view,"Users returns an owning snapshot of the configured profile");
+                if (view) {
+                    auto** table=*reinterpret_cast<void***>(view);
+                    using Get=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
+                    using Size=HRESULT(STDMETHODCALLTYPE*)(void*,UINT*);
+                    using Many=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,UINT,void**,UINT*);
+                    using Index=HRESULT(STDMETHODCALLTYPE*)(void*,void*,UINT*,boolean*);
+                    IInspectable* item=nullptr; UINT size=0;
+                    check(reinterpret_cast<Size>(table[7])(view,&size)==S_OK && size==1,"snapshot count matches the persisted local profile");
+                    check(reinterpret_cast<Get>(table[6])(view,0,reinterpret_cast<void**>(&item))==S_OK && item,"snapshot retains its user object");
+                    void* invalid=reinterpret_cast<void*>(1);
+                    check(reinterpret_cast<Get>(table[6])(view,1,&invalid)==E_BOUNDS && !invalid,"User GetAt rejects an out-of-range index");
+                    UINT actual=99; void* values[2]{nullptr,reinterpret_cast<void*>(1)};
+                    check(reinterpret_cast<Many>(table[9])(view,0,2,values,&actual)==S_OK && actual==1 && values[0]==item && values[1]==reinterpret_cast<void*>(1),
+                          "User GetMany retains exactly the returned items and preserves output guards");
+                    if (values[0]) static_cast<IUnknown*>(values[0])->Release();
+                    check(reinterpret_cast<Many>(table[9])(view,1,0,nullptr,&actual)==S_OK && actual==0 &&
+                          reinterpret_cast<Many>(table[9])(view,2,0,nullptr,&actual)==E_BOUNDS && actual==0,
+                          "User GetMany distinguishes the end of a snapshot from invalid bounds");
+                    UINT index=99;boolean found=false;
+                    check(reinterpret_cast<Index>(table[8])(view,item,&index,&found)==S_OK && found && index==0,"User IndexOf preserves logical identity");
+                    if (item) {
+                        UINT id=0;auto** it=*reinterpret_cast<void***>(item);
+                        check(reinterpret_cast<Size>(it[6])(item,&id)==S_OK && id==local_id,"IUser local ID comes from the shared profile record");
+                        using UserBoolean=HRESULT(STDMETHODCALLTYPE*)(void*,boolean*);
+                        boolean guest=true;
+                        check(reinterpret_cast<UserBoolean>(it[10])(item,&guest)==S_OK && !guest &&
+                              reinterpret_cast<UserBoolean>(it[10])(item,nullptr)==E_POINTER,
+                              "persisted local profile is not a sponsored guest session");
+                        boolean signed_in=false;UINT location=99;void* sponsor=reinterpret_cast<void*>(1);
+                        check(reinterpret_cast<UserBoolean>(it[11])(item,&signed_in)==S_OK && signed_in &&
+                              reinterpret_cast<Size>(it[12])(item,&location)==S_OK && location==0 &&
+                              reinterpret_cast<Users>(it[13])(item,&sponsor)==S_OK && !sponsor,
+                              "selected persistent user is locally signed in and has no guest sponsor");
+                        using UserString=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
+                        HSTRING online_id=reinterpret_cast<HSTRING>(1);
+                        check(reinterpret_cast<UserString>(it[15])(item,&online_id)==E_NOTIMPL && !online_id &&
+                              reinterpret_cast<UserString>(it[15])(item,nullptr)==E_POINTER,
+                              "local profile cannot manufacture an Xbox services identity");
+                        IInspectable* display=nullptr;
+                        check(reinterpret_cast<Users>(it[9])(item,reinterpret_cast<void**>(&display))==S_OK && display,
+                              "User.DisplayInfo retains the same local profile owner");
+                        if (display) {
+                            HSTRING label=nullptr;
+                            using Name=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
+                            check(reinterpret_cast<Name>((*reinterpret_cast<void***>(display))[6])(display,&label)==S_OK && text(label)==L"Local Player",
+                                  "offline display label uses the reference's HSTRING ABI without claiming an online identity");
+                            WindowsDeleteString(label);display->Release();
+                        }
+                    }
+                    constexpr GUID iterable_iid{0x1e1813fd,0xf62e,0x5198,{0xb2,0x07,0x9a,0xa8,0x77,0x14,0x7c,0x08}};
+                    IInspectable* iterable=nullptr;
+                    check(view->QueryInterface(iterable_iid,reinterpret_cast<void**>(&iterable))==S_OK && iterable,"user snapshot exposes the reference's class-derived iterable IID");
+                    if (iterable) {
+                        IInspectable* iterator=nullptr;auto** vt=*reinterpret_cast<void***>(iterable);
+                        check(reinterpret_cast<Users>(vt[6])(iterable,reinterpret_cast<void**>(&iterator))==S_OK && iterator,"First creates an independently owned iterator");
+                        iterable->Release();
+                        if (iterator) {
+                            auto** iv=*reinterpret_cast<void***>(iterator);IInspectable* current=nullptr;
+                            check(reinterpret_cast<Users>(iv[6])(iterator,reinterpret_cast<void**>(&current))==S_OK && current==item,"iterator retains the same profile identity");
+                            if (current) current->Release();
+                            using Advance=HRESULT(STDMETHODCALLTYPE*)(void*,boolean*);
+                            boolean more=true;
+                            check(reinterpret_cast<Advance>(iv[8])(iterator,&more)==S_OK && !more &&
+                                  reinterpret_cast<Users>(iv[6])(iterator,reinterpret_cast<void**>(&current))==E_BOUNDS && !current,
+                                  "iterator end never fabricates another user");
+                            iterator->Release();
+                        }
+                    }
+                    xboxone::era::set_title_storage_root(second.wstring());
+                    GUID second_identity{};
+                    check(xboxone::era::title_local_user_identity(&second_identity,&local_id)==S_OK && second_identity!=identity,
+                          "separate session storage cannot alias a different persisted profile");
+                    if (item) {
+                        UINT id=0;check(reinterpret_cast<Size>((*reinterpret_cast<void***>(item))[6])(item,&id)==S_OK && id==1,
+                            "existing user snapshots remain alive after storage-root replacement");item->Release();
+                    }
+                    view->Release();
+                }
+                xboxone::era::set_title_storage_root(root.wstring());GUID reloaded{};
+                check(xboxone::era::title_local_user_identity(&reloaded,&local_id)==S_OK && reloaded==identity,
+                      "profile identity survives cache reset and reopening its persistent record");
+                { std::ofstream corrupt(profile,std::ios::binary|std::ios::trunc);corrupt<<"invalid"; }
+                xboxone::era::set_title_storage_root(root.wstring());
+                check(users(user_statics,&missing)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA) && !missing && std::filesystem::file_size(profile)==7,
+                      "corrupt profile is refused and preserved rather than regenerated over existing identity");
+                xboxone::era::set_title_storage_root(previous_root);
+                const auto remove_profile=[](const std::filesystem::path& directory) {
+                    const auto file=directory/L".xone-local-profile";bool deleted=false;
+                    for (UINT attempt=0;attempt<20;++attempt) {
+                        if (!deleted) deleted=DeleteFileW(file.c_str())!=FALSE;
+                        if (deleted && RemoveDirectoryW(directory.c_str())) return true;
+                        Sleep(10); // A scanner can keep a just-deleted file pending briefly.
+                    }
+                    std::cerr<<"profile fixture cleanup Win32 "<<GetLastError()<<'\n';return false;
+                };
+                check(remove_profile(root),"profile fixture removes only its owned record and directory");
+                const auto second_profile=second/L".xone-local-profile";
+                if (std::filesystem::exists(second_profile)) check(remove_profile(second),"second profile fixture removes its own record");
+            }
             using Add = HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*);
             using Remove = HRESULT(STDMETHODCALLTYPE*)(void*, std::int64_t);
             auto** vt = *reinterpret_cast<void***>(user_statics);

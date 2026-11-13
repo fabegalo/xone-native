@@ -2716,7 +2716,7 @@ void STDMETHODCALLTYPE context_set_raster(Context* self,RasterState* state) {
     self->raster_state=state;
 }
 void STDMETHODCALLTYPE context_set_depth_state(Context* self,DepthState* state,UINT reference) {
-    if(state && (state->vtable!=depth_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",37);return;}
+    if(state && (state->vtable!=depth_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",self->device->legacy ? 36 : 37);return;}
     if(state) add_ref(state);
     if(self->depth_state) depth_state_release(self->depth_state);
     self->depth_state=state; self->stencil_reference=reference;
@@ -2749,6 +2749,13 @@ void STDMETHODCALLTYPE context_set_render_targets(Context* self, UINT count, Buf
     if (self->depth_target) view_release(self->depth_target);
     self->render_targets = next; self->depth_target = depth;
 }
+void STDMETHODCALLTYPE context_get_render_targets(Context* self,UINT count,BufferView** views,BufferView** depth) {
+    if (count>self->render_targets.size()) { default_trap("ID3D11DeviceContextX",89);return; }
+    if (views) for (UINT i=0;i<count;++i) {
+        auto* view=self->deferred ? nullptr : self->render_targets[i];if (view) view_add_ref(view);views[i]=view;
+    }
+    if (depth) { auto* view=self->deferred ? nullptr : self->depth_target;if (view) view_add_ref(view);*depth=view; }
+}
 void STDMETHODCALLTYPE context_set_viewports(Context* self, UINT count, const D3D11_VIEWPORT* input) {
     decltype(self->viewports) next{};
     SIZE_T read = 0;
@@ -2777,6 +2784,21 @@ void STDMETHODCALLTYPE context_get_viewports(Context* self, UINT* count, D3D11_V
         std::copy_n(self->viewports.begin(),*count,out);
     }
     *count = self->viewport_count;
+}
+void STDMETHODCALLTYPE legacy_context_set_viewports(Context* self,UINT count,const D3D11_VIEWPORT* input) {
+    const D3D11_VIEWPORT zero{}; // 11295 18000b180 substitutes one zero viewport for count zero.
+    context_set_viewports(self,count ? count : 1,count ? input : &zero);
+}
+void STDMETHODCALLTYPE legacy_context_get_viewports(Context* self,UINT* count,D3D11_VIEWPORT* out) {
+    if (!count) return;
+    const UINT capacity=*count;
+    if (self->deferred) {
+        if (out && capacity>self->viewports.size()) {default_trap("ID3D11DeviceContextX",95);return;}
+        if (out) std::fill_n(out,capacity,D3D11_VIEWPORT{});
+        *count=0;return;
+    }
+    context_get_viewports(self,count,out);
+    if (out) *count=(std::min)(capacity,*count);
 }
 HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth) {
     if (self->deferred) return DXGI_ERROR_UNSUPPORTED;
@@ -3206,15 +3228,17 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         for(UINT slot : {9u,10u,11u,12u,13u,14u,18u,19u,20u,21u,25u}) t[slot]=traps<kind_context>()[slot];
         t[34] = reinterpret_cast<const void*>(&trap_slot<kind_context,34>);
         t[33] = reinterpret_cast<const void*>(&context_set_render_targets); // Original 11295 180014fc0.
+        t[89] = reinterpret_cast<const void*>(&context_get_render_targets); // Original 11295 18000c9f0 -> 180007cb0.
         t[45] = reinterpret_cast<const void*>(&trap_slot<kind_context,45>);
+        t[44] = reinterpret_cast<const void*>(&legacy_context_set_viewports); // 11295 18000b180 -> 180007f70.
+        t[95] = reinterpret_cast<const void*>(&legacy_context_get_viewports); // 11295 18000cc10 -> 180008600.
         t[96] = reinterpret_cast<const void*>(&trap_slot<kind_context,96>);
         t[51] = reinterpret_cast<const void*>(&trap_slot<kind_context,51>);
         t[50] = reinterpret_cast<const void*>(&context_clear_rtv); // Original 11295 1800151f0 -> 180035d90.
         t[54] = reinterpret_cast<const void*>(&trap_slot<kind_context,54>);
-        t[44] = reinterpret_cast<const void*>(&trap_slot<kind_context,44>);
         t[43] = reinterpret_cast<const void*>(&context_set_raster); // Original 11295 18000b140 -> 180032490.
         t[37] = reinterpret_cast<const void*>(&trap_slot<kind_context,37>);
-        t[36] = reinterpret_cast<const void*>(&trap_slot<kind_context,36>);
+        t[36] = reinterpret_cast<const void*>(&context_set_depth_state); // 11295 18000af30 -> 180039bc0.
         t[35] = reinterpret_cast<const void*>(&context_set_blend); // Original 11295 18000aeb0.
         t[17] = reinterpret_cast<const void*>(&trap_slot<kind_context,17>);
         t[15] = reinterpret_cast<const void*>(&context_map_buffer); // Original 18000ff10, not desktop slot 14.

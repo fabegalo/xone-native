@@ -7,6 +7,7 @@
 #include <atomic>
 #include <memory>
 #include <new>
+#include <cstdio>
 
 namespace xboxone::era {
 namespace {
@@ -188,15 +189,18 @@ HRESULT STDMETHODCALLTYPE controllers(WinrtObject* self, void** out) try {
 } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 HRESULT register_handler(WinrtEvent& event, IUnknown* handler, INT64* token) {
     if (!handler || !token) return E_INVALIDARG;
+    *token=0;
     if (!host().get) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
-    DWORD previous = 0;
-    const bool first = event_thread.compare_exchange_strong(previous, GetCurrentThreadId());
-    if (!first && previous != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
-    if (first) {
-        const HRESULT hr = poll_title_input();
-        if (FAILED(hr)) { event_thread = 0; return hr; }
-        input_timer = SetTimer(nullptr, 0, 32, nullptr);
-        if (!input_timer) { event_thread = 0; return HRESULT_FROM_WIN32(GetLastError()); }
+    if (!event_thread) {
+        const HRESULT hr=start_title_input();if (FAILED(hr)) return hr;
+    }
+    if (event_thread != GetCurrentThreadId()) {
+        // The dispatcher can invoke an agile delegate registered by a worker.
+        // Non-agile delegates still require an apartment-aware marshaling path.
+        IUnknown* agile=nullptr;
+        const HRESULT hr=handler->QueryInterface(__uuidof(IAgileObject),reinterpret_cast<void**>(&agile));
+        if (FAILED(hr)) return hr==E_NOINTERFACE ? RPC_E_WRONG_THREAD : hr;
+        agile->Release();
     }
     return event.add(handler, token);
 }
@@ -267,7 +271,10 @@ HRESULT notify(WinrtEvent& event, Controller* controller, bool is_added, bool pa
 HRESULT poll_title_input() try {
     if (!event_thread) return S_OK;
     if (!host().get) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
-    if (event_thread && event_thread != GetCurrentThreadId()) return RPC_E_WRONG_THREAD;
+    if (event_thread && event_thread != GetCurrentThreadId()) {
+        std::fprintf(stderr,"xone-era: input poll thread %lu differs from owner %lu\n",GetCurrentThreadId(),event_thread.load());
+        return RPC_E_WRONG_THREAD;
+    }
     std::array<bool, XUSER_MAX_COUNT> current{};
     std::array<Controller*, XUSER_MAX_COUNT> changed{};
     {
@@ -290,6 +297,16 @@ HRESULT poll_title_input() try {
     }
     return S_OK;
 } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+HRESULT start_title_input() {
+    DWORD previous=0;
+    if (!event_thread.compare_exchange_strong(previous,GetCurrentThreadId()))
+        return previous==GetCurrentThreadId() ? S_OK : RPC_E_WRONG_THREAD;
+    const HRESULT hr=poll_title_input();
+    if (FAILED(hr)) { event_thread=0;return hr; }
+    input_timer=SetTimer(nullptr,0,32,nullptr);
+    if (!input_timer) {event_thread=0;return HRESULT_FROM_WIN32(GetLastError());}
+    return S_OK;
+}
 void stop_title_input() {
     if (event_thread && event_thread != GetCurrentThreadId()) return;
     if (input_timer && event_thread == GetCurrentThreadId()) KillTimer(nullptr,input_timer);

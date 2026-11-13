@@ -215,6 +215,7 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
 
     std::wstring entry;
     HSTRING entry_point = nullptr;
+    if (SUCCEEDED(hr)) hr = start_title_input();
     if (SUCCEEDED(hr)) hr = title_entry_point(entry);
     if (SUCCEEDED(hr)) hr = WindowsCreateString(entry.c_str(), static_cast<UINT32>(entry.size()), &entry_point);
     bool initialized = false;

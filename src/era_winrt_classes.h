@@ -21,6 +21,9 @@ HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed);
 HWND core_window_hwnd(const void* window);
 // Windows.Xbox.System.User (statics; observed slots only).
 HRESULT xbox_user_factory(REFIID iid, void** factory);
+std::wstring title_storage_root();
+void reset_title_users();
+HRESULT title_local_user_identity(GUID* identity, std::uint32_t* local_id);
 HRESULT xbox_controller_factory(REFIID iid, void** factory);
 HRESULT xbox_gamepad_factory(REFIID iid, void** factory);
 struct RawGamepadReading {
@@ -31,6 +34,7 @@ struct RawGamepadReading {
 };
 static_assert(sizeof(RawGamepadReading)==40 && offsetof(RawGamepadReading,left_trigger)==12);
 HRESULT poll_title_input();
+HRESULT start_title_input(); // Called on the session dispatcher before title initialization.
 void stop_title_input();
 std::size_t xbox_user_removed_handlers(); // Test observation.
 // Windows.Xbox.Management.Deployment.DownloadableContentPackageManager.

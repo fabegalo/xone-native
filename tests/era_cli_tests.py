@@ -15,12 +15,13 @@ with tempfile.TemporaryDirectory(prefix="xone-era-cli-") as scratch:
         result = subprocess.run([launcher, command, title], capture_output=True, text=True, timeout=5)
         assert result.returncode == 1, result
         assert "unresolved 2" in result.stdout and "running title" not in result.stdout, result
-    result = subprocess.run([launcher, "run", title, "--stop-on-missing", "--timeout-ms", "2000"],
-                            capture_output=True, text=True, timeout=5)
-    assert result.returncode == 125, result
-    assert "resolved 0, unresolved 2" in result.stdout, result
-    assert "unimplemented missing.dll!Sleep" in result.stderr and "; stopped" in result.stderr, result
-    assert "title entry returned" not in result.stderr, result
+    for option in ("--stop-on-missing", "--stop-on-missing-imports"):
+        result = subprocess.run([launcher, "run", title, option, "--timeout-ms", "2000"],
+                                capture_output=True, text=True, timeout=5)
+        assert result.returncode == 125, result
+        assert "resolved 0, unresolved 2" in result.stdout, result
+        assert "unimplemented missing.dll!Sleep" in result.stderr and "; stopped" in result.stderr, result
+        assert "title entry returned" not in result.stderr, result
 result = subprocess.run([loader_tests, "--missing-activation"], capture_output=True, text=True, timeout=5)
 assert result.returncode == 125, result
 assert "unimplemented activation Xone.Tests.MissingActivation; stopped" in result.stderr, result

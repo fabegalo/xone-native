@@ -73,12 +73,77 @@ std::vector<std::uint8_t> read(const char* path) {
 
 int main(int argc, char** argv) {
     using namespace xboxone::era;
-    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa")) {
+    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa" || std::string(argv[1]) == "--xg-depth")) {
         const bool graphics = std::string(argv[1]) == "--xg-graphics";
         set_stop_on_missing_activation(true);
         HRESULT hr = bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
         if (SUCCEEDED(hr)) hr = bind_xg_module(std::filesystem::path(argv[3]).wstring());
         if (SUCCEEDED(hr)) hr = initialize_xg_module();
+        if (std::string(argv[1]) == "--xg-depth") {
+            if (FAILED(hr)) return 1;
+            using Create = HRESULT(WINAPI*)(void*,D3D_DRIVER_TYPE,HMODULE,UINT,const D3D_FEATURE_LEVEL*,UINT,UINT,void**,D3D_FEATURE_LEVEL*,void**);
+            const auto create = reinterpret_cast<Create>(resolve_d3d11x({"d3d11_x.dll","D3D11CreateDevice",0}));
+            void* device = nullptr; void* context = nullptr;
+            if (!create || FAILED(create(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,7,&device,nullptr,&context))) return 1;
+            const auto vt = [](void* object){return *static_cast<void***>(object);};
+            using Count = ULONG(STDMETHODCALLTYPE*)(void*);
+            void* embedded_device = nullptr;
+            using GetDevice = void(STDMETHODCALLTYPE*)(void*,void**);
+            auto* embedded = reinterpret_cast<void**>(static_cast<char*>(context)+0x3d0);
+            check(embedded[34] != nullptr,"observed modern inline OM call has an explicit dispatch target");
+            reinterpret_cast<GetDevice>(embedded[3])(context,&embedded_device);
+            check(embedded_device == device,"modern embedded context dispatch preserves its device identity");
+            if (embedded_device) reinterpret_cast<Count>(vt(embedded_device)[2])(embedded_device);
+            struct TextureDesc { D3D11_TEXTURE2D_DESC standard; UINT extra[2]{}; } desc{};
+            desc.standard = {32,16,1,1,DXGI_FORMAT_D32_FLOAT,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_DEPTH_STENCIL,0,0};
+            using Texture = HRESULT(STDMETHODCALLTYPE*)(void*,const TextureDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+            void* texture = nullptr;
+            hr = reinterpret_cast<Texture>(vt(device)[5])(device,&desc,nullptr,&texture);
+            check(SUCCEEDED(hr) && texture,"modern ABI creates the expanded D32 texture");
+            if (texture) {
+                check(*reinterpret_cast<ULONG*>(static_cast<char*>(texture)+12) == 1,"D32 retains the modern public reference counter");
+                using Dsv = HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_DEPTH_STENCIL_VIEW_DESC*,void**);
+                const auto create_dsv = reinterpret_cast<Dsv>(vt(device)[10]);
+                void* view = reinterpret_cast<void*>(1);
+                check(create_dsv(device,nullptr,nullptr,&view) == E_INVALIDARG && !view,"DSV clears its output on an invalid resource");
+                D3D11_DEPTH_STENCIL_VIEW_DESC input{};
+                input.Format = DXGI_FORMAT_D32_FLOAT; input.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                input.Texture2D.MipSlice = 1;
+                check(create_dsv(device,texture,&input,&view) == E_INVALIDARG && !view,"DSV rejects a mip outside the resource");
+                input.Texture2D.MipSlice = 0; input.Flags = D3D11_DSV_READ_ONLY_STENCIL;
+                check(create_dsv(device,texture,&input,&view) == DXGI_ERROR_UNSUPPORTED && !view,"D32 cannot claim a stencil plane");
+                input.Flags = 0;
+                check(create_dsv(device,texture,&input,&view) == S_OK && view,"modern ABI creates a real native depth view");
+                if (view) {
+                    check(*reinterpret_cast<UINT*>(static_cast<char*>(view)+40) == 1,"DSV public type agrees with the original UMD");
+                    using Bind = void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
+                    const auto bind = reinterpret_cast<Bind>(embedded[34]);
+                    bind(context,0,nullptr,view);
+                    bind(context,0,nullptr,view);
+                    check(*reinterpret_cast<ULONG*>(static_cast<char*>(view)+12) == 2,
+                        "repeated OM binding retains one view without accumulating references");
+                    bind(context,0,nullptr,nullptr);
+                    check(*reinterpret_cast<ULONG*>(static_cast<char*>(view)+12) == 1,
+                        "OM unbinding releases its retained depth view");
+                    struct { D3D11_DEPTH_STENCIL_VIEW_DESC desc{}; UINT64 guard=0x1122334455667788ull; } output;
+                    using GetDesc = void(STDMETHODCALLTYPE*)(void*,D3D11_DEPTH_STENCIL_VIEW_DESC*);
+                    reinterpret_cast<GetDesc>(vt(view)[9])(view,&output.desc);
+                    check(output.desc.Format == DXGI_FORMAT_D32_FLOAT && output.desc.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D &&
+                        !output.desc.Flags && output.guard == 0x1122334455667788ull,"DSV writes exactly its verified 24-byte description");
+                    using Resource = void(STDMETHODCALLTYPE*)(void*,void**);
+                    void* retained = nullptr;
+                    reinterpret_cast<Resource>(vt(view)[8])(view,&retained);
+                    check(retained == texture && *reinterpret_cast<ULONG*>(static_cast<char*>(texture)+12) == 3,
+                        "DSV GetResource retains the same canonical texture identity");
+                    reinterpret_cast<Count>(vt(retained)[2])(retained);
+                    check(reinterpret_cast<Count>(vt(view)[2])(view) == 0 &&
+                        *reinterpret_cast<ULONG*>(static_cast<char*>(texture)+12) == 1,"DSV retirement releases its parent ownership");
+                }
+                reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            reinterpret_cast<Count>(vt(context)[2])(context); reinterpret_cast<Count>(vt(device)[2])(device);
+            return failures ? 1 : 0;
+        }
         TitleTextureLayout layout;
         if (std::string(argv[1]) == "--xg-msaa") {
             if (SUCCEEDED(hr)) hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, layout,

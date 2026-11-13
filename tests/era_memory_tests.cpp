@@ -559,7 +559,9 @@ int main(int argc, char** argv) {
         check(begin_title_gpu_buffer(texture, list.Get(), D3D12_RESOURCE_STATE_COPY_DEST) == E_INVALIDARG,
               "texture cannot bypass its layout conversion through the buffer path");
         const bool render_target = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
-        hr = begin_title_gpu_texture(texture, list.Get(), render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST);
+        const bool depth_target = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+        hr = begin_title_gpu_texture(texture, list.Get(), depth_target ? D3D12_RESOURCE_STATE_DEPTH_WRITE :
+            render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST);
         if (FAILED(hr)) return false;
         check(begin_title_gpu_buffer(alias, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
               "buffer alias cannot race a native texture using the same canonical bytes");
@@ -578,7 +580,15 @@ int main(int argc, char** argv) {
         D3D12_TEXTURE_COPY_LOCATION destination{};
         destination.pResource = texture.resource; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; destination.SubresourceIndex = mutation_mip;
         ComPtr<ID3D12DescriptorHeap> render_heap;
-        if (render_target) {
+        if (depth_target) {
+            const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            if (FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&render_heap)))) return false;
+            D3D12_DEPTH_STENCIL_VIEW_DESC view{};
+            view.Format = DXGI_FORMAT_D32_FLOAT; view.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+            view.Texture2D.MipSlice = mutation_mip;
+            device->CreateDepthStencilView(texture.resource,&view,render_heap->GetCPUDescriptorHandleForHeapStart());
+            list->ClearDepthStencilView(render_heap->GetCPUDescriptorHandleForHeapStart(),D3D12_CLEAR_FLAG_DEPTH,.25f,0,0,nullptr);
+        } else if (render_target) {
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
             if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&render_heap)))) return false;
             D3D12_RENDER_TARGET_VIEW_DESC view{};
@@ -591,6 +601,11 @@ int main(int argc, char** argv) {
             list->ClearRenderTargetView(render_heap->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
         } else list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         std::fill(expected[mutation_mip].begin(), expected[mutation_mip].end(), 0xa7);
+        if (depth_target) {
+            const float cleared = .25f;
+            for (SIZE_T offset=0;offset<expected[mutation_mip].size();offset+=4)
+                std::memcpy(expected[mutation_mip].data()+offset,&cleared,4);
+        }
         if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
         queue->ExecuteCommandLists(1, lists);
         check(complete_title_gpu_resource(texture, fence.Get(), signal) == E_PENDING,
@@ -666,6 +681,9 @@ int main(int argc, char** argv) {
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,4,9,nullptr),
             "original 2018 XG BGRA backbuffer layout preserves independent GPU clears, canonical guards and CPU reuse");
+        hr = create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_D32_FLOAT,UINT_MAX,layout,D3D11_BIND_DEPTH_STENCIL);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,4,11,nullptr),
+            "expanded D32 image preserves GPU depth clear bits, aliases, guards, fences and CPU reuse");
     } else if (original_xg) {
         TitleTextureLayout layout;
         hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);

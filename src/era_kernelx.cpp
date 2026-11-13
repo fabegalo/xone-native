@@ -802,7 +802,7 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
         (layout.alignment & (layout.alignment - 1)) || reinterpret_cast<std::uintptr_t>(address) % layout.alignment) return E_INVALIDARG;
     if ((d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
         !d.Width || !d.Height || !d.DepthOrArraySize || !d.MipLevels || !d.SampleDesc.Count || d.SampleDesc.Quality ||
-        (d.Flags & ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) ||
+        (d.Flags & ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
         d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
     if (d.SampleDesc.Count != 1 && (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 ||
         d.DepthOrArraySize != 1 || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1)) ||
@@ -905,9 +905,12 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
         !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
     if ((state & D3D12_RESOURCE_STATE_RENDER_TARGET) &&
         !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) return DXGI_ERROR_UNSUPPORTED;
+    if ((state & (D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ)) &&
+        !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return DXGI_ERROR_UNSUPPORTED;
     if (texture && (state & ~(D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_COPY_DEST |
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET))) return DXGI_ERROR_UNSUPPORTED;
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET |
+        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ))) return DXGI_ERROR_UNSUPPORTED;
     hr = physical_pages(buffer, window->physical_pages, true);
     if (FAILED(hr)) return hr;
     for (UINT page = 0; page < window->physical_pages.size(); ++page)

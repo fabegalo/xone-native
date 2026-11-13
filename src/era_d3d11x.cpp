@@ -2563,7 +2563,8 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
     if (!samples || samples > 8 || (samples & (samples - 1)) || (samples > 1 && (mips != 1 || depth))) return E_INVALIDARG;
     const bool bc7 = format == DXGI_FORMAT_BC7_TYPELESS || format == DXGI_FORMAT_BC7_UNORM || format == DXGI_FORMAT_BC7_UNORM_SRGB;
     if ((!bc7 && format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-         format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT) ||
+         format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
+         format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
         ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
     if (samples > 1 && format == DXGI_FORMAT_R8_UINT) return DXGI_ERROR_UNSUPPORTED;
     try {
@@ -2571,6 +2572,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         context->module = module; context->width = width; context->height = height;
         context->mips = mips; context->arrays = arrays; context->block = bc7 ? 4 : 1; context->bytes_per_block = bc7 ? 16 : 4;
         if (format == DXGI_FORMAT_R8_UINT) context->bytes_per_block = 1;
+        if (format == DXGI_FORMAT_R32G8X24_TYPELESS) context->bytes_per_block = 8;
         context->samples = samples;
         // 180052210 constructs the 60-byte XG descriptor independently of the
         // 52-byte public texture descriptor. Single-sample, default SRV storage.
@@ -2584,6 +2586,9 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         // Approved expanded canonical image: host render-target capabilities
         // remain below; Xbox auxiliary compression planes are not fabricated.
         std::array<UINT, 15> desc{width, height, mips, arrays, static_cast<UINT>(format), samples, 0, 0, 0, 0, 0, 0, 0, tile_mode, 0};
+        // Original 180052210 carries the depth bind into XG. Omitting it yields
+        // E_INVALIDARG and conceals the real three-plane depth/stencil contract.
+        if (format == DXGI_FORMAT_R32G8X24_TYPELESS) desc[8] = D3D11_BIND_DEPTH_STENCIL;
         if (depth) {
             // Original 180052210: 52-byte volume descriptor; tile mode at +44.
             using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
@@ -2623,6 +2628,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         out.resource_desc.Format = format; out.resource_desc.SampleDesc.Count = samples;
         if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) out.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (bind_flags & D3D11_BIND_RENDER_TARGET) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (bind_flags & D3D11_BIND_DEPTH_STENCIL) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
         std::memcpy(out.guest_descriptor.data(), static_cast<unsigned char*>(context->computer) + 0x10, sizeof out.guest_descriptor);
         out.context = std::move(context); out.copy = &copy_xg_texture;
         return S_OK;
@@ -2631,7 +2637,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
 
 HRESULT create_xg_texture_layout(UINT width, UINT height, UINT mips, UINT arrays, DXGI_FORMAT format,
                                  UINT tile_mode, TitleTextureLayout& out, UINT bind_flags, UINT samples) {
-    if (bind_flags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET)) return DXGI_ERROR_UNSUPPORTED;
+    if (bind_flags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL)) return DXGI_ERROR_UNSUPPORTED;
     return create_xg_texture_layout_impl(width, height, 0, mips, arrays, format, tile_mode, bind_flags, samples, out);
 }
 HRESULT create_xg_texture3d_layout(UINT width, UINT height, UINT depth, UINT mips, DXGI_FORMAT format,

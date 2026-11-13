@@ -93,6 +93,15 @@ int main(int argc, char** argv) {
             check(SUCCEEDED(hr) && input == output, "MSAA CPU layout preserves four independent samples without resolve");
             check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
                 std::all_of(tiled.end() - 16, tiled.end(), [](auto x) { return x == 0x5a; }), "MSAA copies preserve canonical guards");
+            hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
+                D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 4);
+            std::cout << "original XG depth/stencil MSAA4 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
+            check(hr == DXGI_ERROR_UNSUPPORTED && !layout.context && !layout.bytes,
+                "three-plane depth/stencil layout is explicitly refused until every plane is translated");
+            hr = create_xg_texture_layout(1920, 1080, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
+                D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 4);
+            check(hr == DXGI_ERROR_UNSUPPORTED && !layout.context && !layout.bytes,
+                "observed full-size FH2 depth descriptor preserves the same explicit plane boundary");
             return failures ? 1 : 0;
         }
         if (SUCCEEDED(hr)) hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);

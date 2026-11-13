@@ -5,7 +5,7 @@
 #include <array>
 
 namespace xboxone::era {
-void set_graphics_diagnostics(bool enabled);
+void set_graphics_diagnostics(bool enabled, bool warp = false);
 // Xbox display transfer inside the native GPU backend. The caller owns resource
 // states, descriptor lifetime and submission fences, as for other GPU commands.
 class DisplayTransfer {

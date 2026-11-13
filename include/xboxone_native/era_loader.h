@@ -103,7 +103,7 @@ HRESULT get_title_activation_factory(HSTRING class_id, REFIID iid, void** factor
 void set_stop_on_missing_activation(bool stop);
 bool stop_on_missing_service(); // Shared diagnostic policy for fatal WinRT slots.
 // Package directory holding the title's AppxManifest.xml; read once per process.
-void set_title_package_root(const std::wstring& root);
+void set_title_package_root(const std::wstring& root, const std::string& executable = {}, const std::string& sha256 = {});
 // EtwPlus.dll telemetry: offline semantics, events dropped, nothing uploaded.
 void* resolve_etwplus(const ImportRequest& request);
 // Writable title storage root for file mutation APIs. Empty (the

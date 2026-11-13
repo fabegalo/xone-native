@@ -7,6 +7,7 @@
 // are reported with title-relative addresses.
 #include "xboxone_native/era_loader.h"
 #include "era_display.h"
+#include "sha256.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -73,6 +74,29 @@ auto import_stops(std::index_sequence<Index...>) {
 }
 const auto stops = import_stops(std::make_index_sequence<256>{});
 
+void diagnose_callers(const CONTEXT& original) {
+    CONTEXT context=original;
+    __try {
+        for (UINT i=0;i<48 && context.Rip;++i) {
+            if (context.Rip>=title_base && context.Rip<title_end) {
+                char line[96];
+                std::snprintf(line,sizeof line,"xone-era:   C++ caller title+0x%llX\n",context.Rip-title_base);
+                report(line);
+            }
+            DWORD64 base=0;
+            auto* entry=RtlLookupFunctionEntry(context.Rip,&base,nullptr);
+            if (entry) {
+                void* data=nullptr;DWORD64 frame=0;
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,context.Rip,entry,&context,&data,&frame,nullptr);
+            } else {
+                SIZE_T read=0;
+                if (!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(context.Rsp),&context.Rip,sizeof context.Rip,&read) || read!=sizeof context.Rip) break;
+                context.Rsp+=sizeof context.Rip;
+            }
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { report("xone-era:   C++ caller unwind incomplete\n"); }
+}
+
 LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
     if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C || code == 0x406D1388)
@@ -110,6 +134,7 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
             std::snprintf(line,sizeof line,"xone-era:   C++ type %.95s metadata image 0x%llX\n",type_name,static_cast<unsigned long long>(data[3]));
             report(line);
         }
+        diagnose_callers(*info->ContextRecord);
     }
     if (code == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2) {
         std::snprintf(line, sizeof line, "xone-era:   %s 0x%llX\n",
@@ -135,11 +160,12 @@ void on_exit() { report("xone-era: title called exit\n"); }
 
 int usage() {
     std::cerr << "Usage: xone-era check <title.exe>\n"
-                 "       xone-era run <title.exe> [--timeout-ms N] [--storage DIR] [--stop-on-missing | --stop-on-missing-imports]\n"
+                 "       xone-era run <title.exe> [--timeout-ms N] [--storage DIR] [--warp] [--stop-on-missing | --stop-on-missing-imports]\n"
                  "check maps the image and binds imports without calling the entry point.\n"
                  "run also executes the title natively in this process (default deadline 15000 ms).\n"
                  "--stop-on-missing diagnoses missing imports, activations and service calls (exit 125).\n"
                  "--stop-on-missing-imports traps missing imports but returns real activation failures to the title.\n";
+    std::cerr << "--warp selects the software GPU explicitly and enables bounded graphics diagnostics.\n";
     return 2;
 }
 
@@ -154,12 +180,14 @@ int wmain(int argc, wchar_t** argv) {
     std::wstring storage;
     bool stop_on_missing = false;
     bool stop_on_activation = false;
+    bool warp = false;
     for (int i = 3; i < argc; ++i) {
         const std::wstring option = argv[i];
         if (option == L"--timeout-ms" && i + 1 < argc) timeout = static_cast<DWORD>(std::wcstoul(argv[++i], nullptr, 10));
         else if (option == L"--storage" && i + 1 < argc) storage = argv[++i];
         else if (option == L"--stop-on-missing") { stop_on_missing = true; stop_on_activation = true; }
         else if (option == L"--stop-on-missing-imports") stop_on_missing = true;
+        else if (option == L"--warp") warp = true;
         else return usage();
     }
     if (run && (timeout == 0 || timeout > 600000)) { std::cerr << "timeout must be 1..600000 ms\n"; return 2; }
@@ -203,9 +231,11 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "cannot enter package directory: Win32 " << GetLastError() << '\n'; return 1;
     }
     xboxone::era::set_title_storage_root(storage);
-    xboxone::era::set_title_package_root(title.parent_path().wstring());
+    xboxone::detail::Sha256 title_hash;title_hash.update(file);
+    const auto selected=title.filename().u8string();
+    xboxone::era::set_title_package_root(title.parent_path().wstring(),std::string(selected.begin(),selected.end()),title_hash.finish());
     xboxone::era::set_stop_on_missing_activation(stop_on_activation);
-    xboxone::era::set_graphics_diagnostics(stop_on_missing);
+    xboxone::era::set_graphics_diagnostics(stop_on_missing || warp, warp);
     diagnostic_exceptions.store(stop_on_missing);
     for (const auto* runtime : {L"vccorlib110.dll", L"vccorlib140.dll"}) {
         const HMODULE module = GetModuleHandleW(runtime);

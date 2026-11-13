@@ -7,6 +7,8 @@
 #include "xboxone_native/era_loader.h"
 #include "era_winrt_classes.h"
 #include "xboxone_native/inspection.h"
+#include "xboxone_native/appmodel.h"
+#include "xboxone_native/inventory.h"
 #include "file_path.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -22,6 +24,9 @@
 #include <algorithm>
 #include <new>
 #include <string>
+#include <optional>
+#include <cstdio>
+#include <atomic>
 
 namespace xboxone::era {
 namespace {
@@ -41,6 +46,9 @@ std::mutex package_mutex;
 std::wstring package_root;
 std::vector<std::uint32_t> installed_chunks;
 bool chunks_loaded = false;
+std::string package_executable, package_executable_hash, package_manifest_hash;
+HRESULT package_binding_status = HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE);
+std::optional<appmodel::Manifest> package_manifest;
 
 struct Identity {
     HRESULT status = E_FAIL;
@@ -155,11 +163,48 @@ private:
 
 } // namespace
 
-void set_title_package_root(const std::wstring& root) {
+void set_title_package_root(const std::wstring& root, const std::string& executable, const std::string& sha256) {
     std::lock_guard lock(package_mutex);
     package_root = root;
     installed_chunks.clear();
     chunks_loaded = false;
+    package_manifest.reset();
+    package_executable=executable;package_executable_hash=sha256;package_manifest_hash.clear();
+    package_binding_status=HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE);
+    if (!root.empty() && !executable.empty()) {
+        std::filesystem::path relative;std::string error;
+        if (!appmodel::package_relative_path(executable,relative) || sha256.size()!=64 ||
+            sha256.find_first_not_of("0123456789abcdef")!=std::string::npos)
+            package_binding_status=E_INVALIDARG;
+        else package_binding_status=inventory::fingerprint(std::filesystem::path(root)/L"AppxManifest.xml",package_manifest_hash,error,1u<<20) ?
+            S_OK : HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
+}
+
+HRESULT title_package_metadata(appmodel::Manifest& manifest,std::wstring& root,std::string& revision) {
+    std::lock_guard lock(package_mutex);
+    if (FAILED(package_binding_status)) return package_binding_status;
+    if (!package_manifest) {
+        appmodel::Manifest candidate;std::string error,hash;std::filesystem::path relative;
+        if (!appmodel::package_relative_path(package_executable,relative) ||
+            !inventory::fingerprint(std::filesystem::path(package_root)/relative,hash,error) || hash!=package_executable_hash)
+            return HRESULT_FROM_WIN32(ERROR_CRC);
+        if (!appmodel::read_manifest(std::filesystem::path(package_root)/L"AppxManifest.xml",package_manifest_hash,candidate,error)) {
+            static std::atomic<UINT> reports{0};
+            if(reports.fetch_add(1)<8)std::fprintf(stderr,"xone-era: package metadata rejected: %.256s\n",error.c_str());
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        }
+        UINT matches=0;
+        for (const auto& application:candidate.applications) {
+            std::filesystem::path path;
+            if (appmodel::package_relative_path(application.executable,path) &&
+                CompareStringOrdinal(path.c_str(),-1,relative.c_str(),-1,TRUE)==CSTR_EQUAL) ++matches;
+        }
+        if (matches!=1 || candidate.architecture!=PROCESSOR_ARCHITECTURE_AMD64) return HRESULT_FROM_WIN32(ERROR_BAD_EXE_FORMAT);
+        package_manifest=std::move(candidate);
+    }
+    manifest=*package_manifest;root=package_root;revision=package_manifest_hash+package_executable_hash;
+    return S_OK;
 }
 
 HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed) {

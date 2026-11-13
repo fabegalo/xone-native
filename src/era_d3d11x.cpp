@@ -309,6 +309,7 @@ std::string xg_identity;
 std::mutex xg_module_mutex;
 std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
 std::atomic<bool> graphics_diagnostics{false};
+std::atomic<bool> diagnostic_warp{false};
 const std::array<const void*, vtable_slots>& shader_vtable();
 
 [[noreturn]] void default_trap(const char* interface_name, unsigned slot) {
@@ -325,7 +326,7 @@ const std::array<const void*, vtable_slots>& shader_vtable();
 enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv, kind_texture, kind_rtv };
 constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView", "ID3D11Texture2D", "ID3D11RenderTargetView"};
 
-void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
+void diagnose_shader(std::uintptr_t address, SIZE_T bytes, bool instructions = false) {
     if (!address || bytes < 32 || bytes > (16u << 20)) return;
     try {
         std::vector<std::uint8_t> code(bytes);
@@ -353,6 +354,9 @@ void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
         ID3DBlob* text = nullptr;
         const HRESULT decoded = disassemble ? disassemble(code.data(), code.size(), 0, nullptr, &text) : E_NOINTERFACE;
         std::fprintf(stderr, "xone-era: native shader disassembly 0x%08lX (not saved)\n", decoded);
+        if (text && instructions)
+            std::fprintf(stderr, "xone-era: draw shader %zu bytes\n%.*s\n", bytes,
+                static_cast<int>((std::min)(text->GetBufferSize(), SIZE_T(8192))), static_cast<const char*>(text->GetBufferPointer()));
         if (text) text->Release();
         FreeLibrary(compiler);
     } catch (const std::bad_alloc&) {
@@ -2443,11 +2447,12 @@ HRESULT pace_legacy_present(DxgiObject* self,UINT interval) {
     self->present_tick=deadline;self->present_fraction=UINT(numerator%60);
     return S_OK;
 }
-void diagnose_presented_pixels(Texture* source,UINT64 frame) {
+void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary="presented title") {
     if(!graphics_diagnostics.load() || frame!=1) return;
     const auto& desc=source->desc.standard;
-    const bool packed10=desc.Format==DXGI_FORMAT_R10G10B10A2_UNORM;
-    if((!packed10 && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM) ||
+    const bool packed10=desc.Format==DXGI_FORMAT_R10G10B10A2_UNORM || desc.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    const bool packed11=desc.Format==DXGI_FORMAT_R11G11B10_FLOAT;
+    if((!packed10 && !packed11 && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM) ||
         UINT64(desc.Width)*desc.Height>8u*1024*1024) return;
     try {
         std::vector<UINT32> pixels(SIZE_T(desc.Width)*desc.Height);
@@ -2459,11 +2464,11 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame) {
             if(SUCCEEDED(hr)) hr=closed;
         }
         if(FAILED(hr)) {std::fprintf(stderr,"xone-era: frame pixel verification failed 0x%08lX\n",hr);return;}
-        const UINT mask=packed10 ? 0x3fffffff : 0x00ffffff;
+        const UINT mask=packed11 ? UINT_MAX : packed10 ? 0x3fffffff : 0x00ffffff;
         const auto nonblack=std::count_if(pixels.begin(),pixels.end(),[&](UINT value){return (value&mask)!=0;});
         detail::Sha256 hash;
         hash.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()),pixels.size()*4));
-        std::fprintf(stderr,"xone-era: presented title pixels %ux%u format %u nonblack %llu/%llu SHA256 %s\n",desc.Width,desc.Height,desc.Format,
+        std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u nonblack %llu/%llu SHA256 %s\n",boundary,desc.Width,desc.Height,desc.Format,
             static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str());
     } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
 }
@@ -3223,6 +3228,33 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         vertices[i]={buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset+self->vertex_offsets[i],buffer->desc.standard.ByteWidth-self->vertex_offsets[i],self->vertex_strides[i]};
     }
     if(self->input_layout) for(const auto& element : self->input_layout->elements) if(!self->vertex_buffers[element.InputSlot]) return DXGI_ERROR_UNSUPPORTED;
+    if (graphics_diagnostics.load() && self->completed_draws < 2) {
+        std::fprintf(stderr,"xone-era: draw state indexed=%u count=%u first=%u mask=0x%X targets=%u layout=%zu cull=%u blend=%u write=0x%X depth=%u\n",
+            indexed,count,first,pipeline.SampleMask,pipeline.NumRenderTargets,self->input_layout ? self->input_layout->elements.size() : 0,
+            pipeline.RasterizerState.CullMode,pipeline.BlendState.RenderTarget[0].BlendEnable,
+            pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask,pipeline.DepthStencilState.DepthEnable);
+        for (UINT i=0;i<self->viewport_count;++i) {
+            const auto& v=self->viewports[i];
+            std::fprintf(stderr,"xone-era: draw viewport %u %g %g %g %g depth %g %g\n",i,v.TopLeftX,v.TopLeftY,v.Width,v.Height,v.MinDepth,v.MaxDepth);
+        }
+        if (self->input_layout) for (const auto& element:self->input_layout->elements) {
+            const auto slot=element.InputSlot;const auto* buffer=self->vertex_buffers[slot];
+            std::fprintf(stderr,"xone-era: draw input %s%u format=%u slot=%u offset=%u stride=%u buffer_offset=%u bytes=%u\n",
+                element.SemanticName,element.SemanticIndex,element.Format,slot,element.AlignedByteOffset,self->vertex_strides[slot],self->vertex_offsets[slot],buffer->desc.standard.ByteWidth);
+        }
+        for (UINT stage=0;stage<2;++stage) {
+            diagnose_shader(reinterpret_cast<std::uintptr_t>(self->shaders[stage]->code.data()),self->shaders[stage]->code.size(),true);
+            for (UINT i=0;i<counts[stage][0];++i) {
+                const auto* buffer=self->constants[stage][i];
+                std::array<FLOAT,16> values{};SIZE_T read=0;
+                const auto bytes=(std::min)(SIZE_T(buffer->desc.standard.ByteWidth),sizeof values);
+                if (ReadProcessMemory(GetCurrentProcess(),buffer->allocation_start,values.data(),bytes,&read) && read==bytes)
+                    std::fprintf(stderr,"xone-era: draw CB stage=%u slot=%u bytes=%u prefix %g %g %g %g %g %g %g %g %g %g %g %g %g %g %g %g\n",
+                        stage,i,buffer->desc.standard.ByteWidth,values[0],values[1],values[2],values[3],values[4],values[5],values[6],values[7],
+                        values[8],values[9],values[10],values[11],values[12],values[13],values[14],values[15]);
+            }
+        }
+    }
     D3D12_INDEX_BUFFER_VIEW index{};
     if(indexed) {
         if(!use(self->index_buffer->gpu,false,D3D12_RESOURCE_STATE_INDEX_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
@@ -3280,6 +3312,18 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     // Keep descriptors/PSO alive on every in-flight failure path.
     if(FAILED(hr)) default_trap("graphics submission retirement",14);
     for(auto& entry : uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return hr;}
+    if (graphics_diagnostics.load() && self->completed_draws<2) {
+        for (UINT i=0;i<counts[0][1];++i) {
+            const auto* view=self->shader_resources[4][i];
+            if (view && view->resource->vtable==texture_vtable().data()) {
+                auto* texture=static_cast<Texture*>(view->resource);
+                std::fprintf(stderr,"xone-era: draw PS SRV %u format=%u resource_format=%u %ux%u\n",i,view->srv_desc.Format,
+                    texture->desc.standard.Format,texture->desc.standard.Width,texture->desc.standard.Height);
+                diagnose_presented_pixels(texture,1,"draw sampled");
+            }
+        }
+        diagnose_presented_pixels(static_cast<Texture*>(self->render_targets[0]->resource),1,"draw target");
+    }
     ++self->completed_draws;
     if((stop_on_missing_service() || self->device->legacy) && self->completed_draws<=2)
         std::fprintf(stderr,"xone-era: native %s draw %llu completed, %u %s, original VS/PS\n",indexed ? "indexed" : "non-indexed",
@@ -3546,6 +3590,7 @@ bool select_level(ID3D12Device* device, const D3D_FEATURE_LEVEL* levels, UINT co
 }
 
 HRESULT create_d3d12(D3D_DRIVER_TYPE type, ID3D12Device** out) {
+    if (diagnostic_warp.load() && (type==D3D_DRIVER_TYPE_HARDWARE || type==D3D_DRIVER_TYPE_UNKNOWN)) type=D3D_DRIVER_TYPE_WARP;
     if (type == D3D_DRIVER_TYPE_HARDWARE || type == D3D_DRIVER_TYPE_UNKNOWN)
         return D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(out));
     if (type != D3D_DRIVER_TYPE_WARP) return DXGI_ERROR_UNSUPPORTED;
@@ -3573,6 +3618,14 @@ HRESULT WINAPI D3D11CreateDevice(void* adapter, D3D_DRIVER_TYPE type, HMODULE so
     if (!select_level(d3d12, levels, levels ? level_count : 0, level)) {
         d3d12->Release();
         return E_INVALIDARG;
+    }
+    if (graphics_diagnostics.load()) {
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+        Microsoft::WRL::ComPtr<IDXGIAdapter1> selected;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(CreateDXGIFactory2(0,IID_PPV_ARGS(&factory))) &&
+            SUCCEEDED(factory->EnumAdapterByLuid(d3d12->GetAdapterLuid(),IID_PPV_ARGS(&selected))) && SUCCEEDED(selected->GetDesc1(&desc)))
+            std::fprintf(stderr,"xone-era: graphics adapter %ls software=%u\n",desc.Description,(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)!=0);
     }
     if (level_out) *level_out = level;
     if (!device_out && !context_out) { d3d12->Release(); return S_FALSE; }
@@ -3674,7 +3727,10 @@ HRESULT WINAPI D3D11XCreateDeviceX(const CreateParameters* parameters, void** de
 } // namespace
 
 void set_d3d11x_trap_handler(D3D11XTrapHandler handler) { trap_handler.store(handler); }
-void set_graphics_diagnostics(bool enabled) { graphics_diagnostics.store(enabled); }
+void set_graphics_diagnostics(bool enabled, bool warp) {
+    graphics_diagnostics.store(enabled);
+    diagnostic_warp.store(enabled && warp);
+}
 
 HRESULT bind_d3d11x_abi(const std::wstring& original_combase) {
     legacy_abi_bound = false;

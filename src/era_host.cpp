@@ -7,6 +7,7 @@
 #include <oleauto.h>
 
 #include <string_view>
+#include <atomic>
 #include <utility>
 
 namespace xboxone::era {
@@ -69,6 +70,20 @@ void fatal_note(const char* text) {
     DWORD written = 0;
     WriteFile(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(lstrlenA(text)), &written, nullptr);
     OutputDebugStringA(text);
+}
+
+template<bool Modern>
+[[noreturn]] void __cdecl era_raise_com_exception(HRESULT hr) {
+    static std::atomic<UINT> reports{0};
+    if (reports.fetch_add(1)<8) {
+        char line[96];
+        wsprintfA(line,"xone-era: C++/CX %u raise COMException HRESULT 0x%08lX\n",Modern ? 140 : 110,hr);
+        fatal_note(line);
+    }
+    const auto module=GetModuleHandleW(Modern ? L"vccorlib140.dll" : L"vccorlib110.dll");
+    const auto raise=reinterpret_cast<void(__cdecl*)(HRESULT)>(GetProcAddress(module,"?__abi_WinRTraiseCOMException@@YAXJ@Z"));
+    raise(hr); // Preserve the matching host runtime's real exception and unwind.
+    __assume(0);
 }
 
 // Fatal WinRT error paths of the title: record the error, then the host call
@@ -142,7 +157,12 @@ void* resolve_host_module(const ImportRequest& request) {
         const HMODULE module = LoadLibraryExW(file, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!module) return nullptr;
         const char* symbol = request.name.empty() ? MAKEINTRESOURCEA(request.ordinal) : request.name.c_str();
-        return reinterpret_cast<void*>(GetProcAddress(module, symbol));
+        const auto address=GetProcAddress(module, symbol);
+        if (address && request.name=="?__abi_WinRTraiseCOMException@@YAXJ@Z") {
+            if (library=="vccorlib110.dll") return reinterpret_cast<void*>(&era_raise_com_exception<false>);
+            if (library=="vccorlib140.dll") return reinterpret_cast<void*>(&era_raise_com_exception<true>);
+        }
+        return reinterpret_cast<void*>(address);
     }
     return nullptr;
 }

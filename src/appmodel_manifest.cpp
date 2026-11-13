@@ -188,8 +188,10 @@ bool read_manifest(const std::filesystem::path& path, const std::string& sha256,
         Com<IAppxManifestReader3> modern;
         require(reader.As(&modern), "IAppxManifestReader3");
         Com<IAppxManifestTargetDeviceFamiliesEnumerator> families;
-        require(modern->GetTargetDeviceFamilies(&families), "GetTargetDeviceFamilies");
-        each(families.Get(), [&](auto e) {
+        const HRESULT families_hr=modern->GetTargetDeviceFamilies(&families);
+        // Appx 2010 uses Prerequisites instead. Absence is metadata, not desktop activation permission.
+        if(families_hr!=HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) require(families_hr,"GetTargetDeviceFamilies");
+        if(families) each(families.Get(), [&](auto e) {
             Com<IAppxManifestTargetDeviceFamily> family;
             require(e->GetCurrent(&family), "device family");
             candidate.device_families.push_back(string_value([&](auto p) { return family->GetName(p); }));

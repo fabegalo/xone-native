@@ -6,6 +6,9 @@ import sys
 import tempfile
 
 launcher, fixture, loader_tests = map(pathlib.Path, sys.argv[1:])
+result = subprocess.run([launcher, "run", fixture, "--warp", "--timeout-ms", "2000"],
+                        capture_output=True, text=True, timeout=5)
+assert result.returncode == 0 and "title entry returned" in result.stderr, result
 data = fixture.read_bytes()
 assert data.count(b"kernelx.dll\0") == 1
 with tempfile.TemporaryDirectory(prefix="xone-era-cli-") as scratch:

@@ -4,6 +4,8 @@
 #include "../src/era_winrt_classes.h"
 #include "../src/era_winrt_object.h"
 #include "../src/era_memory.h"
+#include "xboxone_native/appmodel.h"
+#include "xboxone_native/inventory.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -82,6 +84,15 @@ std::vector<std::uint8_t> read(const char* path) {
 
 int main(int argc, char** argv) {
     using namespace xboxone::era;
+    if(argc==4 && std::string(argv[1])=="--package-metadata") {
+        const std::filesystem::path root=argv[2];std::string hash,error;
+        if(!xboxone::inventory::fingerprint(root/argv[3],hash,error))return 1;
+        set_title_package_root(root.wstring(),argv[3],hash);
+        xboxone::appmodel::Manifest manifest;std::wstring location;std::string revision;
+        const HRESULT hr=title_package_metadata(manifest,location,revision);
+        std::cout<<"package metadata HRESULT 0x"<<std::hex<<static_cast<UINT>(hr)<<" name "<<manifest.name<<" revision "<<revision<<'\n';
+        return FAILED(hr) ? 1 : 0;
+    }
     if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa" || std::string(argv[1]) == "--xg-depth")) {
         const bool graphics = std::string(argv[1]) == "--xg-graphics";
         set_stop_on_missing_activation(true);
@@ -3009,6 +3020,111 @@ int main(int argc, char** argv) {
             WindowsDeleteString(id);
             return hr;
         };
+        {
+            const auto root=std::filesystem::path(package)/L"metadata-\u03a9";
+            std::filesystem::create_directory(root);
+            const auto xml=root/L"AppxManifest.xml",exe=root/L"owned.exe";
+            std::filesystem::copy_file(std::filesystem::path(__FILE__).parent_path()/L"appmodel/AppxManifest.xml",xml);
+            std::filesystem::copy_file(argv[1],exe);
+            std::string hash,manifest_hash,error;
+            check(xboxone::inventory::fingerprint(exe,hash,error) && xboxone::inventory::fingerprint(xml,manifest_hash,error),
+                "package fixture has pinned executable and manifest bytes");
+            xboxone::appmodel::Manifest expected;
+            check(xboxone::appmodel::read_manifest(xml,manifest_hash,expected,error),"package fixture uses the existing SDK metadata parser");
+            constexpr GUID iid_statics{0x4e534bdf,0x2960,0x4878,{0x97,0xa4,0x96,0x24,0xde,0xb7,0x2f,0x2d}};
+            IInspectable* factory=nullptr;
+            check(activate(L"Windows.ApplicationModel.Package",iid_statics,reinterpret_cast<void**>(&factory))==S_OK && factory,
+                "Package statics use the session WinRT boundary");
+            if(factory) {
+                using Get=HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable**);
+                const auto get=reinterpret_cast<Get>((*reinterpret_cast<void***>(factory))[6]);
+                IActivationFactory* activation_factory=nullptr;IUnknown* identity=nullptr;
+                check(factory->QueryInterface(__uuidof(IActivationFactory),reinterpret_cast<void**>(&activation_factory))==S_OK &&
+                    activation_factory && factory->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity))==S_OK &&
+                    identity==activation_factory,"Package factory and statics preserve one COM identity");
+                if(identity)identity->Release();if(activation_factory)activation_factory->Release();
+                IInspectable* current=reinterpret_cast<IInspectable*>(1);
+                set_title_package_root({});
+                check(get(factory,nullptr)==E_POINTER && get(factory,&current)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !current,
+                    "Current refuses an absent package identity and clears failed outputs");
+                set_title_package_root(root.wstring(),"owned.exe",hash);
+                check(get(factory,&current)==S_OK && current,"Current binds only the verified selected manifest and executable");
+                if(current) {
+                    IInspectable* second=nullptr;
+                    check(get(factory,&second)==S_OK && second==current,"Current retains one COM identity for an immutable package revision");
+                    if(second)second->Release();
+                    IInspectable* id=nullptr;
+                    const auto get_id=reinterpret_cast<Get>((*reinterpret_cast<void***>(current))[6]);
+                    check(get_id(current,nullptr)==E_POINTER && get_id(current,&id)==S_OK && id,"Package.Id retains the metadata snapshot");
+                    if(id) {
+                        const auto vt=*reinterpret_cast<void***>(id);
+                        using String=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
+                        HSTRING value=nullptr;
+                        check(reinterpret_cast<String>(vt[6])(id,&value)==S_OK && text(value)==L"XboxOneNative.OwnedLifecycleTest",
+                            "package name comes from the manifest, not host process identity");
+                        struct {USHORT words[4]{};UINT guard=0x12345678;} version;
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,USHORT*)>(vt[7])(id,version.words)==S_OK &&
+                            version.words[0]==1 && !version.words[1] && !version.words[2] && !version.words[3] && version.guard==0x12345678,
+                            "PackageVersion preserves Major/Minor/Build/Revision order and output extent");
+                        UINT architecture=99;
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT*)>(vt[8])(id,&architecture)==S_OK && architecture==1,
+                            "Appx AMD64 maps to the WinRT X64 enum");
+                        set_title_package_root({});
+                        second=reinterpret_cast<IInspectable*>(1);
+                        check(get(factory,&second)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !second &&
+                            reinterpret_cast<String>(vt[6])(id,&value)==S_OK && text(value)==L"XboxOneNative.OwnedLifecycleTest",
+                            "rebinding invalidates Current while retained package metadata remains alive");
+                        id->Release();
+                    }
+                    current->Release();
+                }
+                set_title_package_root(root.wstring(),"../owned.exe",hash);
+                check(get(factory,&current)==E_INVALIDARG && !current,"package executable traversal is refused");
+                set_title_package_root(root.wstring(),"owned.exe",std::string(64,'0'));
+                check(get(factory,&current)==HRESULT_FROM_WIN32(ERROR_CRC) && !current,"selected executable hash mismatch cannot produce a package");
+                set_title_package_root(root.wstring(),"absent.exe",hash);
+                check(FAILED(get(factory,&current)) && !current,"missing selected executable cannot produce a package");
+                const auto other=root/L"other.exe";std::filesystem::copy_file(exe,other);
+                set_title_package_root(root.wstring(),"other.exe",hash);
+                check(get(factory,&current)==HRESULT_FROM_WIN32(ERROR_BAD_EXE_FORMAT) && !current,
+                    "a valid hash cannot bind an executable absent from the manifest");
+                std::filesystem::remove(other);
+                set_title_package_root(root.wstring(),"owned.exe",hash);
+                {std::ofstream changed(xml,std::ios::app);changed<<' ';}
+                check(get(factory,&current)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA) && !current,"manifest mutation after binding invalidates the snapshot");
+                {std::ofstream changed(xml);changed<<"<!DOCTYPE Package [<!ENTITY x SYSTEM 'file:///outside'>]><Package>&x;</Package>";}
+                set_title_package_root(root.wstring(),"owned.exe",hash);
+                check(FAILED(get(factory,&current)) && !current,"malformed or external-entity manifest cannot manufacture a package");
+                {std::ofstream legacy(xml);legacy<<
+                    "<Package xmlns=\"http://schemas.microsoft.com/appx/2010/manifest\">"
+                    "<Identity Name=\"Owned.Legacy\" Publisher=\"CN=Owned\" Version=\"1.2.3.4\" ProcessorArchitecture=\"x64\"/>"
+                    "<Properties><DisplayName>Owned</DisplayName><PublisherDisplayName>Owned</PublisherDisplayName><Logo>logo.png</Logo></Properties>"
+                    "<Prerequisites><OSMinVersion>6.2</OSMinVersion><OSMaxVersionTested>6.2</OSMaxVersionTested></Prerequisites>"
+                    "<Resources><Resource Language=\"en-US\"/></Resources><Applications>"
+                    "<Application Id=\"App\" Executable=\"owned.exe\" EntryPoint=\"Owned.App\">"
+                    "<VisualElements DisplayName=\"Owned\" Logo=\"logo.png\" SmallLogo=\"small.png\" Description=\"Owned\" ForegroundText=\"light\" BackgroundColor=\"#222222\"><SplashScreen Image=\"splash.png\"/></VisualElements>"
+                    "</Application></Applications></Package>";}
+                check(xboxone::inventory::fingerprint(xml,manifest_hash,error) &&
+                    xboxone::appmodel::read_manifest(xml,manifest_hash,expected,error) && expected.device_families.empty() && !expected.unsupported_contracts.empty(),
+                    "Appx 2010 metadata preserves absent device families and explicit unsupported activation contracts");
+                set_title_package_root(root.wstring(),"owned.exe",hash);
+                check(get(factory,&current)==S_OK && current,"Current supports verified legacy metadata without host deployment");
+                if(current) {
+                    IInspectable* id=nullptr;
+                    check(reinterpret_cast<Get>((*reinterpret_cast<void***>(current))[6])(current,&id)==S_OK && id,"legacy Package.Id is retained");
+                    if(id) {
+                        std::array<USHORT,4> version{};
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,USHORT*)>((*reinterpret_cast<void***>(id))[7])(id,version.data())==S_OK &&
+                            version==std::array<USHORT,4>{1,2,3,4},"legacy version preserves all four distinct components");
+                        id->Release();
+                    }
+                    current->Release();
+                }
+                factory->Release();
+            }
+            set_title_package_root(package);
+            std::filesystem::remove(exe);std::filesystem::remove(xml);std::filesystem::remove(root);
+        }
         Statics* statics = nullptr;
         const HMODULE legacy_cx = GetModuleHandleW(L"vccorlib110.dll");
         if (legacy_cx) {

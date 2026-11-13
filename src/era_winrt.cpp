@@ -28,6 +28,7 @@ struct TitleClass {
     HRESULT (*factory)(REFIID, void**);
 };
 constexpr TitleClass title_classes[]{
+    {L"Windows.ApplicationModel.Package", &package_factory},
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
     {L"Windows.Xbox.System.User", &xbox_user_factory},
     {L"Windows.Xbox.Input.Controller", &xbox_controller_factory},

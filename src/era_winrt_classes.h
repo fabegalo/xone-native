@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 
+namespace xboxone::appmodel { struct Manifest; }
 namespace xboxone::era {
 
 // Windows.Xbox.Services.XboxLiveConfiguration (static class).
@@ -17,6 +18,8 @@ HRESULT xbox_live_configuration_factory(REFIID iid, void** factory);
 // EntryPoint of the package manifest's first Application element.
 HRESULT title_entry_point(std::wstring& entry_point);
 HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed);
+HRESULT title_package_metadata(appmodel::Manifest& manifest, std::wstring& root, std::string& revision);
+HRESULT package_factory(REFIID iid, void** factory);
 // HWND behind a CoreWindow handed to the title, or null if `window` is not ours.
 HWND core_window_hwnd(const void* window);
 // Windows.Xbox.System.User (statics; observed slots only).

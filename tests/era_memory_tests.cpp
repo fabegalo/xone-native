@@ -684,6 +684,9 @@ int main(int argc, char** argv) {
         hr = create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_D32_FLOAT,UINT_MAX,layout,D3D11_BIND_DEPTH_STENCIL);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,4,11,nullptr),
             "expanded D32 image preserves GPU depth clear bits, aliases, guards, fences and CPU reuse");
+        hr = create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_B5G6R5_UNORM,UINT_MAX,layout,D3D11_BIND_SHADER_RESOURCE);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,2,13,nullptr),
+            "original RGB565 layout preserves all packed bits through native GPU copies and canonical CPU reuse");
     } else if (original_xg) {
         TitleTextureLayout layout;
         hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);

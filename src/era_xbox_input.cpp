@@ -68,6 +68,30 @@ HRESULT STDMETHODCALLTYPE controller_type(Controller*, HSTRING* out) {
     if (!out) return E_POINTER;
     return WindowsCreateString(L"Windows.Xbox.Input.Gamepad", 26, out);
 }
+HRESULT STDMETHODCALLTYPE raw_gamepad_reading(Gamepad* self,RawGamepadReading* out) {
+    if (!out) return E_POINTER;
+    *out = {};
+    if (!host().get) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    XINPUT_STATE state{};
+    const DWORD error=host().get(self->owner->index,&state);
+    if (error) return HRESULT_FROM_WIN32(error);
+    LARGE_INTEGER counter{},frequency{};
+    if (!QueryPerformanceCounter(&counter) || !QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0)
+        return E_FAIL;
+    RawGamepadReading value{};
+    value.timestamp=UINT64(counter.QuadPart/frequency.QuadPart)*10000000 +
+        UINT64(counter.QuadPart%frequency.QuadPart)*10000000/UINT64(frequency.QuadPart);
+    const UINT buttons=state.Gamepad.wButtons;
+    value.buttons=((buttons&0xf)<<8) | ((buttons&0x30)>>2) | ((buttons&0xc0)<<8) |
+        ((buttons&0x300)<<4) | ((buttons&0xf000)>>8);
+    value.left_trigger=state.Gamepad.bLeftTrigger/255.f;
+    value.right_trigger=state.Gamepad.bRightTrigger/255.f;
+    const auto axis=[](SHORT v){return v/(v<0 ? 32768.f : 32767.f);};
+    value.left_x=axis(state.Gamepad.sThumbLX); value.left_y=axis(state.Gamepad.sThumbLY);
+    value.right_x=axis(state.Gamepad.sThumbRX); value.right_y=axis(state.Gamepad.sThumbRY);
+    *out=value;
+    return S_OK;
+}
 Controller* make_controller(DWORD index) {
     static const auto table = [] {
         auto t = winrt_vtable();
@@ -84,6 +108,7 @@ Controller* make_controller(DWORD index) {
             auto t = winrt_vtable();
             t[0] = reinterpret_cast<const void*>(&dynamic_query<Gamepad>);
             t[1] = reinterpret_cast<const void*>(&gamepad_retain); t[2] = reinterpret_cast<const void*>(&gamepad_release);
+            t[8] = reinterpret_cast<const void*>(&raw_gamepad_reading); // Reference 14019a690 copies exactly 40 bytes.
             return t;
         }();
         static_cast<WinrtObject&>(object->gamepad) = {pad_table.data(), gamepad_class, iid_gamepad, &gamepad_query};

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/era_loader.h"
 #include "era_memory.h"
+#include "era_audio.h"
 #include "era_display.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -485,7 +486,14 @@ HANDLE WINAPI era_CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURIT
                                FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
     if (((access & mutation) || disposition != OPEN_EXISTING || (flags & FILE_FLAG_DELETE_ON_CLOSE)) &&
         !writable_path(path)) return INVALID_HANDLE_VALUE;
-    return CreateFileW(path, access, share, security, disposition, flags, template_file);
+    const HANDLE file=CreateFileW(path, access, share, security, disposition, flags, template_file);
+    const DWORD error=GetLastError();
+    if(file==INVALID_HANDLE_VALUE && stop_on_missing_service() && (error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND)) {
+        static std::atomic<UINT> missing_files{0};
+        if(missing_files.fetch_add(1)<8) std::fprintf(stderr,"xone-era: content open failed Win32 %lu path %ls\n",error,path ? path : L"<null>");
+    }
+    SetLastError(error);
+    return file;
 }
 
 HANDLE WINAPI era_CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
@@ -493,6 +501,10 @@ HANDLE WINAPI era_CreateFileA(LPCSTR path, DWORD access, DWORD share, LPSECURITY
     const auto wide = wide_path(path);
     if (wide.empty()) return INVALID_HANDLE_VALUE;
     return era_CreateFileW(wide.c_str(), access, share, security, disposition, flags, template_file);
+}
+FARPROC WINAPI era_GetProcAddress(HMODULE module,LPCSTR name) {
+    if (const auto audio = resolve_xaudio2_export(module,name)) return audio;
+    return GetProcAddress(module,name);
 }
 
 HANDLE WINAPI era_CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD disposition,
@@ -1323,6 +1335,7 @@ void* resolve_kernelx(const ImportRequest& request) {
     if (request.name == "DeleteFileW") return reinterpret_cast<void*>(&era_DeleteFileW);
     if (request.name == "DeleteFileA") return reinterpret_cast<void*>(&era_DeleteFileA);
     if (request.name == "CreateFileW") return reinterpret_cast<void*>(&era_CreateFileW);
+    if (request.name == "GetProcAddress") return reinterpret_cast<void*>(&era_GetProcAddress);
     if (request.name == "CreateFileA") return reinterpret_cast<void*>(&era_CreateFileA);
     if (request.name == "CreateFile2") return reinterpret_cast<void*>(&era_CreateFile2);
     if (request.name == "WriteFile") return reinterpret_cast<void*>(&era_WriteFile);

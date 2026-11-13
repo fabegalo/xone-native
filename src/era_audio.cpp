@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <initguid.h>
 #include "era_audio.h"
+#include "xboxone_native/era_loader.h"
 #include <audioclient.h>
+#include <xaudio2.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -14,6 +17,87 @@
 namespace xboxone::era {
 namespace {
 using Microsoft::WRL::ComPtr;
+HMODULE host_xaudio2() {
+    static const HMODULE module = [] {
+        wchar_t system[MAX_PATH]{};
+        const UINT length=GetSystemDirectoryW(system,MAX_PATH);
+        if (!length || length>=MAX_PATH) return HMODULE{};
+        const std::wstring path=std::wstring(system,length)+L"\\xaudio2_9.dll";
+        return LoadLibraryExW(path.c_str(),nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }();
+    return module;
+}
+class XAudioEngine final : public IXAudio2 {
+    std::atomic<ULONG> refs{1};
+    ComPtr<IXAudio2> host;
+public:
+    explicit XAudioEngine(IXAudio2* engine) : host(engine) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(IXAudio2)) return E_NOINTERFACE;
+        *out = static_cast<IXAudio2*>(this); AddRef(); return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override { auto left=--refs; if (!left) delete this; return left; }
+    HRESULT STDMETHODCALLTYPE RegisterForCallbacks(IXAudio2EngineCallback* callback) override { return host->RegisterForCallbacks(callback); }
+    void STDMETHODCALLTYPE UnregisterForCallbacks(IXAudio2EngineCallback* callback) override { host->UnregisterForCallbacks(callback); }
+    HRESULT STDMETHODCALLTYPE CreateSourceVoice(IXAudio2SourceVoice** out,const WAVEFORMATEX* format,UINT32 flags,float ratio,
+            IXAudio2VoiceCallback* callback,const XAUDIO2_VOICE_SENDS* sends,const XAUDIO2_EFFECT_CHAIN* effects) override {
+        // PCM/float voice and callback slots match the observed Xbox ABI. Other
+        // codecs and XAPO contracts need validation before reaching the host.
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (!format) return E_INVALIDARG;
+        if ((format->wFormatTag != WAVE_FORMAT_PCM && format->wFormatTag != WAVE_FORMAT_IEEE_FLOAT) || format->cbSize || effects)
+            return E_NOTIMPL;
+        return host->CreateSourceVoice(out,format,flags,ratio,callback,sends,nullptr);
+    }
+    HRESULT STDMETHODCALLTYPE CreateSubmixVoice(IXAudio2SubmixVoice** out,UINT32 channels,UINT32 rate,UINT32 flags,UINT32 stage,
+            const XAUDIO2_VOICE_SENDS* sends,const XAUDIO2_EFFECT_CHAIN* effects) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (effects) return E_NOTIMPL;
+        return host->CreateSubmixVoice(out,channels,rate,flags,stage,sends,nullptr);
+    }
+    HRESULT STDMETHODCALLTYPE CreateMasteringVoice(IXAudio2MasteringVoice** out,UINT32 channels,UINT32 rate,UINT32 flags,
+            LPCWSTR id,const XAUDIO2_EFFECT_CHAIN* effects,AUDIO_STREAM_CATEGORY category) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (id || effects) return E_NOTIMPL;
+        // Xbox default is an eight-channel 48 kHz mix. The host audio engine
+        // performs the real endpoint conversion; retain all logical channels.
+        return host->CreateMasteringVoice(out,channels ? channels : 8,rate ? rate : 48000,flags,nullptr,nullptr,category);
+    }
+    HRESULT STDMETHODCALLTYPE StartEngine() override { return host->StartEngine(); }
+    void STDMETHODCALLTYPE StopEngine() override { host->StopEngine(); }
+    HRESULT STDMETHODCALLTYPE CommitChanges(UINT32 operation) override { return host->CommitChanges(operation); }
+    void STDMETHODCALLTYPE GetPerformanceData(XAUDIO2_PERFORMANCE_DATA*) override { unsupported("GetPerformanceData layout"); }
+    void STDMETHODCALLTYPE SetDebugConfiguration(const XAUDIO2_DEBUG_CONFIGURATION*,void*) override { unsupported("SetDebugConfiguration layout"); }
+private:
+    static void unsupported(const char* operation) {
+        std::fprintf(stderr,"xone-era: XAudio2 %s is not implemented\n",operation);
+        if (stop_on_missing_service()) ExitProcess(125);
+        RaiseFailFastException(nullptr,nullptr,0);
+    }
+};
+HRESULT WINAPI create_xaudio2_object(IXAudio2** out,UINT32 flags,UINT32 processor,void* reserved) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (flags || !processor || (processor & ~0xffu) || reserved) {
+        std::fprintf(stderr,"xone-era: unsupported XAudio2 creation flags 0x%X processor 0x%X reserved %p\n",flags,processor,reserved);
+        return E_NOTIMPL;
+    }
+    using Create = HRESULT(WINAPI*)(IXAudio2**,UINT32,XAUDIO2_PROCESSOR);
+    const auto create = reinterpret_cast<Create>(GetProcAddress(host_xaudio2(),"XAudio2Create"));
+    if (!create) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    ComPtr<IXAudio2> engine;
+    // Logical Xbox processor indices are not physical Windows CPU indices.
+    HRESULT hr = create(&engine,0,XAUDIO2_DEFAULT_PROCESSOR);
+    if (FAILED(hr)) return hr;
+    try { *out = new XAudioEngine(engine.Get()); return S_OK; }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
 void audio_error(const char* operation, HRESULT hr) {
     static std::atomic<unsigned> count{0};
     const unsigned n = count.fetch_add(1);
@@ -240,5 +324,10 @@ HRESULT wrap_audio_enumerator(IMMDeviceEnumerator* host, REFIID iid, void** out)
         object->Release();
         return hr;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+FARPROC resolve_xaudio2_export(HMODULE module,LPCSTR name) {
+    if (reinterpret_cast<ULONG_PTR>(name) <= 0xffff || std::strcmp(name,"CreateXAudio2Object") != 0) return nullptr;
+    if (!module || module != host_xaudio2()) return nullptr;
+    return reinterpret_cast<FARPROC>(&create_xaudio2_object);
 }
 } // namespace xboxone::era

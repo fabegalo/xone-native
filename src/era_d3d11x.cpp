@@ -122,6 +122,15 @@ struct alignas(64) Context : GraphicsObject {
     bool automatic_gpu_flush = false;
     std::array<BufferView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets{};
     BufferView* depth_target = nullptr;
+    std::array<D3D11_VIEWPORT,D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports{};
+    UINT viewport_count = 0;
+    RasterState* raster_state = nullptr;
+    DepthState* depth_state = nullptr;
+    BlendState* blend_state = nullptr;
+    UINT stencil_reference = 0, sample_mask = UINT_MAX;
+    std::array<FLOAT,4> blend_factor{1,1,1,1};
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> command_allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
     ~Context();
 };
 static_assert(offsetof(Context, private_data) == 24 && offsetof(Context, functions) == 0x3d0);
@@ -216,6 +225,11 @@ struct alignas(16) Texture : GraphicsObject {
     void* canonical = nullptr; // Borrowed placement memory; the registry pins its backing.
     std::array<UINT32, 8> descriptor{};
     TitleGpuResource gpu;
+    TitleTextureLayout layout;
+    std::vector<std::uint8_t> mapped_linear, mapped_tiled;
+    void* mapped_canonical = nullptr;
+    UINT mapped_row_pitch = 0, mapped_slice_pitch = 0;
+    UINT64 gpu_fence_value = 0;
     Microsoft::WRL::ComPtr<ID3D12Fence> creation_fence;
     ~Texture();
 };
@@ -563,6 +577,8 @@ struct ValidatedShader {
         ID3DBlob* decoded = nullptr;
         if (SUCCEEDED(hr)) hr = disassemble ? disassemble(code.data(), bytes, 0, nullptr, &decoded) : E_NOINTERFACE;
         if (decoded) decoded->Release();
+        if (FAILED(hr) && stop_on_missing_service())
+            std::fprintf(stderr, "xone-era: shader validation failed stage %u bytes %zu HRESULT 0x%08lX\n", stage, bytes, hr);
         return hr;
     }
 };
@@ -629,7 +645,7 @@ HRESULT STDMETHODCALLTYPE device_create_shader(Device* self, const void* bytecod
         auto shader = std::make_unique<Shader>();
         shader->code = std::move(validated.code);
         shader->vtable = shader_vtable().data();
-        shader->flags = 1; shader->refcount = 0;
+        shader->flags = self->legacy ? 1 : 0; shader->refcount = self->legacy ? 0 : 1;
         shader->device = self; shader->stage = Stage;
         retain_device(self);
         *out = shader.release();
@@ -718,7 +734,7 @@ HRESULT STDMETHODCALLTYPE device_create_input_layout(Device* self, const D3D12_I
         layout->signature.assign(data, data + blob->GetBufferSize());
         if (!out) return S_FALSE;
         layout->vtable = input_layout_vtable().data();
-        layout->flags = 1; layout->refcount = 0; layout->device = self;
+        layout->flags = self->legacy ? 1 : 0; layout->refcount = self->legacy ? 0 : 1; layout->device = self;
         retain_device(self); *out = layout.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -783,10 +799,10 @@ HRESULT STDMETHODCALLTYPE device_create_depth_state(Device* self, const D3D12_DE
         }
         if (self->depth_states.size() == 4096) return D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS;
         auto state = std::make_unique<DepthState>();
-        state->vtable = depth_state_vtable().data(); state->flags = 1; state->refcount = 0;
+        state->vtable = depth_state_vtable().data(); state->flags = self->legacy ? 1 : 0; state->refcount = self->legacy ? 0 : 1;
         state->device = self; state->desc = desc; state->key = key;
         self->depth_states.emplace(key, state.get());
-        ++self->legacy_dependents;
+        if (self->legacy) ++self->legacy_dependents; else add_ref(self);
         *out = state.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -844,13 +860,20 @@ HRESULT STDMETHODCALLTYPE device_create_sampler(Device* self, const D3D12_SAMPLE
         (base == 0x55 && !desc.MaxAnisotropy) ||
         (filter == (base | 0x80) && (desc.ComparisonFunc < D3D12_COMPARISON_FUNC_NEVER || desc.ComparisonFunc > D3D12_COMPARISON_FUNC_ALWAYS)) ||
         static_cast<UINT>(desc.ComparisonFunc) > 8) return E_INVALIDARG;
-    // The observed native constructor emits border type zero. Custom border
-    // tables need their own console contract; do not silently substitute black.
-    for (float color : desc.BorderColor) if (color != 0) return DXGI_ERROR_UNSUPPORTED;
+    // D3D11X_SAMPLER_DESC word 3 has a two-bit standard border type.
+    // Indexed custom palettes still require their own console contract.
+    constexpr float borders[3][4]{{0,0,0,0},{0,0,0,1},{1,1,1,1}};
+    UINT border = 0;
+    while (border < 3 && !std::equal(std::begin(desc.BorderColor),std::end(desc.BorderColor),borders[border])) ++border;
+    if (border == 3) {
+        if (stop_on_missing_service()) std::fprintf(stderr, "xone-era: unsupported sampler border {%g,%g,%g,%g}\n",
+            desc.BorderColor[0],desc.BorderColor[1],desc.BorderColor[2],desc.BorderColor[3]);
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     if (!out) return S_FALSE;
     try {
         auto sampler = std::make_unique<Sampler>();
-        sampler->vtable = sampler_vtable().data(); sampler->flags = 1; sampler->refcount = 0;
+        sampler->vtable = sampler_vtable().data(); sampler->flags = self->legacy ? 1 : 0; sampler->refcount = self->legacy ? 0 : 1;
         sampler->device = self; sampler->desc = desc;
         std::memcpy(sampler->key.data(), &desc, sizeof desc);
         // 6.2.11295 sampler SRD fields verified at 1800b1e70/18009ef70.
@@ -869,6 +892,7 @@ HRESULT STDMETHODCALLTYPE device_create_sampler(Device* self, const D3D12_SAMPLE
         const UINT xy_mag = base == 0x55 ? 3 : (base >> 2) & 1;
         const UINT mip = base == 0x55 ? 2 : (base & 1) + 1;
         sampler->descriptor[2] = (static_cast<UINT>(bias) & 0x3fff) | (xy_mag << 20) | (xy_min << 22) | (mip << 26) | 0x70000000;
+        sampler->descriptor[3] = border << 30;
         // Host sampling uses the effective quantized console values, while
         // GetDesc preserves the original request and GetDescX exposes the SRD.
         D3D12_SAMPLER_DESC host = desc;
@@ -893,7 +917,7 @@ HRESULT STDMETHODCALLTYPE device_create_sampler(Device* self, const D3D12_SAMPLE
         self->samplers.emplace(sampler->key, sampler.get());
         self->d3d12->CreateSampler(&host, sampler->host);
         self->sampler_slots[slot] = sampler.get();
-        ++self->legacy_dependents;
+        if (self->legacy) ++self->legacy_dependents; else add_ref(self);
         *out = sampler.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -965,7 +989,7 @@ HRESULT STDMETHODCALLTYPE device_create_blend_state(Device* self, const D3D11_BL
     if (!out) return S_FALSE;
     try {
         auto state = std::make_unique<BlendState>();
-        state->vtable = blend_state_vtable().data(); state->flags = 1; state->refcount = 0;
+        state->vtable = blend_state_vtable().data(); state->flags = self->legacy ? 1 : 0; state->refcount = self->legacy ? 0 : 1;
         state->device = self; state->desc = desc; state->host = host;
         state->key[0] = host.AlphaToCoverageEnable; state->key[1] = host.IndependentBlendEnable;
         for (UINT i = 0; i < 8; ++i) {
@@ -980,7 +1004,7 @@ HRESULT STDMETHODCALLTYPE device_create_blend_state(Device* self, const D3D11_BL
             add_ref(existing->second); *out = existing->second; return S_OK;
         }
         if (self->blend_states.size() == 4096) return D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS;
-        self->blend_states.emplace(state->key, state.get()); ++self->legacy_dependents;
+        self->blend_states.emplace(state->key, state.get()); if (self->legacy) ++self->legacy_dependents; else add_ref(self);
         *out = state.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -1028,7 +1052,7 @@ HRESULT STDMETHODCALLTYPE device_create_raster_state(Device* self, const D3D11_R
     if (!out) return S_FALSE;
     try {
         auto state = std::make_unique<RasterState>();
-        state->vtable = raster_state_vtable().data(); state->flags = 1; state->refcount = 0; state->device = self;
+        state->vtable = raster_state_vtable().data(); state->flags = self->legacy ? 1 : 0; state->refcount = self->legacy ? 0 : 1; state->device = self;
         desc.FrontCounterClockwise = desc.FrontCounterClockwise != FALSE; desc.DepthClipEnable = desc.DepthClipEnable != FALSE;
         desc.ScissorEnable = desc.ScissorEnable != FALSE; desc.MultisampleEnable = desc.MultisampleEnable != FALSE;
         desc.AntialiasedLineEnable = desc.AntialiasedLineEnable != FALSE;
@@ -1048,7 +1072,7 @@ HRESULT STDMETHODCALLTYPE device_create_raster_state(Device* self, const D3D11_R
             add_ref(existing->second); *out = existing->second; return S_OK;
         }
         if (self->raster_states.size() == 4096) return D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS;
-        self->raster_states.emplace(state->key, state.get()); ++self->legacy_dependents;
+        self->raster_states.emplace(state->key, state.get()); if (self->legacy) ++self->legacy_dependents; else add_ref(self);
         *out = state.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -1090,7 +1114,9 @@ void STDMETHODCALLTYPE buffer_get_device(Buffer* self, void** out) {
 }
 void STDMETHODCALLTYPE buffer_get_type(Buffer*, D3D11_RESOURCE_DIMENSION* out) { if (out) *out = D3D11_RESOURCE_DIMENSION_BUFFER; }
 void STDMETHODCALLTYPE buffer_get_descriptor(Buffer* self, void** out) { if (out) *out = self; } // Native descriptor is a resource reference.
-void STDMETHODCALLTYPE buffer_get_desc(Buffer* self, LegacyBufferDesc* out) { if (out) *out = self->desc; }
+void STDMETHODCALLTYPE buffer_get_desc(Buffer* self, LegacyBufferDesc* out) {
+    if (out) std::memcpy(out,&self->desc,self->device->legacy ? sizeof self->desc : sizeof self->desc.standard);
+}
 const std::array<const void*, vtable_slots>& buffer_vtable() {
     static const auto table = [] {
         auto t = traps<kind_buffer>();
@@ -1107,11 +1133,12 @@ const std::array<const void*, vtable_slots>& buffer_vtable() {
 }
 HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferDesc* input, const D3D11_SUBRESOURCE_DATA* initial, void** out) {
     if (out) *out = nullptr;
-    if (!self->legacy) return DXGI_ERROR_UNSUPPORTED;
+    if (!self->legacy && !modern_display_abi_bound) return DXGI_ERROR_UNSUPPORTED;
     LegacyBufferDesc desc{};
     D3D11_SUBRESOURCE_DATA data{};
     SIZE_T read = 0;
-    if (!input || !ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc) return E_INVALIDARG;
+    const SIZE_T descriptor_bytes = self->legacy ? sizeof desc : sizeof desc.standard;
+    if (!input || !ReadProcessMemory(GetCurrentProcess(), input, &desc, descriptor_bytes, &read) || read != descriptor_bytes) return E_INVALIDARG;
     const auto& d = desc.standard;
     if (!d.ByteWidth || static_cast<UINT>(d.Usage) > D3D11_USAGE_STAGING) return E_INVALIDARG;
     const bool structured = (d.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0;
@@ -1138,7 +1165,7 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
     if (!out) return S_FALSE;
     try {
         auto buffer = std::make_unique<Buffer>();
-        buffer->vtable = buffer_vtable().data(); buffer->flags = 1; buffer->refcount = 0;
+        buffer->vtable = buffer_vtable().data(); buffer->flags = self->legacy ? 1 : 0; buffer->refcount = self->legacy ? 0 : 1;
         buffer->device = self; buffer->desc = desc;
         HRESULT hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&buffer->creation_fence));
         if (FAILED(hr)) return hr;
@@ -1163,8 +1190,8 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
 }
 
 Texture::~Texture() {
-    // Title GPU commands still trap. This binding has no submitted title work.
-    if (gpu.resource && FAILED(release_title_gpu_resource(gpu, creation_fence.Get(), 0)))
+    // Supported title commands retire synchronously before releasing ownership.
+    if (gpu.resource && FAILED(release_title_gpu_resource(gpu, creation_fence.Get(), gpu_fence_value)))
         default_trap("placed texture retirement", 2);
     if (allocation_attributes && canonical) {
         const auto release = reinterpret_cast<FreeBufferMemory>(resolve_kernelx({"kernelx.dll", "XMemFree", 0}));
@@ -1214,6 +1241,7 @@ HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const Titl
         texture->vtable = texture_vtable().data(); texture->flags = self->legacy ? 1 : 0; texture->refcount = self->legacy ? 0 : 1;
         texture->device = self; texture->desc = desc; texture->desc.standard.MipLevels = layout.resource_desc.MipLevels;
         texture->creation_misc_flags = desc.standard.MiscFlags;
+        texture->layout = layout;
         texture->desc.standard.MiscFlags &= ~legacy_expanded_auxiliary;
         HRESULT hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&texture->creation_fence));
         if (FAILED(hr)) return hr;
@@ -1249,8 +1277,11 @@ HRESULT STDMETHODCALLTYPE device_create_texture2d(Device* self, const LegacyText
     const auto& d = desc.standard;
     if (!d.Width || !d.Height || !d.ArraySize) return E_INVALIDARG;
     const bool multisample = d.SampleDesc.Count > 1;
+    const bool dynamic = !self->legacy && d.Usage == D3D11_USAGE_DYNAMIC &&
+        (d.Format == DXGI_FORMAT_B5G6R5_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
     if (!d.SampleDesc.Count || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1))) return E_INVALIDARG;
-    if ((!self->legacy && !modern_display_abi_bound) || initial || desc.extension[0] || desc.extension[1] || d.Usage != D3D11_USAGE_DEFAULT ||
+    if ((!self->legacy && !modern_display_abi_bound) || initial || desc.extension[0] || desc.extension[1] || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
+        (dynamic && (d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.MiscFlags)) ||
         d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~legacy_expanded_auxiliary) || !d.BindFlags ||
         ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & D3D11_BIND_RENDER_TARGET))) ||
         (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & D3D11_BIND_RENDER_TARGET) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
@@ -1718,7 +1749,7 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
         if (!out) return S_FALSE;
         try {
             auto view = std::make_unique<BufferView>();
-            view->vtable = srv_vtable().data(); view->flags = 1; view->refcount = 0;
+            view->vtable = srv_vtable().data(); view->flags = self->legacy ? 1 : 0; view->refcount = self->legacy ? 0 : 1;
             view->view_type = 2; view->device = self;
             view->srv_desc.Format = desc.Format; view->srv_desc.ViewDimension = desc.ViewDimension;
             if (!multisample) view->srv_desc.Texture2D = desc.Texture2D;
@@ -2207,8 +2238,18 @@ const std::array<const void*, vtable_slots>& device_vtable() {
         t[0] = reinterpret_cast<const void*>(&device_query);
         t[1] = reinterpret_cast<const void*>(&device_add_ref);
         t[2] = reinterpret_cast<const void*>(&device_release);
+        t[3] = reinterpret_cast<const void*>(&device_create_buffer);
+        t[11] = reinterpret_cast<const void*>(&device_create_input_layout);
+        t[12] = reinterpret_cast<const void*>(&device_create_shader<1>);
+        t[13] = reinterpret_cast<const void*>(&device_create_shader<2>);
+        t[15] = reinterpret_cast<const void*>(&device_create_shader<0>);
+        t[20] = reinterpret_cast<const void*>(&device_create_blend_state);
+        t[21] = reinterpret_cast<const void*>(&device_create_depth_state);
+        t[22] = reinterpret_cast<const void*>(&device_create_raster_state);
+        t[23] = reinterpret_cast<const void*>(&device_create_sampler);
         t[9] = reinterpret_cast<const void*>(&device_create_rtv);
         t[5] = reinterpret_cast<const void*>(&device_create_texture2d);
+        t[7] = reinterpret_cast<const void*>(&device_create_srv);
         t[10] = reinterpret_cast<const void*>(&device_create_dsv);
         t[85] = reinterpret_cast<const void*>(&device_set_gpu_memory_priority);
         return t;
@@ -2261,6 +2302,29 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
 Context::~Context() {
     for (auto* view : render_targets) if (view) view_release(view);
     if (depth_target) view_release(depth_target);
+    if (raster_state) raster_state_release(raster_state);
+    if (depth_state) depth_state_release(depth_state);
+    if (blend_state) blend_state_release(blend_state);
+}
+void STDMETHODCALLTYPE context_set_raster(Context* self,RasterState* state) {
+    if(state && (state->vtable!=raster_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",44);return;}
+    if(state) add_ref(state);
+    if(self->raster_state) raster_state_release(self->raster_state);
+    self->raster_state=state;
+}
+void STDMETHODCALLTYPE context_set_depth_state(Context* self,DepthState* state,UINT reference) {
+    if(state && (state->vtable!=depth_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",37);return;}
+    if(state) add_ref(state);
+    if(self->depth_state) depth_state_release(self->depth_state);
+    self->depth_state=state; self->stencil_reference=reference;
+}
+void STDMETHODCALLTYPE context_set_blend(Context* self,BlendState* state,const FLOAT* factor,UINT mask) {
+    if(state && (state->vtable!=blend_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",36);return;}
+    std::array<FLOAT,4> next{1,1,1,1}; SIZE_T read=0;
+    if(factor && (!ReadProcessMemory(GetCurrentProcess(),factor,next.data(),sizeof next,&read) || read!=sizeof next)) {default_trap("ID3D11DeviceContextX",36);return;}
+    if(state) add_ref(state);
+    if(self->blend_state) blend_state_release(self->blend_state);
+    self->blend_state=state; self->blend_factor=next; self->sample_mask=mask;
 }
 void STDMETHODCALLTYPE context_set_render_targets(Context* self, UINT count, BufferView* const* views, BufferView* depth) {
     std::array<BufferView*,D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> next{};
@@ -2280,6 +2344,82 @@ void STDMETHODCALLTYPE context_set_render_targets(Context* self, UINT count, Buf
     if (self->depth_target) view_release(self->depth_target);
     self->render_targets = next; self->depth_target = depth;
 }
+void STDMETHODCALLTYPE context_set_viewports(Context* self, UINT count, const D3D11_VIEWPORT* input) {
+    decltype(self->viewports) next{};
+    SIZE_T read = 0;
+    bool valid = count <= next.size() && (!count || (input &&
+        ReadProcessMemory(GetCurrentProcess(),input,next.data(),count*sizeof(*input),&read) && read == count*sizeof(*input)));
+    for (UINT i = 0; valid && i < count; ++i) {
+        const auto& v = next[i];
+        valid = std::isfinite(v.TopLeftX) && std::isfinite(v.TopLeftY) && std::isfinite(v.Width) && std::isfinite(v.Height) &&
+            std::isfinite(v.MinDepth) && std::isfinite(v.MaxDepth) && v.Width >= 0 && v.Height >= 0 &&
+            v.Width <= D3D11_VIEWPORT_BOUNDS_MAX && v.Height <= D3D11_VIEWPORT_BOUNDS_MAX &&
+            v.TopLeftX >= D3D11_VIEWPORT_BOUNDS_MIN && v.TopLeftY >= D3D11_VIEWPORT_BOUNDS_MIN &&
+            v.TopLeftX + v.Width <= D3D11_VIEWPORT_BOUNDS_MAX && v.TopLeftY + v.Height <= D3D11_VIEWPORT_BOUNDS_MAX &&
+            v.MinDepth >= 0 && v.MinDepth <= 1 && v.MaxDepth >= 0 && v.MaxDepth <= 1;
+    }
+    if (!valid) {
+        (void)trap_slot<kind_context,45>(self,count,reinterpret_cast<std::uintptr_t>(input)); return;
+    }
+    self->viewports = next; self->viewport_count = count;
+}
+void STDMETHODCALLTYPE context_get_viewports(Context* self, UINT* count, D3D11_VIEWPORT* out) {
+    if (!count) return;
+    if (out) {
+        if (*count > self->viewports.size()) {
+            (void)trap_slot<kind_context,96>(self,reinterpret_cast<std::uintptr_t>(count),reinterpret_cast<std::uintptr_t>(out)); return;
+        }
+        std::copy_n(self->viewports.begin(),*count,out);
+    }
+    *count = self->viewport_count;
+}
+HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth) {
+    if (!view || view->device != self->device || !view->resource ||
+        view->resource->vtable != texture_vtable().data() || !view->heap || view->view_type != (color ? 0u : 1u)) return E_INVALIDARG;
+    auto* texture = static_cast<Texture*>(view->resource);
+    HRESULT hr = S_OK;
+    if (!self->command_allocator) hr=self->device->d3d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&self->command_allocator));
+    if (SUCCEEDED(hr)) {
+        if (!self->command_list) hr=self->device->d3d12->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,self->command_allocator.Get(),nullptr,IID_PPV_ARGS(&self->command_list));
+        else {
+            hr=self->command_allocator->Reset();
+            if(SUCCEEDED(hr)) hr=self->command_list->Reset(self->command_allocator.Get(),nullptr);
+        }
+    }
+    if(SUCCEEDED(hr)) hr=begin_title_gpu_texture(texture->gpu,self->command_list.Get(),color ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    if(FAILED(hr)) return hr;
+    if(color) self->command_list->ClearRenderTargetView(view->host,color,0,nullptr);
+    else self->command_list->ClearDepthStencilView(view->host,D3D12_CLEAR_FLAG_DEPTH,depth,0,0,nullptr);
+    hr=end_title_gpu_texture(texture->gpu,self->command_list.Get());
+    if(SUCCEEDED(hr)) hr=self->command_list->Close();
+    if(FAILED(hr)) return hr;
+    ID3D12CommandList* lists[]{self->command_list.Get()};
+    self->device->queue->ExecuteCommandLists(1,lists);
+    const UINT64 value=++texture->gpu_fence_value;
+    hr=self->device->queue->Signal(texture->creation_fence.Get(),value);
+    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(SUCCEEDED(hr) && !completed.IsValid()) hr=HRESULT_FROM_WIN32(GetLastError());
+    if(SUCCEEDED(hr)) hr=texture->creation_fence->SetEventOnCompletion(value,completed.Get());
+    if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if(SUCCEEDED(hr)) hr=complete_title_gpu_resource(texture->gpu,texture->creation_fence.Get(),value);
+    return hr;
+}
+void STDMETHODCALLTYPE context_clear_rtv(Context* self,BufferView* view,const FLOAT* color) {
+    FLOAT value[4]{}; SIZE_T read=0;
+    HRESULT hr=color && ReadProcessMemory(GetCurrentProcess(),color,value,sizeof value,&read) && read==sizeof value ? S_OK : E_INVALIDARG;
+    if(SUCCEEDED(hr)) hr=clear_view(self,view,value,0);
+    if(FAILED(hr)) { std::fprintf(stderr,"xone-era: render-target clear failed 0x%08lX\n",hr); default_trap("ID3D11DeviceContextX",51); }
+}
+void STDMETHODCALLTYPE context_clear_depth(Context* self,BufferView* view,UINT flags,FLOAT depth,UINT8 stencil) {
+    // D32 has no stencil component. A combined clear still clears its depth;
+    // the stencil argument has no storage to modify in this verified format.
+    HRESULT hr=view && view->dsv_desc.Format==DXGI_FORMAT_D32_FLOAT && !(view->dsv_desc.Flags & D3D11_DSV_READ_ONLY_DEPTH) &&
+        (flags & D3D11_CLEAR_DEPTH) && !(flags & ~(D3D11_CLEAR_DEPTH|D3D11_CLEAR_STENCIL)) && std::isfinite(depth) ? S_OK : DXGI_ERROR_UNSUPPORTED;
+    if(SUCCEEDED(hr)) hr=clear_view(self,view,nullptr,std::clamp(depth,0.f,1.f));
+    if(FAILED(hr)) { std::fprintf(stderr,"xone-era: depth clear failed 0x%08lX flags 0x%X depth %g stencil %u\n",hr,flags,depth,stencil); default_trap("ID3D11DeviceContextX",54); }
+}
+HRESULT STDMETHODCALLTYPE context_map_modern(Context*,GraphicsObject*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*);
+void STDMETHODCALLTYPE context_unmap_modern(Context*,GraphicsObject*);
 const std::array<const void*, vtable_slots>& context_vtable() {
     static const auto table = [] {
         auto t = traps<kind_context>();
@@ -2288,6 +2428,15 @@ const std::array<const void*, vtable_slots>& context_vtable() {
         t[2] = reinterpret_cast<const void*>(&context_release);
         t[3] = reinterpret_cast<const void*>(&context_get_device);
         t[34] = reinterpret_cast<const void*>(&context_set_render_targets);
+        t[16] = reinterpret_cast<const void*>(&context_map_modern);
+        t[17] = reinterpret_cast<const void*>(&context_unmap_modern);
+        t[45] = reinterpret_cast<const void*>(&context_set_viewports);
+        t[96] = reinterpret_cast<const void*>(&context_get_viewports);
+        t[51] = reinterpret_cast<const void*>(&context_clear_rtv);
+        t[54] = reinterpret_cast<const void*>(&context_clear_depth);
+        t[44] = reinterpret_cast<const void*>(&context_set_raster);
+        t[37] = reinterpret_cast<const void*>(&context_set_depth_state);
+        t[36] = reinterpret_cast<const void*>(&context_set_blend);
         return t;
     }();
     return table;
@@ -2351,10 +2500,68 @@ void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource, UIN
     if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self->device || subresource ||
         FAILED(unmap_title_gpu_resource(resource->gpu))) default_trap("ID3D11DeviceContextX", 16);
 }
+HRESULT STDMETHODCALLTYPE context_map_modern(Context* self,GraphicsObject* resource,UINT subresource,
+        D3D11_MAP mode,UINT flags,D3D11_MAPPED_SUBRESOURCE* out) {
+    if (!out) return E_POINTER;
+    *out = {};
+    if (!resource || !modern_display_abi_bound || self->device->legacy) return E_INVALIDARG;
+    if (resource->vtable == buffer_vtable().data())
+        return context_map_buffer(self,static_cast<Buffer*>(resource),subresource,mode,flags,out);
+    if (resource->vtable != texture_vtable().data()) return E_INVALIDARG;
+    auto* texture = static_cast<Texture*>(resource);
+    const auto& d = texture->desc.standard;
+    if (texture->device != self->device || subresource || d.Usage != D3D11_USAGE_DYNAMIC ||
+        texture->volume || d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
+        (d.Format != DXGI_FORMAT_B5G6R5_UNORM && d.Format != DXGI_FORMAT_B8G8R8A8_UNORM)) return E_INVALIDARG;
+    if (self->deferred || flags || mode != D3D11_MAP_WRITE_DISCARD) return DXGI_ERROR_UNSUPPORTED;
+    if (texture->mapped_canonical) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    self->device->d3d12->GetCopyableFootprints(&texture->layout.resource_desc,0,1,0,&footprint,nullptr,nullptr,nullptr);
+    const UINT64 slice = UINT64(footprint.Footprint.RowPitch)*d.Height;
+    if (!slice || slice > UINT_MAX) return E_OUTOFMEMORY;
+    try {
+        texture->mapped_linear.assign(static_cast<std::size_t>(slice),0);
+        texture->mapped_tiled.resize(texture->layout.bytes);
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    void* canonical = nullptr;
+    const HRESULT hr = map_title_gpu_resource(texture->gpu,&canonical);
+    if (FAILED(hr)) return hr;
+    // Keep the canonical preimage until the original XG retile succeeds.
+    std::memcpy(texture->mapped_tiled.data(),canonical,texture->layout.bytes);
+    texture->mapped_canonical = canonical;
+    texture->mapped_row_pitch = footprint.Footprint.RowPitch;
+    texture->mapped_slice_pitch = static_cast<UINT>(slice);
+    out->pData = texture->mapped_linear.data(); out->RowPitch = texture->mapped_row_pitch; out->DepthPitch = texture->mapped_slice_pitch;
+    return S_OK;
+}
+void STDMETHODCALLTYPE context_unmap_modern(Context* self,GraphicsObject* resource) {
+    if (resource && resource->vtable == buffer_vtable().data()) {
+        context_unmap_buffer(self,static_cast<Buffer*>(resource),0); return;
+    }
+    if (!resource || resource->vtable != texture_vtable().data()) { default_trap("ID3D11DeviceContextX",17); return; }
+    auto* texture = static_cast<Texture*>(resource);
+    if (texture->device != self->device || !texture->mapped_canonical) { default_trap("ID3D11DeviceContextX",17); return; }
+    const auto& layout = texture->layout;
+    const HRESULT hr = layout.copy(layout.context.get(),true,texture->mapped_linear.data(),texture->mapped_tiled.data(),0,
+        texture->mapped_row_pitch,texture->mapped_slice_pitch);
+    if (FAILED(hr)) { default_trap("texture retile",17); return; }
+    std::memcpy(texture->mapped_canonical,texture->mapped_tiled.data(),layout.bytes);
+    if (FAILED(unmap_title_gpu_resource(texture->gpu))) { default_trap("texture CPU retirement",17); return; }
+    texture->mapped_canonical = nullptr;
+    texture->mapped_linear.clear(); texture->mapped_tiled.clear();
+}
 const std::array<const void*, vtable_slots>& legacy_context_vtable() {
     static const auto table = [] {
         auto t = context_vtable();
         t[34] = reinterpret_cast<const void*>(&trap_slot<kind_context,34>);
+        t[45] = reinterpret_cast<const void*>(&trap_slot<kind_context,45>);
+        t[96] = reinterpret_cast<const void*>(&trap_slot<kind_context,96>);
+        t[51] = reinterpret_cast<const void*>(&trap_slot<kind_context,51>);
+        t[54] = reinterpret_cast<const void*>(&trap_slot<kind_context,54>);
+        t[44] = reinterpret_cast<const void*>(&trap_slot<kind_context,44>);
+        t[37] = reinterpret_cast<const void*>(&trap_slot<kind_context,37>);
+        t[36] = reinterpret_cast<const void*>(&trap_slot<kind_context,36>);
+        t[17] = reinterpret_cast<const void*>(&trap_slot<kind_context,17>);
         t[15] = reinterpret_cast<const void*>(&context_map_buffer); // Original 18000ff10, not desktop slot 14.
         t[16] = reinterpret_cast<const void*>(&context_unmap_buffer); // Original 1800104f0.
         t[24] = reinterpret_cast<const void*>(&context_unbind_geometry_shader);
@@ -2678,9 +2885,11 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
     if ((!bc7 && format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
          format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
          format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB && format != DXGI_FORMAT_R32_FLOAT &&
+         format != DXGI_FORMAT_B5G6R5_UNORM &&
          format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
         ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
     if (samples > 1 && format == DXGI_FORMAT_R8_UINT) return DXGI_ERROR_UNSUPPORTED;
+    if (format == DXGI_FORMAT_B5G6R5_UNORM && (!xg_modern || samples != 1)) return DXGI_ERROR_UNSUPPORTED;
     try {
         auto context = std::make_shared<XgTextureContext>();
         context->modern = xg_modern;
@@ -2688,6 +2897,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         context->module = module; context->width = width; context->height = height;
         context->mips = mips; context->arrays = arrays; context->block = bc7 ? 4 : 1; context->bytes_per_block = bc7 ? 16 : 4;
         if (format == DXGI_FORMAT_R8_UINT) context->bytes_per_block = 1;
+        if (format == DXGI_FORMAT_B5G6R5_UNORM) context->bytes_per_block = 2;
         if (format == DXGI_FORMAT_R32G8X24_TYPELESS) context->bytes_per_block = 8;
         context->samples = samples;
         // 180052210 constructs the 60-byte XG descriptor independently of the

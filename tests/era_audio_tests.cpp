@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "../src/era_audio.h"
 #include <audioclient.h>
+#include <xaudio2.h>
+#include <array>
+#include <cstring>
 #include <wrl/client.h>
 #include <atomic>
 #include <iostream>
@@ -109,7 +112,60 @@ public:
     }
 };
 }
-int main() {
+int main(int argc,char** argv) {
+    if (argc==2 && std::strcmp(argv[1],"--xaudio")==0) {
+        CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+        const HMODULE module=LoadLibraryExW(L"xaudio2_9.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        using Create=HRESULT(WINAPI*)(IXAudio2**,UINT32,UINT32,void*);
+        const auto create=reinterpret_cast<Create>(resolve_xaudio2_export(module,"CreateXAudio2Object"));
+        check(create && !resolve_xaudio2_export(GetModuleHandleW(L"kernel32.dll"),"CreateXAudio2Object") &&
+            !resolve_xaudio2_export(module,MAKEINTRESOURCEA(1)),"audio factory binding rejects a foreign module and ordinal");
+        ComPtr<IXAudio2> engine;
+        if (!create || FAILED(create(&engine,0,0x10,nullptr))) return 1;
+        IXAudio2* rejected=engine.Get();
+        check(create(&rejected,0x80000000,0x10,nullptr)==E_NOTIMPL && !rejected,"unknown Xbox audio flags fail without an engine");
+        IXAudio2MasteringVoice* master=nullptr;
+        HRESULT hr=engine->CreateMasteringVoice(&master,0,0,0,nullptr,nullptr,AudioCategory_GameEffects);
+        check(SUCCEEDED(hr) && master,"real host endpoint accepts the Xbox mastering mix");
+        if (!master) return 1;
+        XAUDIO2_VOICE_DETAILS details{};
+        master->GetVoiceDetails(&details);
+        check(details.InputChannels==8 && details.InputSampleRate==48000,"Xbox default mix keeps eight channels at 48 kHz");
+        struct Callback final : IXAudio2VoiceCallback {
+            HANDLE done=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+            std::atomic<void*> context{nullptr};
+            std::atomic<HRESULT> error{S_OK};
+            ~Callback(){if(done) CloseHandle(done);}
+            void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32) override {}
+            void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
+            void STDMETHODCALLTYPE OnStreamEnd() override {}
+            void STDMETHODCALLTYPE OnBufferStart(void*) override {}
+            void STDMETHODCALLTYPE OnBufferEnd(void* value) override {context=value;SetEvent(done);}
+            void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
+            void STDMETHODCALLTYPE OnVoiceError(void*,HRESULT value) override {error=value;SetEvent(done);}
+        } callback;
+        WAVEFORMATEX format{WAVE_FORMAT_IEEE_FLOAT,8,44100,44100*32,32,32,0};
+        IXAudio2SourceVoice* source=nullptr;
+        hr=engine->CreateSourceVoice(&source,&format,0,2,&callback,nullptr,nullptr);
+        check(SUCCEEDED(hr) && source,"Sonic eight-channel float source uses the real host mixer");
+        if (source) {
+            std::array<float,128*8> silence{};
+            XAUDIO2_BUFFER buffer{};
+            buffer.AudioBytes=sizeof silence; buffer.pAudioData=reinterpret_cast<const BYTE*>(silence.data()); buffer.pContext=&buffer;
+            hr=source->SubmitSourceBuffer(&buffer,nullptr);
+            if (SUCCEEDED(hr)) hr=source->Start(0,0);
+            check(SUCCEEDED(hr) && WaitForSingleObject(callback.done,2000)==WAIT_OBJECT_0 &&
+                callback.error==S_OK && callback.context==&buffer,"native processing completes with the original callback context");
+            XAUDIO2_VOICE_STATE state{};
+            source->GetState(&state,0);
+            check(!state.BuffersQueued && state.SamplesPlayed==128,"real source sample clock consumes every queued frame");
+            source->Stop(0,0); source->DestroyVoice();
+        }
+        master->DestroyVoice(); engine.Reset();
+        if(module) FreeLibrary(module);
+        CoUninitialize();
+        return failures ? 1 : 0;
+    }
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(initialized)) return 1;
     ComPtr<Backend> host; host.Attach(new Backend);

@@ -15,4 +15,6 @@ struct ChannelCountNotification : IUnknown {
 };
 // Takes its own reference; no host device or mixer state is changed.
 HRESULT wrap_audio_enumerator(IMMDeviceEnumerator* host, REFIID iid, void** out);
+// Only substitutes the Xbox factory on the audited System32 XAudio2 module.
+FARPROC resolve_xaudio2_export(HMODULE module, LPCSTR name);
 }

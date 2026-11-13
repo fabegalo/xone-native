@@ -94,10 +94,186 @@ int main(int argc, char** argv) {
             reinterpret_cast<GetDevice>(embedded[3])(context,&embedded_device);
             check(embedded_device == device,"modern embedded context dispatch preserves its device identity");
             if (embedded_device) reinterpret_cast<Count>(vt(embedded_device)[2])(embedded_device);
+            using SetViewport = void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*);
+            using GetViewport = void(STDMETHODCALLTYPE*)(void*,UINT*,D3D11_VIEWPORT*);
+            const auto set_viewports = reinterpret_cast<SetViewport>(embedded[45]);
+            const auto get_viewports = reinterpret_cast<GetViewport>(embedded[96]);
+            const D3D11_VIEWPORT viewport{13,17,1920,1080,.125f,.875f};
+            set_viewports(context,1,&viewport);
+            UINT viewport_count = 0;
+            get_viewports(context,&viewport_count,nullptr);
+            check(viewport_count==1,"viewport count queries retain the configured raster state");
+            struct { D3D11_VIEWPORT value[2]; UINT64 guard=0x1122334455667788ull; } viewport_output{};
+            viewport_count = 2;
+            get_viewports(context,&viewport_count,viewport_output.value);
+            const D3D11_VIEWPORT empty_viewport{};
+            check(viewport_count==1 && !std::memcmp(&viewport,viewport_output.value,sizeof viewport) &&
+                !std::memcmp(&empty_viewport,&viewport_output.value[1],sizeof viewport) && viewport_output.guard==0x1122334455667788ull,
+                "viewport state preserves origin, dimensions, depth range and output bounds");
+            static UINT invalid_viewport_slot = 0;
+            set_d3d11x_trap_handler([](const char*,unsigned slot)->std::uintptr_t { invalid_viewport_slot=slot; return 0; });
+            set_viewports(context,17,&viewport);
+            set_d3d11x_trap_handler(nullptr);
+            viewport_count = 1;
+            get_viewports(context,&viewport_count,viewport_output.value);
+            check(invalid_viewport_slot==45 && viewport_count==1 && !std::memcmp(&viewport,viewport_output.value,sizeof viewport),
+                "invalid viewport binding reports its slot and preserves prior state");
+            set_viewports(context,0,nullptr);
+            get_viewports(context,&viewport_count,nullptr);
+            check(!viewport_count,"zero viewport binding clears raster viewport state");
+            D3D11_RASTERIZER_DESC raster{};
+            raster.FillMode=D3D11_FILL_SOLID; raster.CullMode=D3D11_CULL_NONE; raster.DepthClipEnable=TRUE;
+            D3D12_DEPTH_STENCIL_DESC depth_state{};
+            depth_state.DepthEnable=TRUE; depth_state.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ALL; depth_state.DepthFunc=D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            depth_state.FrontFace=depth_state.BackFace={D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_COMPARISON_FUNC_ALWAYS};
+            D3D11_BLEND_DESC blend{};
+            blend.RenderTarget[0].RenderTargetWriteMask=D3D11_COLOR_WRITE_ENABLE_ALL;
+            using CreateState=HRESULT(STDMETHODCALLTYPE*)(void*,const void*,void**);
+            for(UINT kind=0;kind<3;++kind) {
+                const UINT factory_slot=kind==0 ? 22 : kind==1 ? 21 : 20;
+                const void* description=kind==0 ? static_cast<const void*>(&raster) : kind==1 ? static_cast<const void*>(&depth_state) : static_cast<const void*>(&blend);
+                void* state=nullptr;
+                check(reinterpret_cast<CreateState>(vt(device)[factory_slot])(device,description,&state)==S_OK && state,
+                    "modern pipeline factory retains its state object");
+                if(!state) continue;
+                const auto bind=[&](void* value) {
+                    if(kind==0) reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(embedded[44])(context,value);
+                    else if(kind==1) reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT)>(embedded[37])(context,value,7);
+                    else {
+                        const FLOAT factor[]{.25f,.5f,.75f,1};
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*,UINT)>(embedded[36])(context,value,factor,0xff);
+                    }
+                };
+                bind(state); bind(state);
+                check(*reinterpret_cast<ULONG*>(static_cast<char*>(state)+12)==2,"repeated pipeline binding retains exactly one reference");
+                bind(nullptr);
+                check(reinterpret_cast<Count>(vt(state)[2])(state)==0,"pipeline unbinding releases ownership and its cache entry");
+            }
+            using CreateSampler = HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_SAMPLER_DESC*,void**);
+            D3D12_SAMPLER_DESC sampler_desc{};
+            sampler_desc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sampler_desc.AddressU = sampler_desc.AddressV = sampler_desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+            sampler_desc.MaxAnisotropy = 1; sampler_desc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            sampler_desc.MaxLOD = D3D12_FLOAT32_MAX;
+            for (float& channel : sampler_desc.BorderColor) channel = 1;
+            void* sampler = nullptr;
+            const auto create_sampler = reinterpret_cast<CreateSampler>(vt(device)[23]);
+            check(create_sampler(device,&sampler_desc,&sampler)==S_OK && sampler,"modern factory creates a native white-border sampler");
+            if (sampler) {
+                std::array<UINT32,4> words{};
+                using GetSamplerX = void(STDMETHODCALLTYPE*)(void*,UINT32*);
+                reinterpret_cast<GetSamplerX>(vt(sampler)[9])(sampler,words.data());
+                check(words[3]==0x80000000u && *reinterpret_cast<ULONG*>(static_cast<char*>(sampler)+12)==1,
+                    "modern sampler retains its border SRD and reference ABI");
+                void* duplicate = nullptr;
+                check(create_sampler(device,&sampler_desc,&duplicate)==S_OK && duplicate==sampler,
+                    "modern sampler cache shares the same live object");
+                if (duplicate) reinterpret_cast<Count>(vt(duplicate)[2])(duplicate);
+                check(reinterpret_cast<Count>(vt(sampler)[2])(sampler)==0,"modern sampler cache releases its device ownership");
+            }
+            using CreateBuffer = HRESULT(STDMETHODCALLTYPE*)(void*,const D3D11_BUFFER_DESC*,const D3D11_SUBRESOURCE_DATA*,void**);
+            const auto create_buffer = reinterpret_cast<CreateBuffer>(vt(device)[3]);
+            // Nonzero adjacent bytes catch accidental reads of the older 32-byte ABI.
+            struct { D3D11_BUFFER_DESC desc; UINT64 guard; } buffer_input{
+                {800,D3D11_USAGE_IMMUTABLE,D3D11_BIND_VERTEX_BUFFER,0,0,0},0xffffffffffffffffull};
+            std::array<unsigned char,800> vertices{};
+            for (UINT i=0;i<vertices.size();++i) vertices[i]=static_cast<unsigned char>(i*13+7);
+            D3D11_SUBRESOURCE_DATA initial{vertices.data(),0,0};
+            void* buffer = nullptr;
+            check(create_buffer(device,&buffer_input.desc,nullptr,&buffer)==E_INVALIDARG && !buffer,
+                "modern immutable buffers require initial data");
+            check(create_buffer(device,&buffer_input.desc,&initial,&buffer)==S_OK && buffer,
+                "modern CreateBuffer reads only its verified 24-byte descriptor");
+            if (buffer) {
+                struct { D3D11_BUFFER_DESC desc{}; UINT64 guard=0x1122334455667788ull; } output;
+                using GetBufferDesc = void(STDMETHODCALLTYPE*)(void*,D3D11_BUFFER_DESC*);
+                reinterpret_cast<GetBufferDesc>(vt(buffer)[12])(buffer,&output.desc);
+                check(!std::memcmp(&output.desc,&buffer_input.desc,sizeof output.desc) && output.guard==0x1122334455667788ull,
+                    "modern GetDesc preserves the descriptor and adjacent memory");
+                check(*reinterpret_cast<ULONG*>(static_cast<char*>(buffer)+12)==1,
+                    "modern buffers expose their live reference count at offset 12");
+                const auto* canonical=*reinterpret_cast<void**>(static_cast<char*>(buffer)+48);
+                check(canonical && !std::memcmp(canonical,vertices.data(),vertices.size()),
+                    "modern immutable buffers preserve every initial vertex byte");
+                reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+            }
             struct TextureDesc { D3D11_TEXTURE2D_DESC standard; UINT extra[2]{}; } desc{};
             desc.standard = {32,16,1,1,DXGI_FORMAT_D32_FLOAT,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_DEPTH_STENCIL,0,0};
             using Texture = HRESULT(STDMETHODCALLTYPE*)(void*,const TextureDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+            for (const auto format : {DXGI_FORMAT_B5G6R5_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM}) {
+                TextureDesc dynamic{};
+                dynamic.standard = {33,17,1,1,format,{1,0},D3D11_USAGE_DYNAMIC,D3D11_BIND_SHADER_RESOURCE,0,0};
+                void* image = nullptr;
+                check(reinterpret_cast<Texture>(vt(device)[5])(device,&dynamic,nullptr,&image)==S_OK && image,
+                    "modern dynamic image uses the shared canonical texture registry");
+                if (!image) continue;
+                using CreateSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                void* srv=nullptr;
+                check(reinterpret_cast<CreateSrv>(vt(device)[7])(device,image,nullptr,&srv)==S_OK && srv,
+                    "dynamic texture SRV retains the same canonical allocation");
+                const auto canonical=srv ? *reinterpret_cast<void**>(static_cast<char*>(srv)+80) : nullptr;
+                using Map = HRESULT(STDMETHODCALLTYPE*)(void*,void*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*);
+                using Unmap = void(STDMETHODCALLTYPE*)(void*,void*);
+                const auto map = reinterpret_cast<Map>(embedded[16]);
+                const auto unmap = reinterpret_cast<Unmap>(embedded[17]);
+                const UINT pixel = format==DXGI_FORMAT_B5G6R5_UNORM ? 2 : 4;
+                for (UINT pass=0;pass<2;++pass) {
+                    D3D11_MAPPED_SUBRESOURCE mapped{};
+                    hr=map(context,image,0,D3D11_MAP_WRITE_DISCARD,0,&mapped);
+                    check(hr==S_OK && mapped.pData && mapped.RowPitch>=33*pixel && mapped.DepthPitch==17*mapped.RowPitch,
+                        "texture map exposes an actual linear footprint with consistent pitches");
+                    if (FAILED(hr)) break;
+                    D3D11_MAPPED_SUBRESOURCE duplicate{};
+                    check(map(context,image,0,D3D11_MAP_WRITE_DISCARD,0,&duplicate)==HRESULT_FROM_WIN32(ERROR_BUSY) && !duplicate.pData,
+                        "nested texture maps are rejected without releasing CPU ownership");
+                    auto* bytes=static_cast<unsigned char*>(mapped.pData);
+                    for(UINT y=0;y<17;++y) for(UINT x=0;x<33*pixel;++x) bytes[y*mapped.RowPitch+x]=static_cast<unsigned char>(pass*29+y*13+x*7);
+                    unmap(context,image);
+                    TitleTextureLayout layout;
+                    hr=create_xg_texture_layout(33,17,1,1,format,UINT_MAX,layout,D3D11_BIND_SHADER_RESOURCE);
+                    std::vector<unsigned char> linear(33*17*pixel);
+                    if(SUCCEEDED(hr)) hr=canonical ? layout.copy(layout.context.get(),false,linear.data(),canonical,0,33*pixel,33*17*pixel) : E_POINTER;
+                    bool equal=SUCCEEDED(hr);
+                    for(UINT y=0;y<17 && equal;++y) for(UINT x=0;x<33*pixel;++x)
+                        equal=equal && linear[y*33*pixel+x]==static_cast<unsigned char>(pass*29+y*13+x*7);
+                    check(equal,"texture unmap retiles every logical pixel and refreshes repeated writes");
+                }
+                if(srv) reinterpret_cast<Count>(vt(srv)[2])(srv);
+                reinterpret_cast<Count>(vt(image)[2])(image);
+            }
             void* texture = nullptr;
+            {
+                TextureDesc color_desc{};
+                color_desc.standard={32,16,1,1,DXGI_FORMAT_B8G8R8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,
+                    D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,0,0};
+                void* color=nullptr;
+                check(reinterpret_cast<Texture>(vt(device)[5])(device,&color_desc,nullptr,&color)==S_OK && color,
+                    "native clear fixture creates a shared renderable image");
+                if(color) {
+                    using View=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const void*,void**);
+                    void* rtv=nullptr; void* srv=nullptr;
+                    check(reinterpret_cast<View>(vt(device)[9])(device,color,nullptr,&rtv)==S_OK && rtv,"native clear creates its render-target view");
+                    check(reinterpret_cast<View>(vt(device)[7])(device,color,nullptr,&srv)==S_OK && srv,"native clear exposes the same image through its SRV");
+                    if(rtv && srv) {
+                        using Clear=void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*);
+                        TitleTextureLayout layout;
+                        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_B8G8R8A8_UNORM,UINT_MAX,layout,color_desc.standard.BindFlags);
+                        const auto canonical=*reinterpret_cast<void**>(static_cast<char*>(srv)+80);
+                        for(UINT pass=0;pass<2;++pass) {
+                            const FLOAT rgba[]{(17.f+pass*17)/255,34.f/255,51.f/255,68.f/255};
+                            reinterpret_cast<Clear>(embedded[51])(context,rtv,rgba);
+                            std::array<unsigned char,32*16*4> pixels{};
+                            HRESULT copied=SUCCEEDED(hr) ? layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048) : hr;
+                            bool equal=SUCCEEDED(copied);
+                            for(UINT i=0;i<pixels.size();i+=4) equal=equal && pixels[i]==51 && pixels[i+1]==34 && pixels[i+2]==17+pass*17 && pixels[i+3]==68;
+                            check(equal,"title clear executes on D3D12 and publishes every BGRA pixel after its fence, including reuse");
+                        }
+                    }
+                    if(rtv) reinterpret_cast<Count>(vt(rtv)[2])(rtv);
+                    if(srv) reinterpret_cast<Count>(vt(srv)[2])(srv);
+                    reinterpret_cast<Count>(vt(color)[2])(color);
+                }
+            }
             hr = reinterpret_cast<Texture>(vt(device)[5])(device,&desc,nullptr,&texture);
             check(SUCCEEDED(hr) && texture,"modern ABI creates the expanded D32 texture");
             if (texture) {
@@ -116,6 +292,10 @@ int main(int argc, char** argv) {
                 check(create_dsv(device,texture,&input,&view) == S_OK && view,"modern ABI creates a real native depth view");
                 if (view) {
                     check(*reinterpret_cast<UINT*>(static_cast<char*>(view)+40) == 1,"DSV public type agrees with the original UMD");
+                    using ClearDepth=void(STDMETHODCALLTYPE*)(void*,void*,UINT,FLOAT,UINT8);
+                    const auto clear_depth=reinterpret_cast<ClearDepth>(embedded[54]);
+                    clear_depth(context,view,D3D11_CLEAR_DEPTH,0.375f,0x7f);
+                    clear_depth(context,view,D3D11_CLEAR_DEPTH|D3D11_CLEAR_STENCIL,1.f,0);
                     using Bind = void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
                     const auto bind = reinterpret_cast<Bind>(embedded[34]);
                     bind(context,0,nullptr,view);
@@ -917,7 +1097,7 @@ int main(int argc, char** argv) {
                 return 0xdead;
             });
             using Any = std::uintptr_t (*)(void*);
-            check(reinterpret_cast<Any>(vt(device)[7])(device) == 0xdead && trapped_slot == 7 &&
+            check(reinterpret_cast<Any>(vt(device)[6])(device) == 0xdead && trapped_slot == 6 &&
                   std::string(trapped_interface) == "ID3D11DeviceX", "unimplemented device slot reports interface and slot");
             check(reinterpret_cast<Any>(vt(context)[300])(context) == 0xdead && trapped_slot == 300 &&
                   std::string(trapped_interface) == "ID3D11DeviceContextX", "unimplemented context slot reports itself");
@@ -1349,6 +1529,23 @@ int main(int argc, char** argv) {
                     }
                     desc.Filter = static_cast<D3D12_FILTER>(3);
                     check(factory(device, &desc, &sampler) == E_INVALIDARG && !sampler, "invalid sampler filter rejected");
+                    desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+                    for (UINT border = 1; border <= 2; ++border) {
+                        for (UINT channel = 0; channel < 4; ++channel) desc.BorderColor[channel] = channel == 3 || border == 2 ? 1.f : 0.f;
+                        check(factory(device,&desc,&sampler) == S_OK && sampler,"standard opaque sampler borders are represented exactly");
+                        if (sampler) {
+                            std::array<UINT32,4> words{};
+                            using GetX = void(STDMETHODCALLTYPE*)(void*,UINT32*);
+                            reinterpret_cast<GetX>(vt(sampler)[9])(sampler,words.data());
+                            check(words[3] == (border << 30),"sampler SRD retains the standard border color type");
+                            using GetDesc = void(STDMETHODCALLTYPE*)(void*,D3D12_SAMPLER_DESC*);
+                            D3D12_SAMPLER_DESC actual{};
+                            reinterpret_cast<GetDesc>(vt(sampler)[8])(sampler,&actual);
+                            check(!std::memcmp(actual.BorderColor,desc.BorderColor,sizeof desc.BorderColor),"sampler GetDesc preserves all border channels");
+                            reinterpret_cast<Count>(vt(sampler)[2])(sampler);
+                        }
+                    }
+                    for (float& channel : desc.BorderColor) channel = 0;
                     desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT; desc.BorderColor[0] = 1;
                     check(factory(device, &desc, &sampler) == DXGI_ERROR_UNSUPPORTED && !sampler, "custom border table remains explicit gap");
                 }
@@ -1763,6 +1960,22 @@ int main(int argc, char** argv) {
                         check(item->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity)) == S_OK && identity == item,
                             "controller COM identity is preserved");
                         if (identity) identity->Release();
+                        constexpr GUID gamepad_iid{0x082e402c,0x07df,0x45e1,{0xa5,0xab,0xa3,0x12,0x7a,0xf1,0x97,0xb5}};
+                        IUnknown* gamepad=nullptr;
+                        check(item->QueryInterface(gamepad_iid,reinterpret_cast<void**>(&gamepad))==S_OK && gamepad,
+                            "host controller shares its gamepad identity");
+                        if (gamepad) {
+                            using Read=HRESULT(STDMETHODCALLTYPE*)(void*,RawGamepadReading*);
+                            const auto read=reinterpret_cast<Read>((*reinterpret_cast<void***>(gamepad))[8]);
+                            struct { RawGamepadReading value; UINT64 guard=0x1122334455667788ull; } sample{};
+                            check(read(gamepad,nullptr)==E_POINTER,"raw gamepad reading validates its output");
+                            const HRESULT result=read(gamepad,&sample.value);
+                            check((result==HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) || (result==S_OK && sample.value.timestamp &&
+                                sample.value.left_trigger>=0 && sample.value.left_trigger<=1 && sample.value.right_trigger>=0 && sample.value.right_trigger<=1 &&
+                                sample.value.left_x>=-1 && sample.value.left_x<=1 && sample.value.right_y>=-1 && sample.value.right_y<=1)) &&
+                                sample.guard==0x1122334455667788ull,"real gamepad read respects normalized ranges, disconnection and its 40-byte ABI");
+                            gamepad->Release();
+                        }
                         item->Release();
                     }
                 }

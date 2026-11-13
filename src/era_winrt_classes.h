@@ -23,6 +23,13 @@ HWND core_window_hwnd(const void* window);
 HRESULT xbox_user_factory(REFIID iid, void** factory);
 HRESULT xbox_controller_factory(REFIID iid, void** factory);
 HRESULT xbox_gamepad_factory(REFIID iid, void** factory);
+struct RawGamepadReading {
+    std::uint64_t timestamp = 0; // Monotonic 100 ns units, not wall-clock time.
+    std::uint32_t buttons = 0;
+    float left_trigger = 0, right_trigger = 0;
+    float left_x = 0, left_y = 0, right_x = 0, right_y = 0;
+};
+static_assert(sizeof(RawGamepadReading)==40 && offsetof(RawGamepadReading,left_trigger)==12);
 HRESULT poll_title_input();
 void stop_title_input();
 std::size_t xbox_user_removed_handlers(); // Test observation.

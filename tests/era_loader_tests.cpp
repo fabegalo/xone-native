@@ -864,6 +864,9 @@ int main(int argc, char** argv) {
         using Create = HRESULT (WINAPI*)(const Parameters*, void**, void**);
         const auto create = reinterpret_cast<Create>(resolve_title_import({"d3d11_x.dll", "D3D11XCreateDeviceX", 0}));
         check(create != nullptr, "bound old graphics factory resolved");
+        using MapEsram = HRESULT (WINAPI*)(UINT, void*, UINT, const UINT*);
+        const auto map_esram = reinterpret_cast<MapEsram>(resolve_title_import({"d3d11_x.dll", "D3DMapEsramMemory", 0}));
+        check(map_esram && map_esram(1, nullptr, 1, nullptr) == E_INVALIDARG, "bound ESRAM import validates the original four-argument ABI");
         void* device = &p;
         void* context = &p;
         if (create) {

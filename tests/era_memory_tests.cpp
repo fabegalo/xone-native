@@ -181,6 +181,62 @@ int main(int argc, char** argv) {
 
     const auto virtual_allocate = reinterpret_cast<decltype(&VirtualAlloc)>(resolve_kernelx({"kernelx.dll", "VirtualAlloc", 0}));
     const auto virtual_free = reinterpret_cast<decltype(&VirtualFree)>(resolve_kernelx({"kernelx.dll", "VirtualFree", 0}));
+    void* dynamic_reservation = virtual_allocate(nullptr, 0x27f8000, 0x30002000, PAGE_READWRITE);
+    check(dynamic_reservation && !(reinterpret_cast<std::uintptr_t>(dynamic_reservation) & 65535) &&
+        reinterpret_cast<std::uintptr_t>(dynamic_reservation) >= 0x100000000ull &&
+        reinterpret_cast<std::uintptr_t>(dynamic_reservation) < 0x10000000000ull,
+        "observed null-address graphics reservation chooses a real address in the Xbox range");
+    if (!dynamic_reservation) return 1;
+    VirtualQuery(dynamic_reservation, &info, sizeof info);
+    check(info.State == MEM_RESERVE && info.RegionSize == 0x2800000,
+          "graphics reservation rounds its size without manufacturing committed pages");
+    auto* esram_memory = static_cast<unsigned char*>(dynamic_reservation);
+    const UINT first_pages[]{3, 5};
+    check(map_title_esram(1, esram_memory, 2, first_pages) == S_OK, "ESRAM pages map into an owned graphics reservation");
+    VirtualQuery(esram_memory, &info, sizeof info);
+    if (info.State != MEM_COMMIT) return 1;
+    esram_memory[0] = 0x33; esram_memory[65536] = 0x55;
+    auto* alias_memory = static_cast<unsigned char*>(virtual_allocate(nullptr, 65536, 0x30002000, PAGE_READWRITE));
+    if (!alias_memory) return 1;
+    check(map_title_esram(1, alias_memory, 1, first_pages) == S_OK && alias_memory[0] == 0x33,
+          "two virtual mappings see the same physical ESRAM bytes");
+    VirtualQuery(alias_memory, &info, sizeof info);
+    if (info.State != MEM_COMMIT) return 1;
+    alias_memory[0] = 0x44;
+    check(esram_memory[0] == 0x44, "CPU writes are shared immediately across ESRAM aliases");
+    const UINT invalid_page = 512;
+    check(map_title_esram(0, esram_memory, 1, first_pages) == E_INVALIDARG &&
+        map_title_esram(1, esram_memory, 1, &invalid_page) == E_INVALIDARG && esram_memory[0] == 0x44,
+        "invalid ESRAM flags and pages preserve existing mappings");
+    check(map_title_esram(1, esram_memory, 1, first_pages + 1) == S_OK && esram_memory[0] == 0x55,
+          "ESRAM remapping changes identity without copying disconnected data");
+    esram_memory[65536] = 0x66;
+    check(esram_memory[0] == 0x66 && alias_memory[0] == 0x44, "repeated physical pages alias while distinct pages stay independent");
+    check(map_title_esram(1, esram_memory, 2, nullptr) == S_OK, "ESRAM unmapping restores owned placeholders");
+    VirtualQuery(esram_memory, &info, sizeof info);
+    check(info.State == MEM_RESERVE && alias_memory[0] == 0x44, "unmapping one alias preserves physical bytes and other mappings");
+    std::array<UINT, 512> all_pages{};
+    for (UINT i = 0; i < all_pages.size(); ++i) all_pages[i] = i;
+    const HRESULT full_mapping = map_title_esram(1, esram_memory, UINT(all_pages.size()), all_pages.data());
+    check(full_mapping == S_OK && esram_memory[3 * 65536] == 0x44,
+          "observed 512-page mapping preserves the complete 32-MiB physical pool");
+    if (FAILED(full_mapping)) return 1;
+    VirtualQuery(esram_memory + (32u << 20), &info, sizeof info);
+    check(info.State == MEM_RESERVE, "ESRAM mapping leaves the remaining graphics reservation uncommitted");
+    auto* large_reservation = static_cast<unsigned char*>(virtual_allocate(nullptr, 8u << 20, 0x30002000, PAGE_READWRITE));
+    if (!large_reservation) return 1;
+    auto* large_page = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(large_reservation) + (4u << 20) - 1) & ~std::uintptr_t((4u << 20) - 1));
+    const UINT last_large = 7, last_small = 448;
+    check(map_title_esram(2, large_page, 1, &last_large) == S_OK, "4-MiB page mode uses the same ESRAM pool");
+    VirtualQuery(large_page, &info, sizeof info);
+    if (info.State != MEM_COMMIT) return 1;
+    large_page[0] = 0x77;
+    check(map_title_esram(1, alias_memory, 1, &last_small) == S_OK && alias_memory[0] == 0x77 && esram_memory[448 * 65536] == 0x77,
+          "64-KiB and 4-MiB ESRAM mappings share physical identity");
+    check(map_title_esram(2, large_page + 65536, 1, &last_large) == E_INVALIDARG && large_page[0] == 0x77,
+          "misaligned large-page mappings cannot replace valid data");
+    check(virtual_free(large_reservation, 0, MEM_RELEASE) && virtual_free(alias_memory, 0, MEM_RELEASE) &&
+        virtual_free(dynamic_reservation, 0, MEM_RELEASE), "ESRAM reservations release every owned mapping and placeholder");
     constexpr SIZE_T reservation_size = 1u << 21;
     void* probe = VirtualAlloc(nullptr, 2 * reservation_size, MEM_RESERVE, PAGE_NOACCESS);
     if (!probe) return 1;
@@ -618,11 +674,12 @@ int main(int argc, char** argv) {
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 1, 15, nullptr),
               "typed R8 metadata preserves canonical bytes through independent GPU mutation");
     }
-    const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal) -> bool {
-        auto* storage = static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
-        if (!storage) return false;
-        std::memset(storage, 0x5a, layout.bytes + layout.alignment + 32);
-        auto* canonical = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(storage) + 16 + layout.alignment - 1) & ~(layout.alignment - 1));
+    const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal, void* reserved = nullptr) -> bool {
+        auto* storage = reserved ? nullptr : static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
+        if (!reserved && !storage) return false;
+        auto* canonical = reserved ? static_cast<unsigned char*>(reserved) :
+            reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(storage) + 16 + layout.alignment - 1) & ~(layout.alignment - 1));
+        std::memset(canonical - 16, 0x5a, layout.bytes + 32);
         std::vector<UINT32> expected(32 * 16 * 4), actual(expected.size());
         for (UINT i = 0; i < expected.size(); ++i) {
             const UINT sample = i % 4;
@@ -674,7 +731,7 @@ int main(int argc, char** argv) {
                 check(canonical[int(i) - 16] == 0x5a && canonical[layout.bytes + i] == 0x5a, "MSAA coherence preserves neighboring bytes");
         }
         if (FAILED(release_title_gpu_resource(texture, fence.Get(), signal + 2))) return false;
-        release(storage, attributes);
+        if (storage) release(storage, attributes);
         return true;
     };
     TitleTextureLayout sample_layout;
@@ -794,5 +851,82 @@ int main(int argc, char** argv) {
                 "negative control preserves RGB without the Xbox transfer");
         }
     }
+    auto* pool_memory = static_cast<unsigned char*>(virtual_allocate(nullptr, 4 * 65536, 0x30002000, PAGE_READWRITE));
+    auto* pool_alias = static_cast<unsigned char*>(virtual_allocate(nullptr, 65536, 0x30002000, PAGE_READWRITE));
+    if (!pool_memory || !pool_alias) return 1;
+    const UINT pool_pages[]{1, 2, 3};
+    if (FAILED(map_title_esram(1, pool_memory, 3, pool_pages)) || FAILED(map_title_esram(1, pool_alias, 1, pool_pages + 2)) ||
+        virtual_allocate(pool_memory + 3 * 65536, 32768, 0x30001000, PAGE_READWRITE) != pool_memory + 3 * 65536) return 1;
+    MEMORY_BASIC_INFORMATION rounded_commit{};
+    check(VirtualQuery(pool_memory + 4 * 65536 - 1, &rounded_commit, sizeof rounded_commit) && rounded_commit.State == MEM_COMMIT,
+        "graphics commit rounds a partial 64-KiB page within its owned reservation");
+    auto* mixed_bytes = pool_memory + 3 * 65536 - 16;
+    std::memset(mixed_bytes - 16, 0x5a, 96); std::memset(mixed_bytes, 0x39, 64);
+    TitleGpuResource mixed, mirror;
+    hr = acquire_title_gpu_buffer(mixed_bytes, 64, device.Get(), mixed, D3D12_RESOURCE_FLAG_NONE, true);
+    check(SUCCEEDED(hr) && mixed.composite, "GPU buffer spans ESRAM and private graphics storage in one registry");
+    if (FAILED(hr) || FAILED(acquire_title_gpu_buffer(pool_alias + 65536 - 16, 16, device.Get(), mirror, D3D12_RESOURCE_FLAG_NONE, true))) return 1;
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return 1;
+    if (FAILED(begin_title_gpu_buffer(mixed, list.Get(), D3D12_RESOURCE_STATE_COPY_DEST))) return 1;
+    check(begin_title_gpu_buffer(mirror, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
+          "physical ESRAM aliases cannot run concurrent conflicting GPU intervals");
+    void* cpu_alias = nullptr;
+    check(map_title_gpu_resource(mirror, &cpu_alias) == E_PENDING && !cpu_alias,
+          "CPU aliases wait for the physical page's real GPU interval");
+    const UINT remapped_page = 4;
+    check(map_title_esram(1, pool_alias, 1, &remapped_page) == HRESULT_FROM_WIN32(ERROR_BUSY) && pool_alias[65536 - 16] == 0x39,
+          "remapping cannot retire a physical page in flight");
+    void* upload_bytes = nullptr;
+    if (FAILED(upload->Map(0, nullptr, &upload_bytes))) return 1;
+    std::memset(upload_bytes, 0xa7, 64); upload->Unmap(0, nullptr);
+    list->CopyBufferRegion(mixed.resource, 0, upload.Get(), 0, 64);
+    if (FAILED(end_title_gpu_buffer(mixed, list.Get()))) return 1;
+    const auto finish_pool = [&](UINT64 value) {
+        if (FAILED(list->Close())) return false;
+        queue->ExecuteCommandLists(1, lists);
+        HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) return false;
+        HRESULT hr = queue->Signal(fence.Get(), value);
+        if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(value, event);
+        const bool done = SUCCEEDED(hr) && WaitForSingleObject(event, 3000) == WAIT_OBJECT_0;
+        CloseHandle(event); return done;
+    };
+    if (!finish_pool(200)) return 1;
+    check(mixed_bytes[0] == 0x39 && pool_alias[65536 - 16] == 0x39 && release_title_gpu_resource(mixed, fence.Get(), 200) == E_PENDING,
+          "GPU completion alone does not publish pending CPU writeback");
+    if (FAILED(complete_title_gpu_resource(mixed, fence.Get(), 200))) return 1;
+    check(std::all_of(mixed_bytes, mixed_bytes + 64, [](auto x) { return x == 0xa7; }) &&
+        pool_alias[65535] == 0xa7 && mixed_bytes[-1] == 0x5a && mixed_bytes[64] == 0x5a,
+        "GPU writes update real ESRAM aliases and the private tail while preserving guards");
+    if (FAILED(map_title_esram(1, pool_memory + 2 * 65536, 1, &remapped_page))) return 1;
+    std::memset(mixed_bytes, 0x66, 16);
+    check(pool_alias[65535] == 0xa7, "remapping an inactive representation changes its physical source without changing the old alias");
+    if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr)) ||
+        FAILED(begin_title_gpu_buffer(mixed, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE))) return 1;
+    check(map_title_gpu_resource(mirror, &cpu_alias) == S_OK && cpu_alias == pool_alias + 65536 - 16,
+          "physical ownership refreshes after remapping and preserves the guest CPU address");
+    if (cpu_alias) unmap_title_gpu_resource(mirror);
+    if (FAILED(begin_title_gpu_buffer(mirror, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE))) return 1;
+    list->CopyBufferRegion(readback.Get(), 0, mixed.resource, 0, 64);
+    if (FAILED(end_title_gpu_buffer(mixed, list.Get())) || FAILED(end_title_gpu_buffer(mirror, list.Get())) || !finish_pool(201)) return 1;
+    if (FAILED(readback->Map(0, nullptr, &upload_bytes))) return 1;
+    const auto* observed = static_cast<const unsigned char*>(upload_bytes);
+    check(std::all_of(observed, observed + 16, [](auto x) { return x == 0x66; }) &&
+        std::all_of(observed + 16, observed + 64, [](auto x) { return x == 0xa7; }), "GPU reuse refreshes the new physical page and preserves the private tail");
+    readback->Unmap(0, nullptr);
+    if (FAILED(complete_title_gpu_resource(mixed, fence.Get(), 201)) || FAILED(complete_title_gpu_resource(mirror, fence.Get(), 201)) ||
+        FAILED(release_title_gpu_resource(mixed, fence.Get(), 201)) || FAILED(release_title_gpu_resource(mirror, fence.Get(), 201))) return 1;
+    if (FAILED(map_title_esram(1, pool_alias, 1, &remapped_page))) return 1;
+    TitleTextureLayout pool_texture;
+    pool_texture.bytes = 8192; pool_texture.alignment = 16; pool_texture.context = std::make_shared<int>(0); pool_texture.copy = &linear_sample_copy;
+    pool_texture.resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    pool_texture.resource_desc.Width = 32; pool_texture.resource_desc.Height = 16;
+    pool_texture.resource_desc.DepthOrArraySize = pool_texture.resource_desc.MipLevels = 1;
+    pool_texture.resource_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT; pool_texture.resource_desc.SampleDesc.Count = 4;
+    pool_texture.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    auto* mixed_texture = pool_memory + 3 * 65536 - 4096;
+    check(sample_fixture(pool_texture, 210, mixed_texture), "four-sample texture spans ESRAM and private graphics pages coherently");
+    check(!std::memcmp(mixed_texture, pool_alias + 65536 - 4096, 4096), "MSAA writeback reaches the physical ESRAM alias");
+    check(virtual_free(pool_memory, 0, MEM_RELEASE) && virtual_free(pool_alias, 0, MEM_RELEASE), "GPU ESRAM fixtures release every owned reservation after retirement");
     return failures ? 1 : 0;
 }

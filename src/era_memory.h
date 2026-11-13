@@ -32,7 +32,9 @@ struct TitleGpuResource {
     D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON;
     void* representation = nullptr; // Registry-owned aligned window, if requested.
     std::size_t canonical_offset = 0, size = 0;
+    bool composite = false; // A graphics reservation spanning physical/shared commitments.
 };
+HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_list);
 // Resource capabilities are fixed by the first binding; later requests never
 // replace a cached resource with an unsynchronized alias.
 HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* device, TitleGpuResource& out,

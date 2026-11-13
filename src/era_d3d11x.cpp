@@ -2645,6 +2645,7 @@ void* resolve_d3d11x(const ImportRequest& request) {
     if (!same_library(request.library, "d3d11_x.dll")) return nullptr;
     if (request.name == "D3D11CreateDevice") return reinterpret_cast<void*>(&D3D11CreateDevice);
     if (request.name == "D3D11XCreateDeviceX" && legacy_abi_bound) return reinterpret_cast<void*>(&D3D11XCreateDeviceX);
+    if (request.name == "D3DMapEsramMemory" && legacy_abi_bound) return reinterpret_cast<void*>(&map_title_esram);
     return nullptr;
 }
 

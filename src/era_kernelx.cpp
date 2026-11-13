@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <climits>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -76,12 +77,15 @@ struct GpuWindow {
     std::unique_ptr<SampleTransfer> sample_transfer;
     UINT sample_srv_step = 0, sample_rtv_step = 0;
     std::vector<unsigned char> sample_linear;
+    bool staged_buffer = false;
+    std::array<bool, 512> physical_pages{};
 };
 using GpuWindows = std::multimap<std::pair<SIZE_T, SIZE_T>, GpuWindow>;
 struct GpuBacking {
     SIZE_T size;
     DWORD guest_protection = 0;
     bool retiring = false;
+    UINT esram_page = UINT_MAX;
     unsigned gpu_pins = 0;
     Microsoft::WRL::ComPtr<ID3D12Heap> heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
@@ -98,6 +102,12 @@ struct TitleRegion : GpuBacking {
     TitleRegion(SIZE_T bytes, bool gpu) : GpuBacking{bytes}, graphics(gpu) {}
 };
 std::map<std::uintptr_t, TitleRegion> title_regions;
+constexpr SIZE_T esram_page_bytes = 65536, esram_bytes = 32u << 20;
+struct PhysicalGate { TitleGpuResource* gpu = nullptr; TitleGpuResource* cpu = nullptr; };
+struct EsramPool {
+    Microsoft::WRL::Wrappers::FileHandle mapping;
+    std::array<PhysicalGate, 512> pages{};
+} esram;
 void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes);
 void WINAPI era_XMemFreeDefault(void* address, ULONGLONG attributes);
 using XAlloc = void* (WINAPI*)(SIZE_T, ULONGLONG);
@@ -250,22 +260,27 @@ bool unmap_graphics_backing(std::uintptr_t address, GpuBacking& backing) {
 
 // MEM_TITLE selects title ownership; keep the requested address/protection.
 // GPU commitments retain the reservation and bind each committed span to the
-// same shared CPU/GPU registry. Physical aliases and ESRAM remain unsupported.
+// same shared CPU/GPU registry, including mapped ESRAM physical aliases.
 LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection) {
     constexpr DWORD mem_title = 0x40000000;
     constexpr DWORD mem_graphics = 0x10000000;
     constexpr DWORD supported = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_RESET | MEM_RESET_UNDO | MEM_WRITE_WATCH;
     const bool graphics = (type & mem_graphics) != 0;
-    // This supported subset reserves at 2 MiB boundaries, without backing;
-    // individual 64 KiB-aligned commitments replace owned placeholders.
-    const bool graphics_reserve = graphics && address && (type & MEM_LARGE_PAGES) &&
+    // Xbox's large graphics pages are 64 KiB; reservations round to that size.
+    // Null addresses select a free address in the same 40-bit graphics window.
+    const bool graphics_reserve = graphics && (type & MEM_LARGE_PAGES) &&
         (type & ~(mem_graphics | MEM_LARGE_PAGES)) == MEM_RESERVE &&
-        !(reinterpret_cast<std::uintptr_t>(address) & ((1u << 21) - 1)) && !(size & ((1u << 21) - 1));
+        !(reinterpret_cast<std::uintptr_t>(address) & 65535) &&
+        (protection == PAGE_READWRITE || protection == (PAGE_READWRITE | 0x10000));
     const bool graphics_commit = address && type == (mem_graphics | MEM_LARGE_PAGES | MEM_COMMIT) &&
-        !(reinterpret_cast<std::uintptr_t>(address) & 65535) && !(size & 65535) &&
+        !(reinterpret_cast<std::uintptr_t>(address) & 65535) &&
         (protection == PAGE_READWRITE || protection == (PAGE_READWRITE | 0x10000));
     if (!size || (!graphics_reserve && !graphics_commit && (type & ~(supported | mem_title)))) {
         memory_error(address, size, type, protection, ERROR_NOT_SUPPORTED); return nullptr;
+    }
+    if (graphics_commit) {
+        if (size > SIZE_MAX - 65535) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+        size = (size + 65535) & ~SIZE_T{65535};
     }
     std::lock_guard lock(memory_mutex);
     if (address && !(type & MEM_RESERVE)) {
@@ -281,6 +296,7 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
             auto& commits = region->second.commits;
             auto next = commits.lower_bound(at);
             if (next != commits.end() && next->first == at && next->second.size == size) {
+                if (next->second.esram_page != UINT_MAX) { SetLastError(ERROR_INVALID_ADDRESS); return nullptr; }
                 if (next->second.gpu_pins) { SetLastError(ERROR_BUSY); return nullptr; }
                 if (next->second.guest_protection != protection) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
                 return address; // The same span is already committed; preserve its bytes.
@@ -325,8 +341,15 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
     if (graphics_reserve) {
         const auto allocate = host_allocate2();
         if (!allocate || !host_map3() || !host_unmap2()) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
-        result = allocate(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                          PAGE_NOACCESS, nullptr, 0);
+        if (size > SIZE_MAX - 65535) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+        MEM_ADDRESS_REQUIREMENTS requirements{};
+        requirements.Alignment = 65536;
+        requirements.LowestStartingAddress = reinterpret_cast<void*>(0x100000000ull);
+        requirements.HighestEndingAddress = reinterpret_cast<void*>(0xffffffffffull);
+        MEM_EXTENDED_PARAMETER parameter{};
+        parameter.Type = MemExtendedParameterAddressRequirements; parameter.Pointer = &requirements;
+        result = allocate(GetCurrentProcess(), address, (size + 65535) & ~SIZE_T{65535}, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                          PAGE_NOACCESS, address ? nullptr : &parameter, address ? 0 : 1);
     } else result = VirtualAlloc(address, size, type & ~mem_title, protection);
     if (!result) memory_error(address, size, type, protection, GetLastError());
     if (result && ((type & MEM_RESERVE) || !address)) {
@@ -540,6 +563,112 @@ HMODULE WINAPI era_GetModuleHandleW(LPCWSTR name) {
 
 } // namespace
 
+HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_list) {
+    const SIZE_T unit = flags == 1 ? esram_page_bytes : flags == 2 ? SIZE_T{4} << 20 : 0;
+    if (!unit || !address || !pages || pages > esram_bytes / unit || reinterpret_cast<std::uintptr_t>(address) % unit)
+        return E_INVALIDARG;
+    try {
+        std::vector<UINT> input(pages);
+        SIZE_T read = 0;
+        if (page_list && (!ReadProcessMemory(GetCurrentProcess(), page_list, input.data(), input.size() * sizeof(UINT), &read) ||
+            read != input.size() * sizeof(UINT))) return E_INVALIDARG;
+        if (page_list && std::any_of(input.begin(), input.end(), [unit](UINT page) { return page >= esram_bytes / unit; })) return E_INVALIDARG;
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        const SIZE_T bytes = pages * unit;
+        std::lock_guard lock(memory_mutex);
+        auto region = title_regions.upper_bound(at);
+        if (region == title_regions.begin()) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+        --region;
+        if (!region->second.graphics || region->second.xmem || at - region->first >= region->second.size ||
+            bytes > region->second.size - (at - region->first)) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+        for (const auto& [range, window] : region->second.windows)
+            if ((window.active || window.cpu) && at - region->first < range.first + range.second &&
+                range.first < at - region->first + bytes) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        struct Change { std::uintptr_t address; UINT before, after; bool changed = false; };
+        std::vector<Change> changes;
+        changes.reserve(bytes / esram_page_bytes);
+        std::map<std::uintptr_t, GpuBacking> staged;
+        for (SIZE_T offset = 0; offset < bytes; offset += esram_page_bytes) {
+            const auto target = at + offset;
+            auto found = region->second.commits.upper_bound(target);
+            UINT before = UINT_MAX;
+            if (found != region->second.commits.begin()) {
+                --found;
+                if (target - found->first < found->second.size) {
+                    if (found->first != target || found->second.size != esram_page_bytes || found->second.esram_page == UINT_MAX)
+                        return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+                    if (found->second.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
+                    before = found->second.esram_page;
+                }
+            }
+            const UINT after = page_list ? UINT((SIZE_T(input[offset / unit]) * unit + offset % unit) / esram_page_bytes) : UINT_MAX;
+            for (const UINT physical : {before, after})
+                if (physical != UINT_MAX && (esram.pages[physical].gpu || esram.pages[physical].cpu)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+            changes.push_back({target, before, after});
+            if (before == UINT_MAX && after != UINT_MAX) staged.emplace(target, GpuBacking{esram_page_bytes});
+        }
+        const auto map = host_map3(); const auto unmap = host_unmap2();
+        if (!map || !unmap) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+        if (page_list && !esram.mapping.IsValid()) {
+            const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(esram_bytes), nullptr);
+            if (!handle) return HRESULT_FROM_WIN32(GetLastError());
+            esram.mapping.Attach(handle);
+        }
+        DWORD failure = 0;
+        for (auto& change : changes) {
+            if (change.before == change.after) continue;
+            if (change.before != UINT_MAX) {
+                if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(change.address), MEM_PRESERVE_PLACEHOLDER)) { failure = GetLastError(); break; }
+                change.changed = true;
+            } else {
+                MEMORY_BASIC_INFORMATION info{};
+                if (!VirtualQuery(reinterpret_cast<void*>(change.address), &info, sizeof info) || info.State != MEM_RESERVE) {
+                    failure = ERROR_INVALID_ADDRESS; break;
+                }
+                const auto start = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+                if (change.address > start && !VirtualFree(info.BaseAddress, change.address - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                    failure = GetLastError(); break;
+                }
+                if (start + info.RegionSize - change.address > esram_page_bytes &&
+                    !VirtualFree(reinterpret_cast<void*>(change.address), esram_page_bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+                    failure = GetLastError(); break;
+                }
+            }
+            if (change.after != UINT_MAX && !map(esram.mapping.Get(), GetCurrentProcess(), reinterpret_cast<void*>(change.address),
+                UINT64(change.after) * esram_page_bytes, esram_page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0)) {
+                failure = GetLastError(); break;
+            }
+            change.changed = true;
+        }
+        if (failure) {
+            // Restore completed remaps before exposing the failure. No bytes in
+            // the physical pool are overwritten by mapping or rollback itself.
+            for (auto change = changes.rbegin(); change != changes.rend(); ++change) if (change->changed) {
+                MEMORY_BASIC_INFORMATION info{};
+                VirtualQuery(reinterpret_cast<void*>(change->address), &info, sizeof info);
+                bool restored = info.State != MEM_COMMIT || unmap(GetCurrentProcess(), reinterpret_cast<void*>(change->address), MEM_PRESERVE_PLACEHOLDER);
+                if (restored && change->before != UINT_MAX)
+                    restored = map(esram.mapping.Get(), GetCurrentProcess(), reinterpret_cast<void*>(change->address),
+                        UINT64(change->before) * esram_page_bytes, esram_page_bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) != nullptr;
+                if (!restored) {
+                    std::fputs("xone-era: ESRAM mapping rollback failed; refusing inconsistent address state\n", stderr);
+                    TerminateProcess(GetCurrentProcess(), 126);
+                }
+            }
+            return HRESULT_FROM_WIN32(failure);
+        }
+        for (const auto& change : changes) {
+            if (change.after == UINT_MAX) region->second.commits.erase(change.address);
+            else {
+                if (change.before == UINT_MAX) region->second.commits.insert(staged.extract(change.address));
+                auto& commit = region->second.commits.at(change.address);
+                commit.esram_page = change.after; commit.guest_protection = PAGE_READWRITE;
+            }
+        }
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+
 static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Device* device, TitleGpuResource& out,
                                     D3D12_RESOURCE_FLAGS flags, bool aligned, const TitleTextureLayout* texture) {
     if (!address || !size || !device || out.resource) return E_INVALIDARG;
@@ -551,12 +680,31 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
     --found;
     auto base = found->first;
     auto* backing = static_cast<GpuBacking*>(&found->second);
+    bool composite = false;
     if (!found->second.xmem) {
-        auto commit = found->second.commits.upper_bound(at);
-        if (!found->second.graphics || commit == found->second.commits.begin()) return E_INVALIDARG;
-        --commit;
-        base = commit->first;
-        backing = &commit->second;
+        const auto offset = at - found->first;
+        if (!found->second.graphics || offset >= found->second.size || size > found->second.size - offset) return E_INVALIDARG;
+        if (aligned) {
+            auto cursor = at;
+            while (cursor < at + size) {
+                auto commit = found->second.commits.upper_bound(cursor);
+                if (commit == found->second.commits.begin()) return E_INVALIDARG;
+                --commit;
+                const auto inside = cursor - commit->first;
+                if (inside >= commit->second.size) return E_INVALIDARG;
+                if (commit->second.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
+                cursor += (std::min)(SIZE_T(at + size - cursor), commit->second.size - inside);
+            }
+            composite = true;
+        } else {
+            if (found->second.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
+            auto commit = found->second.commits.upper_bound(at);
+            if (!found->second.graphics || commit == found->second.commits.begin()) return E_INVALIDARG;
+            --commit;
+            if (commit->second.esram_page != UINT_MAX) return DXGI_ERROR_UNSUPPORTED; // Physical aliases use the coherent aligned path.
+            base = commit->first;
+            backing = &commit->second;
+        }
     }
     auto& region = *backing;
     const auto offset = at - base;
@@ -568,7 +716,7 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
     if (region.device && region.device.Get() != identity.Get()) return DXGI_ERROR_INVALID_CALL;
     const auto canonical_flags = aligned ? D3D12_RESOURCE_FLAG_NONE : flags;
     if (region.buffer && (region.buffer->GetDesc().Flags & canonical_flags) != canonical_flags) return DXGI_ERROR_UNSUPPORTED;
-    if (!region.buffer) {
+    if (!region.buffer && !composite) {
         Microsoft::WRL::ComPtr<ID3D12Device3> device3;
         hr = device->QueryInterface(IID_PPV_ARGS(&device3));
         if (FAILED(hr)) return hr;
@@ -617,6 +765,7 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
                 desc.Height = 1; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
                 desc.SampleDesc.Count = 1; desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; desc.Flags = flags;
                 GpuWindow entry;
+                entry.staged_buffer = composite && !texture;
                 if (texture) { entry.texture = *texture; desc = texture->resource_desc; }
                 hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                     nullptr, IID_PPV_ARGS(&entry.resource));
@@ -625,10 +774,12 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
             } else if ((window->second.resource->GetDesc().Flags & flags) != flags) return DXGI_ERROR_UNSUPPORTED;
             ++window->second.owners;
             ++region.gpu_pins;
+            if (composite) region.device = identity;
             out.resource = window->second.resource.Get(); out.resource->AddRef();
             out.allocation = reinterpret_cast<void*>(base);
             out.representation = &window->second;
             out.canonical_offset = offset; out.size = size;
+            out.composite = composite;
             return S_OK;
         } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
     }
@@ -667,6 +818,7 @@ GpuBacking* gpu_backing(const TitleGpuResource& buffer) {
     auto found = title_regions.upper_bound(base);
     if (found == title_regions.begin()) return nullptr;
     --found;
+    if (buffer.composite) return found->first == base && found->second.graphics && !found->second.xmem ? &found->second : nullptr;
     if (found->second.xmem) return found->first == base ? &found->second : nullptr;
     auto commit = found->second.commits.find(base);
     return commit == found->second.commits.end() ? nullptr : &commit->second;
@@ -677,6 +829,35 @@ GpuWindow* gpu_window(const TitleGpuResource& buffer, GpuBacking* backing) {
     for (auto found = range.first; found != range.second; ++found)
         if (&found->second == buffer.representation && found->second.resource.Get() == buffer.resource) return &found->second;
     return nullptr;
+}
+HRESULT physical_pages(const TitleGpuResource& buffer, std::array<bool, 512>& pages, bool reject_duplicates) {
+    pages.fill(false);
+    if (!buffer.composite) return S_OK;
+    const auto base = reinterpret_cast<std::uintptr_t>(buffer.allocation);
+    const auto region = title_regions.find(base);
+    if (region == title_regions.end()) return E_INVALIDARG;
+    auto cursor = base + buffer.canonical_offset;
+    const auto end = cursor + buffer.size;
+    while (cursor < end) {
+        auto commit = region->second.commits.upper_bound(cursor);
+        if (commit == region->second.commits.begin()) return E_INVALIDARG;
+        --commit;
+        const auto inside = cursor - commit->first;
+        if (inside >= commit->second.size) return E_INVALIDARG;
+        const UINT page = commit->second.esram_page;
+        if (page != UINT_MAX) {
+            if (pages[page] && reject_duplicates) return DXGI_ERROR_UNSUPPORTED;
+            pages[page] = true;
+        }
+        cursor += (std::min)(SIZE_T(end - cursor), commit->second.size - inside);
+    }
+    return S_OK;
+}
+void release_physical(GpuWindow& window, TitleGpuResource* owner, bool cpu) {
+    for (UINT page = 0; page < window.physical_pages.size(); ++page) if (window.physical_pages[page]) {
+        auto*& gate = cpu ? esram.pages[page].cpu : esram.pages[page].gpu;
+        if (gate == owner) gate = nullptr;
+    }
 }
 HRESULT completed_fence(GpuBacking* backing, ID3D12Fence* fence, UINT64 value) {
     if (!fence || value == UINT64_MAX) return E_INVALIDARG;
@@ -727,7 +908,36 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     if (texture && (state & ~(D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_COPY_DEST |
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET))) return DXGI_ERROR_UNSUPPORTED;
+    hr = physical_pages(buffer, window->physical_pages, true);
+    if (FAILED(hr)) return hr;
+    for (UINT page = 0; page < window->physical_pages.size(); ++page)
+        if (window->physical_pages[page] && (esram.pages[page].gpu || esram.pages[page].cpu)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    for (UINT page = 0; page < window->physical_pages.size(); ++page)
+        if (window->physical_pages[page]) esram.pages[page].gpu = &buffer;
     window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;
+    return S_OK;
+}
+
+static HRESULT prepare_staged_buffer(GpuWindow& window, const void* canonical, SIZE_T bytes) {
+    if (!bytes || bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
+    if (!window.upload) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        HRESULT hr = window.resource->GetDevice(IID_PPV_ARGS(&device));
+        if (FAILED(hr)) return hr;
+        auto desc = window.resource->GetDesc(); desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        Microsoft::WRL::ComPtr<ID3D12Resource> upload, readback;
+        hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload));
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        if (SUCCEEDED(hr)) hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+        if (FAILED(hr)) return hr;
+        window.upload = std::move(upload); window.readback = std::move(readback); window.staging_bytes = bytes;
+    }
+    void* mapped = nullptr; const D3D12_RANGE no_read{0, 0};
+    const HRESULT hr = window.upload->Map(0, &no_read, &mapped);
+    if (FAILED(hr)) return hr;
+    std::memcpy(mapped, canonical, bytes);
+    const D3D12_RANGE written{0, bytes}; window.upload->Unmap(0, &written);
     return S_OK;
 }
 
@@ -736,6 +946,18 @@ HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandLi
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
     const HRESULT hr = claim_gpu_window(buffer, list, state, false, backing, window);
     if (FAILED(hr)) return hr;
+    if (window->staged_buffer) {
+        const auto* canonical = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
+        const HRESULT prepared = prepare_staged_buffer(*window, canonical, buffer.size);
+        if (FAILED(prepared)) {
+            release_physical(*window, &buffer, false); window->active = nullptr; window->list.Reset();
+            return prepared;
+        }
+        gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(buffer.resource, 0, window->upload.Get(), 0, buffer.size);
+        gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COPY_DEST, state);
+        return S_OK;
+    }
     gpu_transition(list, backing->buffer.Get(), backing->initial_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     list->CopyBufferRegion(buffer.resource, 0, backing->buffer.Get(), buffer.canonical_offset, buffer.size);
@@ -750,9 +972,12 @@ HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList
     auto* window = gpu_window(buffer, backing);
     if (!window || window->texture.context || window->active != &buffer || window->list.Get() != list || window->copied_back) return E_INVALIDARG;
     gpu_transition(list, buffer.resource, window->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    gpu_transition(list, backing->buffer.Get(), backing->initial_state, D3D12_RESOURCE_STATE_COPY_DEST);
-    list->CopyBufferRegion(backing->buffer.Get(), buffer.canonical_offset, buffer.resource, 0, buffer.size);
-    gpu_transition(list, backing->buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, backing->initial_state);
+    if (window->staged_buffer) list->CopyBufferRegion(window->readback.Get(), 0, buffer.resource, 0, buffer.size);
+    else {
+        gpu_transition(list, backing->buffer.Get(), backing->initial_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(backing->buffer.Get(), buffer.canonical_offset, buffer.resource, 0, buffer.size);
+        gpu_transition(list, backing->buffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST, backing->initial_state);
+    }
     gpu_transition(list, buffer.resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     window->copied_back = true;
     return S_OK;
@@ -883,7 +1108,7 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
     hr = prepare_texture_upload(*window, canonical);
     lock.lock();
     window->preparing = false;
-    if (FAILED(hr)) { window->active = nullptr; window->list.Reset(); return hr; }
+    if (FAILED(hr)) { release_physical(*window, &texture, false); window->active = nullptr; window->list.Reset(); return hr; }
     auto* copy_target = window->sample_array ? window->sample_array.Get() : texture.resource;
     gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     for (UINT i = 0; i < window->footprints.size(); ++i) {
@@ -954,7 +1179,7 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
     if (!window->copied_back || window->completing) return E_PENDING;
     const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;
-    if (window->texture.context) {
+    if (window->texture.context || window->staged_buffer) {
         window->completing = true;
         auto* canonical = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
         lock.unlock();
@@ -966,7 +1191,8 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
             const D3D12_RANGE read{0, static_cast<SIZE_T>(window->staging_bytes)};
             converted = window->readback->Map(0, &read, &mapped);
             if (SUCCEEDED(converted)) {
-                if (window->sample_array) {
+                if (window->staged_buffer) std::memcpy(commit.data(), mapped, buffer.size);
+                else if (window->sample_array) {
                     interleave_samples(*window, mapped, false);
                     const auto& desc = window->texture.resource_desc;
                     const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * 4;
@@ -988,6 +1214,7 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
         if (FAILED(converted)) return converted; // Preserve the gate and canonical preimage for a retry.
         std::memcpy(canonical, commit.data(), commit.size());
     }
+    release_physical(*window, &buffer, false);
     window->active = nullptr; window->list.Reset(); window->copied_back = false;
     return S_OK;
 }
@@ -1004,6 +1231,14 @@ HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address) {
         if (alias.cpu && buffer.canonical_offset < range.first + range.second &&
             range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
     }
+    HRESULT hr = physical_pages(buffer, window->physical_pages, false);
+    if (FAILED(hr)) return hr;
+    for (UINT page = 0; page < window->physical_pages.size(); ++page) if (window->physical_pages[page]) {
+        if (esram.pages[page].gpu) return E_PENDING;
+        if (esram.pages[page].cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    }
+    for (UINT page = 0; page < window->physical_pages.size(); ++page)
+        if (window->physical_pages[page]) esram.pages[page].cpu = &buffer;
     window->cpu = &buffer;
     *address = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
     return S_OK;
@@ -1013,6 +1248,7 @@ HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer) {
     std::lock_guard lock(memory_mutex);
     auto* window = gpu_window(buffer, gpu_backing(buffer));
     if (!window || window->cpu != &buffer) return E_INVALIDARG;
+    release_physical(*window, &buffer, true);
     window->cpu = nullptr;
     return S_OK;
 }
@@ -1025,8 +1261,9 @@ HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence,
     auto found = title_regions.upper_bound(base);
     if (found == title_regions.begin()) return E_INVALIDARG;
     --found;
+    if (buffer.composite && (found->first != base || !found->second.graphics || found->second.xmem)) return E_INVALIDARG;
     auto* backing = static_cast<GpuBacking*>(&found->second);
-    if (!found->second.xmem) {
+    if (!found->second.xmem && !buffer.composite) {
         const auto commit = found->second.commits.find(base);
         if (commit == found->second.commits.end()) return E_INVALIDARG;
         backing = &commit->second;
@@ -1035,7 +1272,7 @@ HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence,
     auto* window = gpu_window(buffer, backing);
     if (buffer.representation ? !window : backing->buffer.Get() != buffer.resource) return E_INVALIDARG;
     if (window && window->cpu) return E_PENDING;
-    if (window && window->texture.context && window->active) return E_PENDING;
+    if (window && (window->texture.context || window->staged_buffer) && window->active) return E_PENDING;
     if (window && window->active && (window->active != &buffer || !window->copied_back)) return E_PENDING;
     const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;

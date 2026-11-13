@@ -3043,6 +3043,7 @@ int main(int argc, char** argv) {
                     activation_factory && factory->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity))==S_OK &&
                     identity==activation_factory,"Package factory and statics preserve one COM identity");
                 if(identity)identity->Release();if(activation_factory)activation_factory->Release();
+                IInspectable* retained=nullptr;
                 IInspectable* current=reinterpret_cast<IInspectable*>(1);
                 set_title_package_root({});
                 check(get(factory,nullptr)==E_POINTER && get(factory,&current)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !current,
@@ -3053,30 +3054,16 @@ int main(int argc, char** argv) {
                     IInspectable* second=nullptr;
                     check(get(factory,&second)==S_OK && second==current,"Current retains one COM identity for an immutable package revision");
                     if(second)second->Release();
-                    IInspectable* id=nullptr;
-                    const auto get_id=reinterpret_cast<Get>((*reinterpret_cast<void***>(current))[6]);
-                    check(get_id(current,nullptr)==E_POINTER && get_id(current,&id)==S_OK && id,"Package.Id retains the metadata snapshot");
-                    if(id) {
-                        const auto vt=*reinterpret_cast<void***>(id);
-                        using String=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
-                        HSTRING value=nullptr;
-                        check(reinterpret_cast<String>(vt[6])(id,&value)==S_OK && text(value)==L"XboxOneNative.OwnedLifecycleTest",
-                            "package name comes from the manifest, not host process identity");
-                        struct {USHORT words[4]{};UINT guard=0x12345678;} version;
-                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,USHORT*)>(vt[7])(id,version.words)==S_OK &&
-                            version.words[0]==1 && !version.words[1] && !version.words[2] && !version.words[3] && version.guard==0x12345678,
-                            "PackageVersion preserves Major/Minor/Build/Revision order and output extent");
-                        UINT architecture=99;
-                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT*)>(vt[8])(id,&architecture)==S_OK && architecture==1,
-                            "Appx AMD64 maps to the WinRT X64 enum");
-                        set_title_package_root({});
-                        second=reinterpret_cast<IInspectable*>(1);
-                        check(get(factory,&second)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !second &&
-                            reinterpret_cast<String>(vt[6])(id,&value)==S_OK && text(value)==L"XboxOneNative.OwnedLifecycleTest",
-                            "rebinding invalidates Current while retained package metadata remains alive");
-                        id->Release();
-                    }
-                    current->Release();
+                    xboxone::appmodel::Manifest metadata;std::wstring location;std::string revision;
+                    check(title_package_metadata(metadata,location,revision)==S_OK && metadata.name==expected.name &&
+                        metadata.version==expected.version && location==root.wstring() && revision==manifest_hash+hash,
+                        "Current context preserves the real SDK metadata and both hashes");
+                    set_title_package_root({});second=reinterpret_cast<IInspectable*>(1);
+                    HSTRING value=nullptr;
+                    check(get(factory,&second)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !second &&
+                        current->GetRuntimeClassName(&value)==S_OK && text(value)==L"Windows.ApplicationModel.Package",
+                        "rebinding invalidates Current while retained snapshots remain alive");
+                    retained=current;
                 }
                 set_title_package_root(root.wstring(),"../owned.exe",hash);
                 check(get(factory,&current)==E_INVALIDARG && !current,"package executable traversal is refused");
@@ -3109,16 +3096,13 @@ int main(int argc, char** argv) {
                     "Appx 2010 metadata preserves absent device families and explicit unsupported activation contracts");
                 set_title_package_root(root.wstring(),"owned.exe",hash);
                 check(get(factory,&current)==S_OK && current,"Current supports verified legacy metadata without host deployment");
-                if(current) {
-                    IInspectable* id=nullptr;
-                    check(reinterpret_cast<Get>((*reinterpret_cast<void***>(current))[6])(current,&id)==S_OK && id,"legacy Package.Id is retained");
-                    if(id) {
-                        std::array<USHORT,4> version{};
-                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,USHORT*)>((*reinterpret_cast<void***>(id))[7])(id,version.data())==S_OK &&
-                            version==std::array<USHORT,4>{1,2,3,4},"legacy version preserves all four distinct components");
-                        id->Release();
-                    }
-                    current->Release();
+                check(expected.version==0x0001000200030004ull,"legacy metadata preserves all four version components");
+                if(current)current->Release();
+                if(retained) {
+                    HSTRING value=nullptr;
+                    check(retained->GetRuntimeClassName(&value)==S_OK && text(value)==L"Windows.ApplicationModel.Package",
+                        "a retained snapshot survives cache replacement by another package revision");
+                    retained->Release();
                 }
                 factory->Release();
             }

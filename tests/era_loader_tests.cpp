@@ -1649,7 +1649,65 @@ int main(int argc, char** argv) {
         check(activate(L"Windows.Foundation.Uri", __uuidof(IActivationFactory), reinterpret_cast<void**>(&host)) == S_OK && host,
               "host class forwarded to Windows");
         void* missing = &missing;
-        check(activate(L"Windows.Xbox.Input.Gamepad", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
+        {
+            constexpr GUID controller_statics{0x7400624f,0x144b,0x47fc,{0x9f,0x3b,0x1d,0xca,0xfb,0x48,0x28,0x73}};
+            constexpr GUID gamepad_statics{0x8c4c1bcd,0xfdab,0x4bf8,{0xbd,0xe9,0xab,0xb2,0xb1,0xd6,0xfd,0xd3}};
+            IInspectable* input = nullptr;
+            check(activate(L"Windows.Xbox.Input.Controller",controller_statics,reinterpret_cast<void**>(&input)) == S_OK && input,
+                "observed Controller statics are implemented in the common runtime");
+            using GetView = HRESULT(STDMETHODCALLTYPE*)(void*, IInspectable**);
+            using Size = HRESULT(STDMETHODCALLTYPE*)(void*, UINT*);
+            using Get = HRESULT(STDMETHODCALLTYPE*)(void*, UINT, IUnknown**);
+            IInspectable* view = nullptr;
+            if (input) {
+                const auto get = reinterpret_cast<GetView>((*reinterpret_cast<void***>(input))[6]);
+                check(get(input,nullptr) == E_POINTER && get(input,&view) == S_OK && view, "real XInput enumeration validates outputs");
+            }
+            if (view) {
+                const auto vt = *reinterpret_cast<void***>(view);
+                UINT count = 99;
+                check(reinterpret_cast<Size>(vt[7])(view,&count) == S_OK && count <= 4, "controller snapshot reflects the bounded host API");
+                IUnknown* item = reinterpret_cast<IUnknown*>(1);
+                check(reinterpret_cast<Get>(vt[6])(view,count,&item) == E_BOUNDS && !item, "snapshot rejects an out-of-range controller");
+                if (count) {
+                    check(reinterpret_cast<Get>(vt[6])(view,0,&item) == S_OK && item, "connected host controller has a retained interface");
+                    if (item) {
+                        IUnknown* identity = nullptr;
+                        check(item->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity)) == S_OK && identity == item,
+                            "controller COM identity is preserved");
+                        if (identity) identity->Release();
+                        item->Release();
+                    }
+                }
+                view->Release();
+            }
+            struct InputHandler : IUnknown {
+                ULONG refs = 1;
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override { if(!out)return E_POINTER; *out=this; AddRef(); return S_OK; }
+                ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+                ULONG STDMETHODCALLTYPE Release() override { return --refs; }
+                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable*) { return S_OK; }
+            } handler;
+            using AddInput = HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, INT64*);
+            using RemoveInput = HRESULT(STDMETHODCALLTYPE*)(void*, INT64);
+            if (input) {
+                auto vt = *reinterpret_cast<void***>(input); INT64 token = 0;
+                check(reinterpret_cast<AddInput>(vt[7])(input,&handler,&token) == S_OK && token && handler.refs == 2,
+                    "input subscription retains the real handler");
+                check(reinterpret_cast<RemoveInput>(vt[8])(input,token) == S_OK && handler.refs == 1,
+                    "input unsubscription releases handler ownership");
+                check(reinterpret_cast<AddInput>(vt[11])(input,&handler,&token) == S_OK && handler.refs == 2,
+                    "observed pairing subscription preserves its callback");
+                stop_title_input();
+                check(handler.refs == 1, "session teardown releases subscriptions and stops the input timer");
+                input->Release();
+            }
+            IInspectable* pads = nullptr;
+            check(activate(L"Windows.Xbox.Input.Gamepad",gamepad_statics,reinterpret_cast<void**>(&pads)) == S_OK && pads,
+                "Gamepad statics use the same host-backed controller registry");
+            if (pads) pads->Release();
+        }
+        check(activate(L"Windows.Xbox.Input.BodyController", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
               "unimplemented Xbox class keeps the real host error");
         {
             constexpr GUID iid_transfer_statics{0xd6cf4cae, 0x9eb1, 0x4cbe, {0xb4,0x26,0x7e,0x75,0xd4,0x29,0xf8,0x46}};
@@ -1802,6 +1860,23 @@ int main(int argc, char** argv) {
                     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(view, &handler, &token);
                 }
                 virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
+                    constexpr GUID iid_window_static{0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};
+                    IInspectable* statics = nullptr;
+                    check(core_window_factory(iid_window_static,reinterpret_cast<void**>(&statics)) == S_OK && statics,
+                        "CoreWindow static factory is served by the same runtime");
+                    if (statics) {
+                        using Current = HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable**);
+                        const auto get = reinterpret_cast<Current>((*reinterpret_cast<void***>(statics))[6]);
+                        IInspectable* current = nullptr;
+                        check(get(statics,nullptr) == E_POINTER && get(statics,&current) == S_OK && current == window,
+                            "GetForCurrentThread returns the exact SetWindow identity");
+                        if (current) current->Release();
+                        std::thread foreign([&] {
+                            IInspectable* other = reinterpret_cast<IInspectable*>(1);
+                            check(get(statics,&other) == S_OK && !other, "foreign thread has no runtime CoreWindow");
+                        });
+                        foreign.join(); statics->Release();
+                    }
                     HSTRING name = nullptr;
                     window->GetRuntimeClassName(&name);
                     lifecycle += std::wstring(WindowsGetStringRawBuffer(name, nullptr)) == L"Windows.UI.Core.CoreWindow" ? "S" : "s";

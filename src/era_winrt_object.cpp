@@ -148,9 +148,10 @@ std::array<const void*, winrt_slots> winrt_vtable() {
 HRESULT WinrtEvent::add(IUnknown* handler, std::int64_t* token) {
     if (!handler || !token) return E_INVALIDARG;
     std::lock_guard lock(mutex_);
+    try { handlers_.emplace_back(next_, handler); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
     handler->AddRef();
     *token = next_++;
-    handlers_.emplace_back(*token, handler);
     return S_OK;
 }
 
@@ -168,8 +169,15 @@ HRESULT WinrtEvent::remove(std::int64_t token) {
 std::vector<IUnknown*> WinrtEvent::snapshot() const {
     std::lock_guard lock(mutex_);
     std::vector<IUnknown*> copy;
+    copy.reserve(handlers_.size());
     for (const auto& h : handlers_) { h.second->AddRef(); copy.push_back(h.second); }
     return copy;
+}
+
+void WinrtEvent::clear() {
+    std::vector<std::pair<std::int64_t, IUnknown*>> retired;
+    { std::lock_guard lock(mutex_); retired.swap(handlers_); }
+    for (const auto& entry : retired) entry.second->Release();
 }
 
 std::size_t WinrtEvent::size() const {

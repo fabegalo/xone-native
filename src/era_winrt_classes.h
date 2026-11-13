@@ -21,12 +21,17 @@ HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed);
 HWND core_window_hwnd(const void* window);
 // Windows.Xbox.System.User (statics; observed slots only).
 HRESULT xbox_user_factory(REFIID iid, void** factory);
+HRESULT xbox_controller_factory(REFIID iid, void** factory);
+HRESULT xbox_gamepad_factory(REFIID iid, void** factory);
+HRESULT poll_title_input();
+void stop_title_input();
 std::size_t xbox_user_removed_handlers(); // Test observation.
 // Windows.Xbox.Management.Deployment.DownloadableContentPackageManager.
 HRESULT dlc_package_manager_factory(REFIID iid, void** factory);
 HRESULT package_transfer_manager_factory(REFIID iid, void** factory);
 // Windows.ApplicationModel.Core.CoreApplication (view lifecycle driven here).
 HRESULT core_application_factory(REFIID iid, void** factory);
+HRESULT core_window_factory(REFIID iid, void** factory);
 inline constexpr char dlc_package_view_signature[] =
     "pinterface({bbe1fa4c-b0e3-4583-baef-1f1b2e483e56};rc(Windows.Xbox.Management.Deployment.DownloadableContentPackage;"
     "{696996e9-f0f6-4497-a05e-514d915b7d05}))";

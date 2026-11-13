@@ -100,6 +100,8 @@ HRESULT STDMETHODCALLTYPE process_events(WinrtObject*, INT32 option) {
     MSG message{};
     bool wait = option == 0 || option == 2;
     do {
+        const HRESULT input = poll_title_input();
+        if (FAILED(input)) return input;
         if (wait) {
             const BOOL result = GetMessageW(&message, nullptr, 0, 0);
             if (result == -1) return HRESULT_FROM_WIN32(GetLastError());
@@ -136,6 +138,14 @@ HRESULT STDMETHODCALLTYPE get_dispatcher(WinrtObject*, IInspectable** out) {
 HRESULT STDMETHODCALLTYPE add_closed(WinrtObject*, IUnknown* h, std::int64_t* t) { return window_closed.add(h, t); }
 HRESULT STDMETHODCALLTYPE remove_closed(WinrtObject*, std::int64_t t) { return window_closed.remove(t); }
 
+HRESULT STDMETHODCALLTYPE activate_window(WinrtObject*) {
+    if (!window) return RO_E_CLOSED;
+    if (GetCurrentThreadId() != window_thread) return RPC_E_WRONG_THREAD;
+    ShowWindow(window, SW_SHOW);
+    SetForegroundWindow(window);
+    return S_OK;
+}
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == WM_DESTROY && window_thread == GetCurrentThreadId()) PostQuitMessage(0);
     return DefWindowProcW(hwnd, message, wparam, lparam);
@@ -162,6 +172,7 @@ WinrtObject& core_window() {
     static const auto vt = [] {
         auto t = winrt_vtable();
         t[7] = reinterpret_cast<const void*>(&get_dispatcher);
+        t[11] = reinterpret_cast<const void*>(&activate_window);
         t[19] = reinterpret_cast<const void*>(&add_closed);
         t[20] = reinterpret_cast<const void*>(&remove_closed);
         return t;
@@ -231,6 +242,7 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
         if (SUCCEEDED(hr)) hr = un;
     }
     static_cast<IUnknown*>(fv)->Release();
+    stop_title_input();
     window_thread = 0;
     if (window) { DestroyWindow(window); window = nullptr; }
     WindowsDeleteString(entry_point);
@@ -302,6 +314,29 @@ HRESULT query(WinrtObject*, REFIID iid, void** out) {
 } // namespace
 
 HWND core_window_hwnd(const void* object) { return object == &core_window() ? window : nullptr; }
+
+static HRESULT window_factory_query(WinrtObject*, REFIID iid, void** out) { return core_window_factory(iid,out); }
+static HRESULT STDMETHODCALLTYPE current_window(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = window && GetCurrentThreadId() == window_thread ? reinterpret_cast<IInspectable*>(&core_window()) : nullptr;
+    if (*out) (*out)->AddRef();
+    return S_OK;
+}
+HRESULT core_window_factory(REFIID iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    constexpr GUID iid_static{0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};
+    static const auto activation_table = winrt_vtable();
+    static const auto static_table = [] {
+        auto t = winrt_vtable(); t[6] = reinterpret_cast<const void*>(&current_window); return t;
+    }();
+    static WinrtObject activation{activation_table.data(), window_class, __uuidof(IActivationFactory), &window_factory_query};
+    static WinrtObject statics{static_table.data(), window_class, iid_static, &window_factory_query};
+    if (iid == iid_static) *out = &statics;
+    else if (iid == __uuidof(IUnknown) || iid == __uuidof(IInspectable) || iid == __uuidof(IActivationFactory)) *out = &activation;
+    else return E_NOINTERFACE;
+    return S_OK;
+}
 
 HRESULT core_application_factory(REFIID iid, void** out) {
     if (!out) return E_POINTER;

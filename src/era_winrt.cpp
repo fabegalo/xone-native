@@ -30,9 +30,12 @@ struct TitleClass {
 constexpr TitleClass title_classes[]{
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
     {L"Windows.Xbox.System.User", &xbox_user_factory},
+    {L"Windows.Xbox.Input.Controller", &xbox_controller_factory},
+    {L"Windows.Xbox.Input.Gamepad", &xbox_gamepad_factory},
     {L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", &dlc_package_manager_factory},
     {L"Windows.Xbox.Management.Deployment.PackageTransferManager", &package_transfer_manager_factory},
     {L"Windows.ApplicationModel.Core.CoreApplication", &core_application_factory},
+    {L"Windows.UI.Core.CoreWindow", &core_window_factory},
 };
 
 void note(const wchar_t* text) {

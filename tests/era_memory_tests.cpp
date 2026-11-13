@@ -3,6 +3,7 @@
 #include "../src/era_memory.h"
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include <d3d11.h>
 #include <wrl/client.h>
 #include <cstring>
 #include <iostream>
@@ -470,7 +471,8 @@ int main(int argc, char** argv) {
         for (UINT mip = 0; mip < mips; ++mip) {
             const UINT columns = ((std::max)(1u, static_cast<UINT>(d.Width) >> mip) + block - 1) / block;
             const UINT rows = ((std::max)(1u, d.Height >> mip) + block - 1) / block;
-            expected[mip].resize(columns * rows * bytes_per_block);
+            const UINT depth = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? (std::max)(1u, UINT(d.DepthOrArraySize) >> mip) : 1;
+            expected[mip].resize(columns * rows * depth * bytes_per_block);
             for (UINT i = 0; i < expected[mip].size(); ++i) expected[mip][i] = static_cast<unsigned char>(0x39 + mip * 11 + i % 17);
             if (FAILED(layout.copy(layout.context.get(), true, expected[mip].data(), canonical, mip,
                 columns * bytes_per_block, columns * rows * bytes_per_block))) return false;
@@ -496,7 +498,10 @@ int main(int argc, char** argv) {
         device->GetCopyableFootprints(&d, 1, 1, 0, &mutation, &rows, &row_bytes, &total);
         void* data = nullptr;
         if (FAILED(upload->Map(0, nullptr, &data))) return false;
-        std::memset(data, 0xa7, mutation.Footprint.RowPitch * rows);
+        check(UINT64(mutation.Footprint.RowPitch) * rows * mutation.Footprint.Depth <= upload->GetDesc().Width,
+              "independent mutation fits its bounded upload fixture");
+        if (UINT64(mutation.Footprint.RowPitch) * rows * mutation.Footprint.Depth > upload->GetDesc().Width) return false;
+        std::memset(data, 0xa7, mutation.Footprint.RowPitch * rows * mutation.Footprint.Depth);
         upload->Unmap(0, nullptr);
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = upload.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = mutation;
@@ -577,6 +582,10 @@ int main(int argc, char** argv) {
         TitleTextureLayout layout;
         hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 4, 16, 9, nullptr), "original XG BC7 texture completes the real GPU coherence path");
+        hr = create_xg_texture3d_layout(16, 16, 16, 5, DXGI_FORMAT_R10G10B10A2_UNORM,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, layout);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 4, 11, nullptr),
+              "original XG volume preserves every depth slice through independent GPU writes and canonical reuse");
     }
     return failures ? 1 : 0;
 }

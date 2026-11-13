@@ -165,6 +165,69 @@ int main(int argc, char** argv) {
             VirtualQuery(root, &memory, sizeof memory);
             check(memory.State == MEM_COMMIT, "placed texture release preserves borrowed canonical storage");
             free_memory(root, attributes);
+            struct VolumeDesc { D3D11_TEXTURE3D_DESC standard; std::array<UINT, 2> extension{}; } volume_desc{};
+            static_assert(sizeof(VolumeDesc) == 44);
+            volume_desc.standard = {16, 16, 16, 1, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_USAGE_DEFAULT,
+                D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
+            using CreateVolume = HRESULT (STDMETHODCALLTYPE*)(void*, const VolumeDesc*, const D3D11_SUBRESOURCE_DATA*, void**);
+            const auto create_volume = reinterpret_cast<CreateVolume>(vt(device)[6]);
+            texture = nullptr;
+            check(create_volume(device, &volume_desc, nullptr, nullptr) == S_FALSE,
+                  "volume descriptor validation does not acquire ownership");
+            check(create_volume(device, &volume_desc, nullptr, &texture) == S_OK && texture,
+                  "observed volume factory owns original XG storage and a native UAV-capable texture");
+            if (texture) {
+                using GetVolumeDesc = void (STDMETHODCALLTYPE*)(void*, VolumeDesc*);
+                struct { VolumeDesc desc{}; UINT guard = 0xaabbccdd; } result;
+                reinterpret_cast<GetVolumeDesc>(vt(texture)[12])(texture, &result.desc);
+                check(!std::memcmp(&result.desc, &volume_desc, sizeof volume_desc) && result.guard == 0xaabbccdd,
+                      "volume GetDesc preserves the native forty-four-byte ABI");
+                using GetType = void (STDMETHODCALLTYPE*)(void*, D3D11_RESOURCE_DIMENSION*);
+                D3D11_RESOURCE_DIMENSION type{};
+                reinterpret_cast<GetType>(vt(texture)[8])(texture, &type);
+                check(type == D3D11_RESOURCE_DIMENSION_TEXTURE3D, "volume retains its real resource dimension");
+                using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
+                void* view = nullptr;
+                check(reinterpret_cast<CreateSrv>(vt(device)[7])(device, texture, nullptr, &view) == S_OK && view,
+                      "default volume SRV owns a native texture3D descriptor");
+                if (view) {
+                    D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+                    using GetSrvDesc = void (STDMETHODCALLTYPE*)(void*, D3D11_SHADER_RESOURCE_VIEW_DESC*);
+                    reinterpret_cast<GetSrvDesc>(vt(view)[9])(view, &desc);
+                    check(desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE3D && desc.Texture3D.MipLevels == 1 &&
+                        desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM, "volume SRV preserves dimension, format and mip range");
+                    check(reinterpret_cast<Count>(vt(texture)[2])(texture) == 1, "volume view retains its storage after caller release");
+                    texture = nullptr;
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            volume_desc.standard.MipLevels = 5; volume_desc.standard.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            volume_desc.standard.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            TitleTextureLayout volume_layout;
+            hr = create_xg_texture3d_layout(16, 16, 16, 5, volume_desc.standard.Format,
+                volume_desc.standard.BindFlags, volume_layout, 13);
+            check(hr == S_OK, "placement volume uses its specified original tile mode");
+            if (SUCCEEDED(hr)) {
+                auto* storage = static_cast<unsigned char*>(allocate(volume_layout.bytes + volume_layout.alignment + 32, attributes));
+                if (!storage) return 1;
+                std::memset(storage, 0x5a, volume_layout.bytes + volume_layout.alignment + 32);
+                const auto placed = (reinterpret_cast<std::uintptr_t>(storage) + 16 + volume_layout.alignment - 1) & ~(volume_layout.alignment - 1);
+                using PlaceVolume = HRESULT (STDMETHODCALLTYPE*)(void*, const VolumeDesc*, UINT, UINT, void*, void**);
+                const auto place_volume = reinterpret_cast<PlaceVolume>(vt(device)[65]);
+                texture = nullptr;
+                check(place_volume(device, &volume_desc, 13, 1, reinterpret_cast<void*>(placed), &texture) == DXGI_ERROR_UNSUPPORTED && !texture,
+                      "unknown volume placement flags remain explicit");
+                check(place_volume(device, &volume_desc, 13, 0, reinterpret_cast<void*>(placed), &texture) == S_OK && texture,
+                      "native slot sixty-five pins borrowed tiled volume storage");
+                if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+                MEMORY_BASIC_INFORMATION retained{};
+                VirtualQuery(storage, &retained, sizeof retained);
+                check(retained.State == MEM_COMMIT &&
+                    std::all_of(storage, storage + volume_layout.bytes + volume_layout.alignment + 32, [](auto x) { return x == 0x5a; }),
+                    "placement volume retirement preserves all borrowed bytes and ownership");
+                free_memory(storage, attributes);
+            }
             reinterpret_cast<Count>(vt(context)[2])(context);
             reinterpret_cast<Count>(vt(device)[2])(device);
             std::cout << "original XG graphics metadata " << (failures ? "FAILED" : "passed") << '\n';
@@ -1261,7 +1324,18 @@ int main(int argc, char** argv) {
                         }
                         check(reinterpret_cast<Query>(vt(adapter)[7])(adapter, factory2, &factory) == S_OK && factory,
                               "legacy GetParent is slot seven");
-                        if (factory) reinterpret_cast<Count>(vt(factory)[2])(factory);
+                        if (factory) {
+                            using CreateChain = HRESULT (STDMETHODCALLTYPE*)(void*, void*, IUnknown*, const DXGI_SWAP_CHAIN_DESC1*, void*, void**);
+                            const auto create_chain = reinterpret_cast<CreateChain>(vt(factory)[17]);
+                            void* chain = reinterpret_cast<void*>(1);
+                            check(create_chain(factory, device, nullptr, nullptr, nullptr, &chain) == DXGI_ERROR_INVALID_CALL,
+                                  "legacy factory slot seventeen validates the native swapchain ABI");
+                            DXGI_SWAP_CHAIN_DESC1 desc{};
+                            desc.Flags = 0x200000;
+                            check(create_chain(factory, device, nullptr, &desc, nullptr, &chain) == DXGI_ERROR_UNSUPPORTED && !chain,
+                                  "Xbox display conversion cannot be silently removed from the desktop descriptor");
+                            reinterpret_cast<Count>(vt(factory)[2])(factory);
+                        }
                         reinterpret_cast<Count>(vt(adapter)[2])(adapter);
                     }
                     reinterpret_cast<Count>(vt(dxgi)[2])(dxgi);

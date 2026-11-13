@@ -643,8 +643,9 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
     const auto& d = layout.resource_desc;
     if (!layout.context || !layout.copy || !layout.bytes || layout.bytes > (1u << 30) || !layout.alignment ||
         (layout.alignment & (layout.alignment - 1)) || reinterpret_cast<std::uintptr_t>(address) % layout.alignment) return E_INVALIDARG;
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !d.Width || !d.Height || !d.DepthOrArraySize || !d.MipLevels ||
-        d.SampleDesc.Count != 1 || d.SampleDesc.Quality || d.Flags || d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
+    if ((d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
+        !d.Width || !d.Height || !d.DepthOrArraySize || !d.MipLevels || d.SampleDesc.Count != 1 || d.SampleDesc.Quality ||
+        (d.Flags & ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) || d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
     return acquire_gpu_resource(address, layout.bytes, device, out, D3D12_RESOURCE_FLAG_NONE, true, &layout);
 }
 
@@ -708,7 +709,8 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     if ((state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
         !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
     if (texture && (state & ~(D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_COPY_DEST |
-        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))) return DXGI_ERROR_UNSUPPORTED;
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))) return DXGI_ERROR_UNSUPPORTED;
     window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;
     return S_OK;
 }
@@ -747,12 +749,12 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
             HRESULT hr = window.resource->GetDevice(IID_PPV_ARGS(&device));
             if (FAILED(hr)) return hr;
             const auto desc = window.resource->GetDesc();
-            const UINT count = desc.MipLevels * desc.DepthOrArraySize;
+            const UINT count = desc.MipLevels * (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : desc.DepthOrArraySize);
             window.footprints.resize(count); window.rows.resize(count);
             device->GetCopyableFootprints(&desc, 0, count, 0, window.footprints.data(), window.rows.data(), nullptr, &window.staging_bytes);
             for (UINT i = 0; i < count; ++i)
                 window.staging_bytes = (std::max)(window.staging_bytes,
-                    window.footprints[i].Offset + UINT64(window.footprints[i].Footprint.RowPitch) * window.rows[i]);
+                    window.footprints[i].Offset + UINT64(window.footprints[i].Footprint.RowPitch) * window.rows[i] * window.footprints[i].Footprint.Depth);
             if (!window.staging_bytes || window.staging_bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
             D3D12_RESOURCE_DESC staging{};
             staging.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; staging.Width = window.staging_bytes;

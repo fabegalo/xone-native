@@ -294,6 +294,9 @@ struct DxgiObject : GraphicsObject {
     Microsoft::WRL::ComPtr<ID3D12Fence> present_fence;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> present_source,present_target;
     UINT64 present_value = 0;
+    LONGLONG present_frequency = 0, present_tick = 0;
+    UINT present_fraction = 0;
+    Microsoft::WRL::Wrappers::FileHandle present_timer;
 };
 
 std::atomic<D3D11XTrapHandler> trap_handler{nullptr};
@@ -305,6 +308,7 @@ std::atomic<bool> xg_modern{false};
 std::string xg_identity;
 std::mutex xg_module_mutex;
 std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
+std::atomic<bool> graphics_diagnostics{false};
 const std::array<const void*, vtable_slots>& shader_vtable();
 
 [[noreturn]] void default_trap(const char* interface_name, unsigned slot) {
@@ -2405,8 +2409,66 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
     return S_OK;
 }
 
-HRESULT STDMETHODCALLTYPE swapchain_present(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input) {
-    if(!self->host || self->device->legacy || interval>4) return DXGI_ERROR_UNSUPPORTED;
+HRESULT pace_legacy_present(DxgiObject* self,UINT interval) {
+    if(!interval) {self->present_tick=0;self->present_fraction=0;return S_OK;}
+    LARGE_INTEGER now{},frequency{};
+    if(!QueryPerformanceCounter(&now)) return HRESULT_FROM_WIN32(GetLastError());
+    if(!self->present_frequency) {
+        if(!QueryPerformanceFrequency(&frequency)) return HRESULT_FROM_WIN32(GetLastError());
+        if(frequency.QuadPart<60 || frequency.QuadPart>(LLONG_MAX-59)/4) return E_INVALIDARG;
+        self->present_frequency=frequency.QuadPart;
+    }
+    if(!self->present_tick) {self->present_tick=now.QuadPart;return S_OK;}
+    // Reference 14004cae0 measures requested intervals against 60 Hz, independent of the PC display.
+    const auto numerator=self->present_frequency*interval+self->present_fraction;
+    const auto period=numerator/60;
+    if(self->present_tick>LLONG_MAX-period) return E_INVALIDARG;
+    auto deadline=self->present_tick+period;
+    if(now.QuadPart>deadline && now.QuadPart-deadline>period) deadline=now.QuadPart;
+    while(now.QuadPart<deadline) {
+        const auto remaining=deadline-now.QuadPart;
+        if(remaining>LLONG_MAX/10000000) return E_INVALIDARG;
+        const auto scaled=remaining*10000000;
+        LARGE_INTEGER due{};
+        due.QuadPart=-(scaled/self->present_frequency+(scaled%self->present_frequency ? 1 : 0));
+        if(!self->present_timer.IsValid()) {
+            self->present_timer.Attach(CreateWaitableTimerExW(nullptr,nullptr,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS));
+            if(!self->present_timer.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+        }
+        if(!SetWaitableTimer(self->present_timer.Get(),&due,0,nullptr,nullptr,FALSE)) return HRESULT_FROM_WIN32(GetLastError());
+        const DWORD waited=WaitForSingleObject(self->present_timer.Get(),5000);
+        if(waited!=WAIT_OBJECT_0) return HRESULT_FROM_WIN32(waited==WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError());
+        if(!QueryPerformanceCounter(&now)) return HRESULT_FROM_WIN32(GetLastError());
+    }
+    self->present_tick=deadline;self->present_fraction=UINT(numerator%60);
+    return S_OK;
+}
+void diagnose_presented_pixels(Texture* source,UINT64 frame) {
+    if(!graphics_diagnostics.load() || frame!=1) return;
+    const auto& desc=source->desc.standard;
+    const bool packed10=desc.Format==DXGI_FORMAT_R10G10B10A2_UNORM;
+    if((!packed10 && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM) ||
+        UINT64(desc.Width)*desc.Height>8u*1024*1024) return;
+    try {
+        std::vector<UINT32> pixels(SIZE_T(desc.Width)*desc.Height);
+        void* canonical=nullptr;
+        HRESULT hr=map_title_gpu_resource(source->gpu,&canonical);
+        if(SUCCEEDED(hr)) {
+            hr=source->layout.copy(source->layout.context.get(),false,pixels.data(),canonical,0,desc.Width*4,UINT(pixels.size()*4));
+            const HRESULT closed=unmap_title_gpu_resource(source->gpu);
+            if(SUCCEEDED(hr)) hr=closed;
+        }
+        if(FAILED(hr)) {std::fprintf(stderr,"xone-era: frame pixel verification failed 0x%08lX\n",hr);return;}
+        const UINT mask=packed10 ? 0x3fffffff : 0x00ffffff;
+        const auto nonblack=std::count_if(pixels.begin(),pixels.end(),[&](UINT value){return (value&mask)!=0;});
+        detail::Sha256 hash;
+        hash.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()),pixels.size()*4));
+        std::fprintf(stderr,"xone-era: presented title pixels %ux%u format %u nonblack %llu/%llu SHA256 %s\n",desc.Width,desc.Height,desc.Format,
+            static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str());
+    } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
+}
+HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input,bool legacy) {
+    if(!self->host || self->device->legacy!=legacy || interval>4) return DXGI_ERROR_UNSUPPORTED;
     DXGI_PRESENT_PARAMETERS parameters{};SIZE_T read=0;
     if(input && (!ReadProcessMemory(GetCurrentProcess(),input,&parameters,sizeof parameters,&read) || read!=sizeof parameters)) return E_INVALIDARG;
     if(flags || parameters.DirtyRectsCount || parameters.pScrollRect || parameters.pScrollOffset) return DXGI_ERROR_UNSUPPORTED;
@@ -2461,9 +2523,15 @@ HRESULT STDMETHODCALLTYPE swapchain_present(DxgiObject* self,UINT interval,UINT 
     if(FAILED(hr)) default_trap("presentation retirement",22);
     hr=complete_title_gpu_resource(source->gpu,self->present_fence.Get(),value);
     if(FAILED(hr)) return hr;
-    hr=chain->Present(interval,0);
-    if(stop_on_missing_service() && value<=3) std::fprintf(stderr,"xone-era: native frame %llu presented, host HRESULT 0x%08lX\n",value,hr);
+    if(legacy) {hr=pace_legacy_present(self,interval);if(FAILED(hr)) return hr;}
+    hr=chain->Present(legacy ? 0 : interval,0);
+    if((stop_on_missing_service() || graphics_diagnostics.load()) && value<=3)
+        std::fprintf(stderr,"xone-era: native frame %llu presented, host HRESULT 0x%08lX interval %u\n",value,hr,interval);
+    if(hr==S_OK) diagnose_presented_pixels(source,value);
     return hr;
+}
+HRESULT STDMETHODCALLTYPE swapchain_present(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input) {
+    return present_frame(self,interval,flags,input,false);
 }
 const std::array<const void*, vtable_slots>& swapchain_vtable() {
     static const auto table = [] {
@@ -2541,6 +2609,39 @@ const void* const* legacy_dxgi_vtable(const void* const* modern) {
     if (modern == factory_vtable().data()) return factory.data();
     if (modern == swapchain_vtable().data()) return swapchain.data();
     default_trap("unbound legacy DXGI object", 0);
+}
+struct LegacyPresentParameters {
+    UINT reserved[2];
+    RECT source;
+    POINT destination;
+    FLOAT scale[2];
+    UINT64 token;
+    UINT flags,reserved_tail;
+};
+static_assert(sizeof(LegacyPresentParameters)==56 && offsetof(LegacyPresentParameters,token)==40);
+HRESULT WINAPI era_DXGIXPresentArray(UINT interval,UINT threshold,UINT flags,UINT count,DxgiObject* const* input,const LegacyPresentParameters* parameters) {
+    const auto fail=[&](HRESULT hr,const char* stage) {
+        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: PresentArray %s failed 0x%08lX interval %u threshold %u flags 0x%X count %u\n",stage,hr,interval,threshold,flags,count);
+        return hr;
+    };
+    if(!legacy_abi_bound || interval>4 || !count || !input) return fail(E_INVALIDARG,"arguments");
+    if((threshold && threshold!=20) || flags || count!=1) return fail(DXGI_ERROR_UNSUPPORTED,"profile");
+    LegacyPresentParameters p{};p.scale[0]=p.scale[1]=1;
+    SIZE_T read=0;
+    if(parameters && (!ReadProcessMemory(GetCurrentProcess(),parameters,&p,sizeof p,&read) || read!=sizeof p)) return fail(E_INVALIDARG,"parameter read");
+    if(p.reserved[0] || p.reserved[1] || p.destination.x || p.destination.y || p.scale[0]!=1 || p.scale[1]!=1 || p.token || p.flags || p.reserved_tail)
+        return fail(DXGI_ERROR_UNSUPPORTED,"composition");
+    DxgiObject* chain=nullptr;
+    if(!ReadProcessMemory(GetCurrentProcess(),input,&chain,sizeof chain,&read) || read!=sizeof chain || !chain) return fail(E_INVALIDARG,"chain read");
+    struct Prefix {const void* table;UINT refs,flags;void* private_data;Device* device;IUnknown* host;} prefix{};
+    static_assert(sizeof prefix==offsetof(DxgiObject,display));
+    if(!ReadProcessMemory(GetCurrentProcess(),chain,&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+        prefix.table!=legacy_dxgi_vtable(swapchain_vtable().data()) || !prefix.device || !prefix.host) return fail(E_INVALIDARG,"chain identity");
+    const RECT full{0,0,LONG(chain->requested_desc.Width),LONG(chain->requested_desc.Height)};
+    const RECT empty{};
+    if(std::memcmp(&p.source,&full,sizeof full) && std::memcmp(&p.source,&empty,sizeof empty)) return fail(DXGI_ERROR_UNSUPPORTED,"source rectangle");
+    const HRESULT hr=present_frame(chain,interval,0,nullptr,true);
+    return FAILED(hr) ? fail(hr,"native transport") : hr;
 }
 
 HRESULT STDMETHODCALLTYPE context_query(Context* self, REFIID riid, void** out) {
@@ -2624,6 +2725,12 @@ const std::array<const void*, vtable_slots>& device_vtable() {
 UINT STDMETHODCALLTYPE device_creation_flags(Device* self) { return self->creation_flags; }
 D3D_FEATURE_LEVEL STDMETHODCALLTYPE device_feature_level(Device* self) { return self->level; }
 HRESULT STDMETHODCALLTYPE device_removed_reason(Device* self) { return self->d3d12->GetDeviceRemovedReason(); }
+void STDMETHODCALLTYPE device_garbage_collect(Device* self,UINT flags) {
+    if(flags || !self->legacy || self->creation_flags!=0x04000000) {
+        (void)trap_slot<kind_device,69>(self,flags);return;
+    }
+    // Bit 26 selects synchronous destruction; translated releases leave no deferred garbage queue.
+}
 const std::array<const void*, vtable_slots>& legacy_device_vtable() {
     static const auto table = [] {
         auto t = traps<kind_device>();
@@ -2662,6 +2769,7 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
         t[59] = reinterpret_cast<const void*>(&device_create_dma);
         t[60] = reinterpret_cast<const void*>(&device_fence_pending);
         t[68] = reinterpret_cast<const void*>(&device_create_deferred);
+        t[69] = reinterpret_cast<const void*>(&device_garbage_collect); // 11295 18002b560; reference 140058bb0.
         return t;
     }();
     return table;
@@ -3566,6 +3674,7 @@ HRESULT WINAPI D3D11XCreateDeviceX(const CreateParameters* parameters, void** de
 } // namespace
 
 void set_d3d11x_trap_handler(D3D11XTrapHandler handler) { trap_handler.store(handler); }
+void set_graphics_diagnostics(bool enabled) { graphics_diagnostics.store(enabled); }
 
 HRESULT bind_d3d11x_abi(const std::wstring& original_combase) {
     legacy_abi_bound = false;
@@ -3940,6 +4049,7 @@ void* resolve_d3d11x(const ImportRequest& request) {
     if (request.name == "D3D11CreateDevice") return reinterpret_cast<void*>(&D3D11CreateDevice);
     if (request.name == "D3D11XCreateDeviceX" && legacy_abi_bound) return reinterpret_cast<void*>(&D3D11XCreateDeviceX);
     if (request.name == "D3DMapEsramMemory" && legacy_abi_bound) return reinterpret_cast<void*>(&map_title_esram);
+    if (request.name == "DXGIXPresentArray" && legacy_abi_bound) return reinterpret_cast<void*>(&era_DXGIXPresentArray);
     return nullptr;
 }
 

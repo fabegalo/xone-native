@@ -640,6 +640,26 @@ int main(int argc, char** argv) {
             const auto create_device = reinterpret_cast<CreateDevice>(resolve_d3d11x({"d3d11_x.dll", "D3D11XCreateDeviceX", 0}));
             void* device = nullptr; void* context = nullptr;
             if (!create_device || FAILED(create_device(&parameters, &device, &context))) return 1;
+            using PresentArray=HRESULT(WINAPI*)(UINT,UINT,UINT,UINT,void* const*,const void*);
+            const auto present_array=reinterpret_cast<PresentArray>(resolve_d3d11x({"d3d11_x.dll","DXGIXPresentArray",0}));
+            check(present_array!=nullptr,"legacy PresentArray export is bound to the presentation runtime");
+            if(present_array) {
+                struct PresentParameters {UINT reserved[2]{};RECT source{};POINT destination{};FLOAT scale[2]{1,1};UINT64 token=0;UINT flags=0,tail=0;} p;
+                static_assert(sizeof p==56);
+                void* chain=nullptr;
+                check(present_array(2,20,0,0,&chain,&p)==E_INVALIDARG && present_array(5,20,0,1,&chain,&p)==E_INVALIDARG,
+                      "PresentArray rejects invalid counts and intervals before touching a swapchain");
+                check(present_array(2,21,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED &&
+                      present_array(2,20,1,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED && present_array(2,20,0,2,&chain,&p)==DXGI_ERROR_UNSUPPORTED,
+                      "unknown presentation profiles, flags and multi-plane composition remain explicit");
+                p.token=1;
+                check(present_array(2,20,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED,"unknown presentation synchronization token cannot be discarded");
+                p.token=0;p.scale[0]=2;
+                check(present_array(2,20,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED,"scaled presentation cannot silently become identity composition");
+                p.scale[0]=1;
+                check(present_array(2,20,0,1,&chain,reinterpret_cast<void*>(1))==E_INVALIDARG &&
+                      present_array(2,20,0,1,&chain,&p)==E_INVALIDARG,"unreadable presentation data and null chains fail without presentation");
+            }
             const auto vt = [](void* object) { return *static_cast<void***>(object); };
             using Count = ULONG (STDMETHODCALLTYPE*)(void*);
             using Allocate = void* (WINAPI*)(SIZE_T, UINT64);
@@ -2103,6 +2123,14 @@ int main(int argc, char** argv) {
                     check(factory(device, &desc, &initial, &buffer) == S_OK && buffer, "shared native vertex buffer created");
                     if (buffer) {
                         check(refs(buffer) == 1 && refs(device) == 1, "buffer owns internal device dependency");
+                        using GarbageCollect=void(STDMETHODCALLTYPE*)(void*,UINT);
+                        const auto collect=reinterpret_cast<GarbageCollect>(vt(device)[69]);
+                        collect(device,0);
+                        check(refs(buffer)==1,"synchronous garbage collection preserves live resource ownership");
+                        static UINT collection_slot=0;collection_slot=0;
+                        set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{collection_slot=slot;return 0;});
+                        collect(device,1);set_d3d11x_trap_handler(nullptr);
+                        check(collection_slot==69 && refs(buffer)==1,"unsupported garbage collection flags stay explicit and preserve live resources");
                         using BindVertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
                         const auto bind_vertices=reinterpret_cast<BindVertices>(vt(context)[19]);
                         const UINT stride=12,offset=4;void* buffers[]{buffer};

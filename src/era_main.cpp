@@ -6,12 +6,14 @@
 // the working directory. A watchdog ends the process at the deadline; faults
 // are reported with title-relative addresses.
 #include "xboxone_native/era_loader.h"
+#include "era_display.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
 
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +31,7 @@ std::uintptr_t title_base = 0, title_end = 0;
 volatile LONG reported = 0;
 std::array<xboxone::era::ImportRequest, 256> stopped_imports;
 std::size_t stopped_count = 0;
+std::atomic<bool> diagnostic_exceptions{false};
 
 void report(const char* text) {
     DWORD written = 0;
@@ -90,7 +93,8 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
                       static_cast<unsigned long long>(at - reinterpret_cast<std::uintptr_t>(module)));
     }
     report(line);
-    if (code==0xE06D7363 && info->ExceptionRecord->NumberParameters==4 && xboxone::era::stop_on_missing_service()) {
+    if (code==0xE06D7363 && info->ExceptionRecord->NumberParameters==4 &&
+        (xboxone::era::stop_on_missing_service() || diagnostic_exceptions.load())) {
         // Diagnostic only: MSVC x64 EH metadata uses image-relative offsets.
         // https://devblogs.microsoft.com/oldnewthing/20100730-00/?p=13273
         const auto* data=info->ExceptionRecord->ExceptionInformation;
@@ -201,6 +205,8 @@ int wmain(int argc, wchar_t** argv) {
     xboxone::era::set_title_storage_root(storage);
     xboxone::era::set_title_package_root(title.parent_path().wstring());
     xboxone::era::set_stop_on_missing_activation(stop_on_activation);
+    xboxone::era::set_graphics_diagnostics(stop_on_missing);
+    diagnostic_exceptions.store(stop_on_missing);
     for (const auto* runtime : {L"vccorlib110.dll", L"vccorlib140.dll"}) {
         const HMODULE module = GetModuleHandleW(runtime);
         if (module && !xboxone::era::hook_winrt_activation(module))

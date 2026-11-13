@@ -1055,6 +1055,67 @@ int main(int argc, char** argv) {
     readback->Unmap(0, nullptr);
     if (FAILED(complete_title_gpu_resource(mixed, fence.Get(), 201)) || FAILED(complete_title_gpu_resource(mirror, fence.Get(), 201)) ||
         FAILED(release_title_gpu_resource(mixed, fence.Get(), 201)) || FAILED(release_title_gpu_resource(mirror, fence.Get(), 201))) return 1;
+    {
+        auto* input= reinterpret_cast<UINT32*>(pool_alias+256);
+        auto* output=static_cast<UINT32*>(allocate(64,attributes));
+        if (!output) return 1;
+        TitleGpuResource raw_input,raw_output;
+        if (FAILED(acquire_title_gpu_buffer(input,64,device.Get(),raw_input,D3D12_RESOURCE_FLAG_NONE,true)) ||
+            FAILED(acquire_title_gpu_buffer(output,64,device.Get(),raw_output,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,true))) return 1;
+        const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto compile=compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")) : nullptr;
+        if (!compile) return 1;
+        constexpr char source[]="ByteAddressBuffer input:register(t0);RWByteAddressBuffer output:register(u0);"
+            "[numthreads(8,1,1)]void main(uint3 id:SV_DispatchThreadID){output.Store(id.x*4,input.Load(id.x*4)^0xDEADBEEFu);}";
+        ComPtr<ID3DBlob> shader,errors,serialized;
+        hr=compile(source,sizeof source-1,nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&shader,&errors);
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0};
+        D3D12_ROOT_PARAMETER parameters[2]{};
+        parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        parameters[0].DescriptorTable={1,&range};
+        parameters[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{2,parameters,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (SUCCEEDED(hr)) hr=D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,nullptr);
+        ComPtr<ID3D12RootSignature> root;
+        if (SUCCEEDED(hr)) hr=device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root));
+        ComPtr<ID3D12PipelineState> pipeline;
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+            desc.pRootSignature=root.Get(); desc.CS={shader->GetBufferPointer(),shader->GetBufferSize()};
+            hr=device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pipeline));
+        }
+        shader.Reset();errors.Reset();serialized.Reset();FreeLibrary(compiler);
+        check(SUCCEEDED(hr),"raw buffer load fixture creates a real compute pipeline");
+        if (FAILED(hr)) return 1;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        if (FAILED(device->CreateDescriptorHeap(&heap_desc,IID_PPV_ARGS(&heap)))) return 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC raw{};
+        raw.Format=DXGI_FORMAT_R32_TYPELESS;raw.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;
+        raw.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        raw.Buffer.FirstElement=raw_input.offset/4+4;raw.Buffer.NumElements=8;raw.Buffer.Flags=D3D12_BUFFER_SRV_FLAG_RAW;
+        device->CreateShaderResourceView(raw_input.resource,&raw,heap->GetCPUDescriptorHandleForHeapStart());
+        for (UINT iteration=0;iteration<2;++iteration) {
+            for (UINT i=0;i<16;++i) input[i]=0xabc00000u+iteration*256+i;
+            std::fill(output,output+16,0x5a5a5a5a);
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),pipeline.Get())) ||
+                FAILED(begin_title_gpu_buffer(raw_input,list.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) ||
+                FAILED(begin_title_gpu_buffer(raw_output,list.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS))) return 1;
+            auto* bound=heap.Get();list->SetDescriptorHeaps(1,&bound);list->SetComputeRootSignature(root.Get());
+            list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            list->SetComputeRootUnorderedAccessView(1,raw_output.resource->GetGPUVirtualAddress()+raw_output.offset);
+            list->Dispatch(1,1,1);
+            if (FAILED(end_title_gpu_buffer(raw_input,list.Get())) || FAILED(end_title_gpu_buffer(raw_output,list.Get())) || !finish_pool(202+iteration)) return 1;
+            if (FAILED(complete_title_gpu_resource(raw_input,fence.Get(),202+iteration)) ||
+                FAILED(complete_title_gpu_resource(raw_output,fence.Get(),202+iteration))) return 1;
+            bool exact=true;
+            for (UINT i=0;i<16;++i) exact=exact && output[i]==(i<8 ? ((0xabc00000u+iteration*256+i+4)^0xdeadbeefu) : 0x5a5a5a5a);
+            check(exact,"raw GPU loads honor element offset, bounds, ESRAM bytes and CPU refresh through real fences");
+        }
+        check(release_title_gpu_resource(raw_input,fence.Get(),203)==S_OK && release_title_gpu_resource(raw_output,fence.Get(),203)==S_OK,
+              "raw SRV representations retire only after their real GPU work");
+        release(output,attributes);
+    }
     if (FAILED(map_title_esram(1, pool_alias, 1, &remapped_page))) return 1;
     TitleTextureLayout pool_texture;
     pool_texture.bytes = 8192; pool_texture.alignment = 16; pool_texture.context = std::make_shared<int>(0); pool_texture.copy = &linear_sample_copy;

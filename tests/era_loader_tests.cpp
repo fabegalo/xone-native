@@ -825,6 +825,82 @@ int main(int argc, char** argv) {
                 check(esram_mirror[mirror_offset]==0x62,
                     "texture retirement preserves the physical pool and the title's mapping");
             }
+            UINT buffer_page=80;
+            check(map_title_esram(1,esram_mirror,1,&buffer_page)==S_OK,"buffer fixture maps the existing ESRAM pool");
+            std::memset(esram_mirror,0x35,65536);
+            struct EsramBufferDesc { D3D11_BUFFER_DESC standard; UINT64 extension; } esram_buffer{};
+            esram_buffer.standard={128,D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,0x20020,0};
+            esram_buffer.extension=UINT64(buffer_page*65536+256)|(UINT64(128)<<32);
+            using CreateEsramBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const EsramBufferDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+            const auto create_esram_buffer=reinterpret_cast<CreateEsramBuffer>(vt(device)[3]);
+            void* buffer=nullptr;
+            check(create_esram_buffer(device,&esram_buffer,nullptr,nullptr)==S_FALSE,
+                  "ESRAM buffer validation does not create a mapping");
+            const D3D11_SUBRESOURCE_DATA esram_initial{esram_mirror,0,0};
+            check(create_esram_buffer(device,&esram_buffer,&esram_initial,&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
+                  "ESRAM initialization remains explicit until writes over existing physical aliases are translated");
+            esram_ddr_allocations=esram_cpu_allocations=0;
+            using SetBufferHooks=void(WINAPI*)(void*,void*);
+            const auto set_buffer_hooks=reinterpret_cast<SetBufferHooks>(resolve_kernelx({"kernelx.dll","XMemSetAllocationHooks",0}));
+            set_buffer_hooks(reinterpret_cast<void*>(&esram_allocate_hook),reinterpret_cast<void*>(&esram_free_hook));
+            const HRESULT buffer_created=create_esram_buffer(device,&esram_buffer,nullptr,&buffer);
+            set_buffer_hooks(nullptr,nullptr);
+            check(buffer_created==S_OK && buffer && !esram_ddr_allocations,
+                  "ESRAM buffer owns a physical alias without allocating DDR pixels");
+            unsigned char* buffer_alias=nullptr;
+            if (buffer) {
+                std::memcpy(&buffer_alias,static_cast<char*>(buffer)+48,sizeof buffer_alias);
+                check(buffer_alias && buffer_alias!=esram_mirror+256 && buffer_alias[0]==0x35,
+                      "ESRAM buffer has its own virtual alias at the requested physical byte");
+                if (buffer_alias) {
+                    buffer_alias[0]=0x62;
+                    check(esram_mirror[256]==0x62,"buffer writes preserve shared ESRAM identity");
+                    ++buffer_page;
+                    check(map_title_esram(1,esram_mirror,1,&buffer_page)==S_OK,"title remaps its independent buffer alias");
+                    esram_mirror[256]=0x9a;
+                    check(buffer_alias[0]==0x62,"title remapping cannot redirect existing buffer storage");
+                    --buffer_page;
+                    check(map_title_esram(1,esram_mirror,1,&buffer_page)==S_OK && esram_mirror[256]==0x62,
+                          "ESRAM physical bytes survive a temporary title remap");
+                }
+                using CreateRawSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                const auto create_raw_srv=reinterpret_cast<CreateRawSrv>(vt(device)[7]);
+                D3D11_SHADER_RESOURCE_VIEW_DESC raw{};
+                raw.Format=DXGI_FORMAT_R32_TYPELESS; raw.ViewDimension=D3D11_SRV_DIMENSION_BUFFEREX;
+                raw.BufferEx={4,8,D3D11_BUFFEREX_SRV_FLAG_RAW};
+                void* raw_view=nullptr;
+                check(create_raw_srv(device,buffer,&raw,nullptr)==S_FALSE,"raw SRV validation does not acquire ownership");
+                check(create_raw_srv(device,buffer,&raw,&raw_view)==S_OK && raw_view,"raw SRV binds the actual ESRAM buffer");
+                if (raw_view) {
+                    struct { D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; UINT guard=0xaabbccdd; } queried;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(raw_view)[9])(raw_view,&queried.desc);
+                    check(!std::memcmp(&queried.desc,&raw,sizeof raw) && queried.guard==0xaabbccdd,
+                          "raw SRV preserves BUFFEREX flags and exact query extent");
+                    std::array<UINT32,8> srd{};
+                    std::memcpy(srd.data(),static_cast<char*>(raw_view)+48,sizeof srd);
+                    check((UINT64(srd[0])|(UINT64(srd[1]&255)<<32))==reinterpret_cast<std::uintptr_t>(buffer_alias)+16 &&
+                          !(srd[1]&0xffffff00) && srd[2]==32 && srd[3]==0x24fac &&
+                          std::all_of(srd.begin()+4,srd.end(),[](auto x){return x==0;}),
+                          "original raw SRD counts bytes, clears stride and preserves the physical base");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                }
+                raw.BufferEx.FirstElement=1;
+                check(create_raw_srv(device,buffer,&raw,&raw_view)==DXGI_ERROR_UNSUPPORTED && !raw_view,
+                      "raw view refuses an offset that violates host alignment");
+                raw.BufferEx.FirstElement=32;
+                check(create_raw_srv(device,buffer,&raw,&raw_view)==E_INVALIDARG && !raw_view,
+                      "raw SRV range cannot exceed its logical buffer");
+                reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+            }
+            MEMORY_BASIC_INFORMATION buffer_retired{};
+            check(buffer_alias && VirtualQuery(buffer_alias,&buffer_retired,sizeof buffer_retired) && buffer_retired.State==MEM_FREE && esram_mirror[256]==0x62,
+                  "buffer retirement frees its alias while preserving pool and title ownership");
+            esram_buffer.extension=UINT64(buffer_page*65536)|(UINT64(64)<<32);
+            check(create_esram_buffer(device,&esram_buffer,nullptr,&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
+                  "partly ESRAM buffer remains explicit without a translated DDR tail");
+            esram_buffer.extension=0x1fffff0;
+            check(create_esram_buffer(device,&esram_buffer,nullptr,&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
+                  "buffer cannot extend beyond the physical ESRAM pool");
             check(release_virtual(esram_mirror,0,MEM_RELEASE),"ESRAM fixture releases its own title mapping");
             for (const auto storage_format:{DXGI_FORMAT_R8_TYPELESS,DXGI_FORMAT_R10G10B10A2_TYPELESS,DXGI_FORMAT_R16G16_FLOAT}) {
                 Desc color{};
@@ -864,6 +940,29 @@ int main(int argc, char** argv) {
                         check(descriptor[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) &&
                             ((descriptor[1]>>26)&15)==(integer ? 4u : format==DXGI_FORMAT_R16G16_FLOAT ? 7u : 0u),"typed SRV/UAV SRDs keep physical identity and native numeric interpretation");
                     }
+                    if (kind==1 && format==formats[0]) {
+                        constexpr FLOAT white[]{1,1,1,1};
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
+                        void* alias=nullptr;
+                        // The SRV exposes the same canonical pixels as this RTV.
+                        void* srv_view=nullptr;
+                        using MakeSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                        check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,texture,&srv,&srv_view)==S_OK && srv_view,
+                              "legacy RTV clear keeps the resource visible through its original SRV");
+                        if (srv_view) {
+                            std::memcpy(&alias,static_cast<char*>(srv_view)+80,sizeof alias);
+                            TitleTextureLayout pixels;
+                            const UINT element=storage_format==DXGI_FORMAT_R8_TYPELESS ? 1 : 4;
+                            hr=create_xg_texture_layout(32,16,1,1,storage_format,UINT_MAX,pixels,color.standard.BindFlags);
+                            std::vector<unsigned char> linear(32*16*element);
+                            check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32*element,32*16*element)==S_OK,
+                                  "legacy clear publishes real GPU pixels through the original XG layout");
+                            bool exact=true;
+                            for (SIZE_T at=0;at<linear.size();++at) exact=exact && linear[at]==(storage_format==DXGI_FORMAT_R16G16_FLOAT ? (at%2 ? 0x3c : 0) : 0xff);
+                            check(exact,"legacy context slot 50 clears every pixel with exact typed values");
+                            reinterpret_cast<Count>(vt(srv_view)[2])(srv_view);
+                        }
+                    }
                     void* parent=nullptr;
                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void**)>(vt(view)[8])(view,&parent);
                     check(parent==texture,"typed color views retain the same logical parent");
@@ -880,6 +979,52 @@ int main(int argc, char** argv) {
                 check(create_uav(device,texture,&invalid,&view)==DXGI_ERROR_UNSUPPORTED && !view,"texture UAV refuses an incompatible format without replacing its parent");
                 reinterpret_cast<Count>(vt(texture)[2])(texture);
             }
+            Desc initialized{};
+            initialized.standard={8,8,3,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,0};
+            std::array<std::vector<unsigned char>,3> sources;
+            std::array<D3D11_SUBRESOURCE_DATA,3> initial{};
+            for (UINT mip=0;mip<3;++mip) {
+                const UINT width=8>>mip,pitch=width*4+12;
+                sources[mip].assign(pitch*width+16,0x5a);
+                for (UINT y=0;y<width;++y) for (UINT x=0;x<width*4;++x) sources[mip][y*pitch+x]=static_cast<unsigned char>(mip*53+y*7+x);
+                initial[mip]={sources[mip].data(),pitch,0};
+            }
+            const auto original_sources=sources;
+            using CreateInitialized=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+            const auto create_initialized=reinterpret_cast<CreateInitialized>(vt(device)[5]);
+            texture=nullptr;
+            check(create_initialized(device,&initialized,initial.data(),&texture)==S_OK && texture,
+                  "initial texture upload accepts padded source rows and every mip");
+            if (texture) {
+                void* view=nullptr;
+                using MakeSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,texture,nullptr,&view)==S_OK && view,
+                      "initialized texture retains a native view of all uploaded mips");
+                if (view) {
+                    void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
+                    TitleTextureLayout pixels;
+                    hr=create_xg_texture_layout(8,8,3,1,DXGI_FORMAT_R8G8B8A8_UNORM,UINT_MAX,pixels,D3D11_BIND_SHADER_RESOURCE);
+                    check(SUCCEEDED(hr),"initialized texture keeps the original XG mip layout");
+                    for (UINT mip=0;SUCCEEDED(hr) && mip<3;++mip) {
+                        const UINT width=8>>mip,pitch=width*4;
+                        std::vector<unsigned char> linear(pitch*width);
+                        check(pixels.copy(pixels.context.get(),false,linear.data(),canonical,mip,pitch,pitch*width)==S_OK,
+                              "initialized texture exposes tiled mip pixels through original XG");
+                        bool exact=true;
+                        for (UINT y=0;y<width;++y) exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
+                        check(exact,"upload preserves every source pixel without copying row padding");
+                    }
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            check(sources==original_sources,"texture initialization leaves source pixels, padding and guards intact");
+            initial[2].SysMemPitch=1;
+            check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
+                  "short initial mip pitch fails without publishing a partial texture");
+            initial[2].SysMemPitch=20; initial[2].pSysMem=reinterpret_cast<void*>(1);
+            check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
+                  "unreadable initial pixels fail without dereferencing untrusted memory");
             TitleTextureLayout placed_color;
             const UINT color_binds=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS;
             hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,14,placed_color,color_binds);
@@ -907,10 +1052,16 @@ int main(int argc, char** argv) {
                 D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, 0, 0};
             using CreateVolume = HRESULT (STDMETHODCALLTYPE*)(void*, const VolumeDesc*, const D3D11_SUBRESOURCE_DATA*, void**);
             const auto create_volume = reinterpret_cast<CreateVolume>(vt(device)[6]);
+            constexpr UINT volume_pitch=16*4+8,volume_slice=volume_pitch*16+16;
+            std::vector<unsigned char> volume_source(volume_slice*16+16,0x5a);
+            for (UINT z=0;z<16;++z) for (UINT y=0;y<16;++y) for (UINT x=0;x<64;++x)
+                volume_source[z*volume_slice+y*volume_pitch+x]=static_cast<unsigned char>(z*13+y*7+x);
+            const auto original_volume_source=volume_source;
+            D3D11_SUBRESOURCE_DATA volume_initial{volume_source.data(),volume_pitch,volume_slice};
             texture = nullptr;
             check(create_volume(device, &volume_desc, nullptr, nullptr) == S_FALSE,
                   "volume descriptor validation does not acquire ownership");
-            check(create_volume(device, &volume_desc, nullptr, &texture) == S_OK && texture,
+            check(create_volume(device, &volume_desc, &volume_initial, &texture) == S_OK && texture,
                   "observed volume factory owns original XG storage and a native UAV-capable texture");
             if (texture) {
                 using GetVolumeDesc = void (STDMETHODCALLTYPE*)(void*, VolumeDesc*);
@@ -967,12 +1118,25 @@ int main(int argc, char** argv) {
                     reinterpret_cast<GetSrvDesc>(vt(view)[9])(view, &desc);
                     check(desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE3D && desc.Texture3D.MipLevels == 1 &&
                         desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM, "volume SRV preserves dimension, format and mip range");
+                    void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
+                    TitleTextureLayout pixels;
+                    hr=create_xg_texture3d_layout(16,16,16,1,volume_desc.standard.Format,volume_desc.standard.BindFlags,pixels);
+                    std::vector<unsigned char> linear(16*16*16*4);
+                    check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),canonical,0,64,16*64)==S_OK,
+                          "volume initial data is stored in the original XG physical layout");
+                    bool exact=true;
+                    for (UINT z=0;z<16;++z) for (UINT y=0;y<16;++y)
+                        exact=exact && !std::memcmp(linear.data()+(z*16+y)*64,volume_source.data()+z*volume_slice+y*volume_pitch,64);
+                    check(exact && volume_source==original_volume_source,"volume initialization preserves every depth slice and source padding");
                     check(reinterpret_cast<Count>(vt(texture)[2])(texture) == 1, "volume view retains its storage after caller release");
                     texture = nullptr;
                     reinterpret_cast<Count>(vt(view)[2])(view);
                 }
                 if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
             }
+            volume_initial.SysMemSlicePitch=1;
+            check(create_volume(device,&volume_desc,&volume_initial,&texture)==E_INVALIDARG && !texture,
+                  "volume initialization rejects overlapping source slices before publishing storage");
             volume_desc.standard.MipLevels = 5; volume_desc.standard.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             volume_desc.standard.BindFlags = D3D11_BIND_SHADER_RESOURCE;
             TitleTextureLayout volume_layout;
@@ -1945,6 +2109,14 @@ int main(int argc, char** argv) {
                             actual.DepthBias == -5 && actual.DepthBiasClamp == 1.5f && actual.SlopeScaledDepthBias == -2.f &&
                             actual.ScissorEnable && actual.DepthClipEnable && actual.MultisampleEnable && actual.AntialiasedLineEnable,
                             "rasterizer preserves culling, winding, bias, scissor, clipping and line/MSAA modes");
+                        using SetRaster=void(STDMETHODCALLTYPE*)(void*,void*);
+                        const auto set_raster=reinterpret_cast<SetRaster>(vt(context)[43]);
+                        set_raster(context,state);
+                        check(refs(state)==2,"legacy raster slot 43 retains its native state");
+                        set_raster(context,state);
+                        check(refs(state)==2,"rebinding a rasterizer preserves one context owner");
+                        set_raster(context,nullptr);
+                        check(refs(state)==1,"legacy raster reset releases context ownership");
                         void* duplicate = nullptr;
                         check(factory(device, &desc, &duplicate) == S_OK && duplicate == state && refs(state) == 2,
                               "identical rasterizer shares live state");
@@ -1977,6 +2149,15 @@ int main(int argc, char** argv) {
                         for (UINT i = 0; i < 8; ++i) all = all && actual.RenderTarget[i].RenderTargetWriteMask == i + 1 &&
                             actual.RenderTarget[i].DestBlend == D3D11_BLEND_INV_SRC_ALPHA && actual.RenderTarget[i].BlendOpAlpha == D3D11_BLEND_OP_REV_SUBTRACT;
                         check(all, "all blend targets retain color, alpha and write mask");
+                        using SetBlend=void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*,UINT);
+                        const auto set_blend=reinterpret_cast<SetBlend>(vt(context)[35]);
+                        const FLOAT factor[]{.125f,.25f,.5f,1.f};
+                        set_blend(context,state,factor,0x55555555);
+                        check(refs(state)==2,"legacy slot 35 retains its real blend state");
+                        set_blend(context,state,nullptr,UINT_MAX);
+                        check(refs(state)==2,"rebinding the same legacy blend preserves exactly one context owner");
+                        set_blend(context,nullptr,nullptr,UINT_MAX);
+                        check(refs(state)==1,"legacy blend unbind retires context ownership");
                         void* duplicate = nullptr;
                         check(factory(device, &desc, &duplicate) == S_OK && duplicate == state && refs(state) == 2,
                               "identical live blend state shares identity");

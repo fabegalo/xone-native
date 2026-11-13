@@ -1111,6 +1111,100 @@ int main(int argc, char** argv) {
                                           "deferred ClearState releases bindings without submitting GPU work or changing physical pixels");
                                     reinterpret_cast<Count>(vt(deferred)[2])(deferred);
                                 }
+                                const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+                                const auto compile=compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")) : nullptr;
+                                const char* sources[]{
+                                    "float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}",
+                                    "float4 main():SV_Target{return float4(.25,0,0,1);}",
+                                    "float4 main():SV_Target{return float4(.75,0,0,1);}",
+                                    "float4 main(float2 p:POSITION,float2 u:TEXCOORD0):SV_Position{return float4(p+u,0,1);}"};
+                                void* shaders[4]{};void* empty_layout=nullptr;void* vertex_layout=nullptr;void* vertex_buffer=nullptr;bool ready=compile!=nullptr;
+                                using CreateShader=HRESULT(STDMETHODCALLTYPE*)(void*,const void*,SIZE_T,void*,void**);
+                                for(UINT i=0;i<4 && ready;++i) {
+                                    Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                    const bool vertex=i==0 || i==3;
+                                    ready=SUCCEEDED(compile(sources[i],std::strlen(sources[i]),nullptr,nullptr,nullptr,"main",vertex ? "vs_5_0" : "ps_5_0",0,0,&code,nullptr));
+                                    if(ready) ready=reinterpret_cast<CreateShader>(vt(device)[vertex ? 12 : 15])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shaders[i])==S_OK;
+                                    if(ready && vertex) {
+                                        using CreateLayout=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_INPUT_ELEMENT_DESC*,UINT,const void*,SIZE_T,void**);
+                                        const D3D12_INPUT_ELEMENT_DESC elements[]{{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+                                            {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,D3D12_APPEND_ALIGNED_ELEMENT,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}};
+                                        ready=reinterpret_cast<CreateLayout>(vt(device)[11])(device,i ? elements : nullptr,i ? 2 : 0,code->GetBufferPointer(),code->GetBufferSize(),i ? &vertex_layout : &empty_layout)==S_OK;
+                                    }
+                                }
+                                const FLOAT vertices[]{99,99,0,0,-1,1,0,0,3,1,0,0,-1,-3,0,0};
+                                if(ready) {
+                                    struct VertexDesc { D3D11_BUFFER_DESC standard;UINT64 extension; } vertex_desc{{sizeof vertices,D3D11_USAGE_DEFAULT,D3D11_BIND_VERTEX_BUFFER,0,0,0},0};
+                                    const D3D11_SUBRESOURCE_DATA initial{vertices,0,0};
+                                    using CreateBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const VertexDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                                    ready=reinterpret_cast<CreateBuffer>(vt(device)[3])(device,&vertex_desc,&initial,&vertex_buffer)==S_OK;
+                                }
+                                check(ready,"legacy procedural draw creates real VS/PS shader objects");
+                                if(ready) {
+                                    bind_targets(context,1,targets,nullptr);
+                                    using Draw=void(STDMETHODCALLTYPE*)(void*,UINT,UINT);
+                                    const auto draw=reinterpret_cast<Draw>(vt(context)[14]);
+                                    const D3D11_VIEWPORT viewport{0,0,32,16,0,1};
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(context)[44])(context,1,&viewport);
+                                    const UINT64 topology=0x000009ffc0009e00ull;
+                                    std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);
+                                    std::memcpy(static_cast<char*>(context)+0x180,&shaders[0],sizeof(void*));
+                                    std::memcpy(static_cast<char*>(context)+0x178,&empty_layout,sizeof empty_layout);
+                                    for(UINT pass=0;pass<2;++pass) {
+                                        std::memcpy(static_cast<char*>(context)+0x188,&shaders[1+pass],sizeof(void*));
+                                        draw(context,3,0);
+                                        const HRESULT copied=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512);
+                                        check(SUCCEEDED(copied) && std::all_of(linear.begin(),linear.end(),[&](auto value){return value==(pass ? 191 : 64);}),
+                                              "procedural draw publishes all pixels after its fence and refreshes inline shader changes");
+                                    }
+                                    check(reinterpret_cast<Count>(vt(shaders[1])[1])(shaders[1])==2,"inline PS replacement releases the prior shader binding");
+                                    reinterpret_cast<Count>(vt(shaders[1])[2])(shaders[1]);
+                                    std::memcpy(static_cast<char*>(context)+0x180,&shaders[3],sizeof(void*));
+                                    std::memcpy(static_cast<char*>(context)+0x178,&vertex_layout,sizeof vertex_layout);
+                                    using BindVertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
+                                    const auto bind_vertices=reinterpret_cast<BindVertices>(vt(context)[19]);
+                                    const UINT stride=16,offset=0;
+                                    bind_vertices(context,0,1,&vertex_buffer,&stride,&offset);
+                                    const FLOAT black[]{0,0,0,0};
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                    draw(context,3,1);
+                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
+                                        "non-indexed draw preserves first vertex, stride, appended input elements and inline layout changes");
+                                    void* vertex_bytes=nullptr;std::memcpy(&vertex_bytes,static_cast<char*>(vertex_buffer)+48,sizeof vertex_bytes);
+                                    check(vertex_bytes && !std::memcmp(vertex_bytes,vertices,sizeof vertices),"non-indexed draw preserves its canonical vertex bytes");
+                                    const std::vector<unsigned char> before(static_cast<unsigned char*>(alias),static_cast<unsigned char*>(alias)+pixels.bytes);
+                                    static UINT rejected_slot=0;rejected_slot=0;
+                                    set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{rejected_slot=slot;return 0;});
+                                    void* invalid_shader=reinterpret_cast<void*>(1);
+                                    std::memcpy(static_cast<char*>(context)+0x188,&invalid_shader,sizeof invalid_shader);
+                                    draw(context,3,0);
+                                    check(rejected_slot==14 && !std::memcmp(before.data(),alias,before.size()),"invalid inline shader refuses draw without changing canonical pixels");
+                                    std::memcpy(static_cast<char*>(context)+0x188,&shaders[2],sizeof(void*));
+                                    const UINT invalid_offset=sizeof vertices+1;rejected_slot=0;
+                                    bind_vertices(context,0,1,&vertex_buffer,&stride,&invalid_offset);draw(context,3,1);
+                                    check(rejected_slot==14 && !std::memcmp(before.data(),alias,before.size()),"vertex offset outside the logical buffer refuses draw before GPU work");
+                                    bind_vertices(context,0,1,&vertex_buffer,&stride,&offset);
+                                    void* deferred_draw=nullptr;
+                                    check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&deferred_draw)==S_OK && deferred_draw,"deferred draw negative control creates a real deferred context");
+                                    if(deferred_draw) {
+                                        rejected_slot=0;reinterpret_cast<Draw>(vt(deferred_draw)[14])(deferred_draw,3,0);
+                                        check(rejected_slot==14 && !std::memcmp(before.data(),alias,before.size()),"deferred draw is refused before any immediate GPU work");
+                                        reinterpret_cast<Count>(vt(deferred_draw)[2])(deferred_draw);
+                                    }
+                                    set_d3d11x_trap_handler(nullptr);
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                    void* retained_layout=nullptr;
+                                    std::memcpy(&retained_layout,static_cast<char*>(context)+0x178,sizeof retained_layout);
+                                    check(retained_layout==vertex_layout && reinterpret_cast<Count>(vt(vertex_layout)[1])(vertex_layout)==3,
+                                          "11295 ClearState preserves its public input-layout cache and retained ownership");
+                                    reinterpret_cast<Count>(vt(vertex_layout)[2])(vertex_layout);
+                                }
+                                for(auto* shader:shaders) if(shader) reinterpret_cast<Count>(vt(shader)[2])(shader);
+                                if(empty_layout) reinterpret_cast<Count>(vt(empty_layout)[2])(empty_layout);
+                                if(vertex_layout) reinterpret_cast<Count>(vt(vertex_layout)[2])(vertex_layout);
+                                if(vertex_buffer) reinterpret_cast<Count>(vt(vertex_buffer)[2])(vertex_buffer);
+                                if(compiler) FreeLibrary(compiler);
                             }
                             reinterpret_cast<Count>(vt(srv_view)[2])(srv_view);
                         }
@@ -2427,6 +2521,13 @@ int main(int argc, char** argv) {
                         check(refs(sampler)==3,"fast PS sampler packet retains both final slots independently");
                         fast(context,batch.data(),batch.data()+batch.size());
                         check(refs(sampler)==3,"fast sampler packet rebind balances ownership");
+                        using BindSamplers=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                        const auto bind_samplers=reinterpret_cast<BindSamplers>(vt(context)[11]);
+                        void* sampler_array[]{sampler};
+                        bind_samplers(context,0,1,sampler_array);bind_samplers(context,0,1,sampler_array);
+                        check(refs(sampler)==4,"legacy standard PS sampler binding shares fast state with balanced ownership");
+                        bind_samplers(context,0,1,nullptr);bind_samplers(context,16,0,nullptr);
+                        check(refs(sampler)==3,"legacy standard PS sampler unbind preserves the two fast-bound slots");
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
                         check(refs(sampler)==1,"ClearState releases fast sampler bindings without changing the descriptor");
                         check(reinterpret_cast<Count>(vt(sampler)[2])(sampler) == 0, "sampler descriptor slot retired");

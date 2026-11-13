@@ -305,6 +305,7 @@ std::atomic<bool> xg_modern{false};
 std::string xg_identity;
 std::mutex xg_module_mutex;
 std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
+const std::array<const void*, vtable_slots>& shader_vtable();
 
 [[noreturn]] void default_trap(const char* interface_name, unsigned slot) {
     char message[160];
@@ -356,8 +357,31 @@ void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
 }
 
 template <unsigned K, unsigned Slot>
-std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std::uintptr_t c = 0, std::uintptr_t d = 0) {
+std::uintptr_t trap_slot(void* object, std::uintptr_t a = 0, std::uintptr_t b = 0, std::uintptr_t c = 0, std::uintptr_t d = 0) {
     if (auto handler = trap_handler.load()) return handler(kind_names[K], Slot);
+    if constexpr (K == kind_context && Slot == 14) {
+        const auto* self=static_cast<Context*>(object);
+        void* vertex=nullptr;void* pixel=nullptr;UINT64 topology=0;
+        std::memcpy(&vertex,self->inline_state.data()+0x180-32,sizeof vertex);
+        std::memcpy(&pixel,self->inline_state.data()+0x188-32,sizeof pixel);
+        std::memcpy(&topology,self->inline_state.data()+0x170-32,sizeof topology);
+        std::fprintf(stderr,"xone-era: Draw caller %p args 0x%llX 0x%llX deferred %u flags 0x%X VS %p PS %p topology 0x%llX viewport_count %u RTV %p\n",
+            _ReturnAddress(),static_cast<unsigned long long>(a),static_cast<unsigned long long>(b),self->deferred,self->creation_flags,
+            vertex,pixel,static_cast<unsigned long long>(topology),self->viewport_count,self->render_targets[0]);
+        for(auto* address : {pixel,vertex}) {
+            const void* table=nullptr;SIZE_T read=0;
+            if(address && ReadProcessMemory(GetCurrentProcess(),address,&table,sizeof table,&read) && read==sizeof table && table==shader_vtable().data()) {
+                const auto* shader=static_cast<Shader*>(address);
+                std::fprintf(stderr,"xone-era: Draw public shader stage %u DXBC bytes %llu same_device %u\n",shader->stage,
+                    static_cast<unsigned long long>(shader->code.size()),shader->device==self->device);
+            } else std::fputs("xone-era: Draw public shader is not a retained runtime shader\n",stderr);
+        }
+        if(auto* view=self->render_targets[0]) {
+            const auto* texture=static_cast<Texture*>(view->resource);
+            std::fprintf(stderr,"xone-era: Draw RTV format %u samples %u depth format %u input_layout %p\n",view->rtv_desc.Format,
+                texture->desc.standard.SampleDesc.Count,self->depth_target ? self->depth_target->dsv_desc.Format : 0,self->input_layout);
+        }
+    }
     if constexpr (K == kind_context && Slot == 209) {
         std::fprintf(stderr,"xone-era: resource batch caller %p begin 0x%llX end 0x%llX\n",_ReturnAddress(),
             static_cast<unsigned long long>(a),static_cast<unsigned long long>(b));
@@ -2642,14 +2666,14 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
     }();
     return table;
 }
-void clear_context_bindings(Context* self) {
+void clear_context_bindings(Context* self,bool preserve_layout=false) {
     for (auto*& view:self->render_targets) { if (view) view_release(view); view=nullptr; }
     if (self->depth_target) view_release(self->depth_target); self->depth_target=nullptr;
     if (self->raster_state) raster_state_release(self->raster_state); self->raster_state=nullptr;
     if (self->depth_state) depth_state_release(self->depth_state); self->depth_state=nullptr;
     if (self->blend_state) blend_state_release(self->blend_state); self->blend_state=nullptr;
     for (auto*& shader:self->shaders) { if (shader) shader_release(shader); shader=nullptr; }
-    if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr;
+    if (!preserve_layout) { if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr; }
     for (auto*& sampler:self->pixel_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
     for (auto& stage:self->shader_resources) for (auto*& view:stage) { if (view) view_release(view); view=nullptr; }
     for (auto& stage:self->constants) for (auto*& buffer:stage) { if (buffer) buffer_release(buffer); buffer=nullptr; }
@@ -2669,7 +2693,7 @@ bool bind_range(std::array<T*,N>& current,UINT start,UINT count,T* const* input,
 }
 void STDMETHODCALLTYPE context_pixel_samplers(Context* self,UINT start,UINT count,Sampler* const* input) {
     if(!bind_range(self->pixel_samplers,start,count,input,[&](Sampler* s){return s->vtable==sampler_vtable().data() && s->device==self->device;},sampler_release))
-        default_trap("ID3D11DeviceContextX",12);
+        default_trap("ID3D11DeviceContextX",self->device->legacy ? 11 : 12);
 }
 void STDMETHODCALLTYPE context_pixel_resources(Context* self,BufferView* const* input,UINT start,UINT packet) {
     // Reference 140220240: PS SRDs start at 0x6b40, 32 registers per slot;
@@ -2927,14 +2951,48 @@ void STDMETHODCALLTYPE context_clear_depth(Context* self,BufferView* view,UINT f
 }
 HRESULT STDMETHODCALLTYPE context_map_modern(Context*,GraphicsObject*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*);
 void STDMETHODCALLTYPE context_unmap_modern(Context*,GraphicsObject*);
-HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
-    const UINT count=UINT(packed>>32),first=UINT(packed);
+HRESULT refresh_graphics_bindings(Context* self) {
+    Shader* shaders[3]{};
+    std::memcpy(&shaders[0],self->inline_state.data()+0x188-32,sizeof(void*));
+    std::memcpy(&shaders[1],self->inline_state.data()+0x180-32,sizeof(void*));
+    std::memcpy(&shaders[2],self->inline_state.data()+0x1d0-32,sizeof(void*));
+    if(!shaders[0] || !shaders[1] || shaders[2]) return DXGI_ERROR_UNSUPPORTED;
+    for(const UINT offset : {0x1c0u,0x1c8u,0x1d8u}) {
+        void* stage=nullptr;std::memcpy(&stage,self->inline_state.data()+offset-32,sizeof stage);
+        if(stage) return DXGI_ERROR_UNSUPPORTED;
+    }
+    for(UINT stage=0;stage<2;++stage) {
+        struct Prefix { const void* table; UINT refs,flags; Device* device; void* private_data; UINT native_flags,stage; } prefix{};
+        static_assert(sizeof prefix==offsetof(Shader,code));
+        SIZE_T read=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),shaders[stage],&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+            prefix.table!=shader_vtable().data() || prefix.device!=self->device || prefix.stage!=stage) return E_INVALIDARG;
+    }
+    InputLayout* layout=nullptr;
+    std::memcpy(&layout,self->inline_state.data()+0x178-32,sizeof layout);
+    if(layout) {
+        struct Prefix { const void* table; UINT refs,flags; Device* device; void* private_data; } prefix{};
+        SIZE_T read=0;
+        if(!ReadProcessMemory(GetCurrentProcess(),layout,&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+            prefix.table!=input_layout_vtable().data() || prefix.device!=self->device) return E_INVALIDARG;
+    }
+    // Native title helpers write these public fields without calling the vtable.
+    if(self->shaders[0]!=shaders[0]) context_shader<0,11>(self,shaders[0]);
+    if(self->shaders[1]!=shaders[1]) context_shader<1,13>(self,shaders[1]);
+    if(self->shaders[2]) context_shader<2,25>(self,nullptr);
+    if(self->input_layout!=layout) context_input_layout(self,layout);
+    return S_OK;
+}
+HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) {
+    if(self->deferred) return DXGI_ERROR_UNSUPPORTED;
+    const HRESULT refreshed=refresh_graphics_bindings(self);
+    if(FAILED(refreshed)) return refreshed;
     UINT64 topology=0;std::memcpy(&topology,self->inline_state.data()+0x170-32,sizeof topology);
-    if(!self->shaders[0] || !self->shaders[1] || self->shaders[2] || !self->input_layout || !self->index_buffer ||
+    if((indexed && !self->index_buffer) ||
         !self->render_targets[0] || !self->viewport_count || topology!=0x000009ffc0009e00ull) return DXGI_ERROR_UNSUPPORTED;
     if(self->raster_state && self->raster_state->desc.ScissorEnable) return DXGI_ERROR_UNSUPPORTED;
     const UINT index_bytes=self->index_format==DXGI_FORMAT_R16_UINT ? 2 : 4;
-    if(UINT64(first)+count>(self->index_buffer->desc.standard.ByteWidth-self->index_offset)/index_bytes) return E_INVALIDARG;
+    if(indexed && UINT64(first)+count>(self->index_buffer->desc.standard.ByteWidth-self->index_offset)/index_bytes) return E_INVALIDARG;
     UINT counts[2][3]{}; // PS/VS: CBV, SRV, sampler.
     for(UINT stage=0;stage<2;++stage) {
         ValidatedShader shader;
@@ -2976,7 +3034,7 @@ HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
     pipeline.pRootSignature=root.Get();
     pipeline.VS={self->shaders[1]->code.data(),self->shaders[1]->code.size()};
     pipeline.PS={self->shaders[0]->code.data(),self->shaders[0]->code.size()};
-    pipeline.InputLayout={self->input_layout->elements.data(),UINT(self->input_layout->elements.size())};
+    if(self->input_layout) pipeline.InputLayout={self->input_layout->elements.data(),UINT(self->input_layout->elements.size())};
     pipeline.SampleMask=self->sample_mask;pipeline.SampleDesc={1,0};pipeline.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     for(auto& target : pipeline.BlendState.RenderTarget) target={FALSE,FALSE,D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,
         D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,D3D12_LOGIC_OP_NOOP,D3D12_COLOR_WRITE_ENABLE_ALL};
@@ -3051,15 +3109,19 @@ HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
         }
     }
     std::array<D3D12_VERTEX_BUFFER_VIEW,D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertices{};
-    for(UINT i=0;i<vertices.size();++i) if(auto* buffer=self->vertex_buffers[i]) {
+    for(UINT i=0;self->input_layout && i<vertices.size();++i) if(auto* buffer=self->vertex_buffers[i]) {
         if(self->vertex_offsets[i]>buffer->desc.standard.ByteWidth || !use(buffer->gpu,false,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)) return E_INVALIDARG;
+        // Native IA bounds use the logical buffer extent, including its original layout/stride.
         vertices[i]={buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset+self->vertex_offsets[i],buffer->desc.standard.ByteWidth-self->vertex_offsets[i],self->vertex_strides[i]};
     }
-    for(const auto& element : self->input_layout->elements) if(!self->vertex_buffers[element.InputSlot]) return DXGI_ERROR_UNSUPPORTED;
-    if(!use(self->index_buffer->gpu,false,D3D12_RESOURCE_STATE_INDEX_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
-    const auto& indices=self->index_buffer->gpu;
-    const D3D12_INDEX_BUFFER_VIEW index{indices.resource->GetGPUVirtualAddress()+indices.offset+self->index_offset,
-        self->index_buffer->desc.standard.ByteWidth-self->index_offset,self->index_format};
+    if(self->input_layout) for(const auto& element : self->input_layout->elements) if(!self->vertex_buffers[element.InputSlot]) return DXGI_ERROR_UNSUPPORTED;
+    D3D12_INDEX_BUFFER_VIEW index{};
+    if(indexed) {
+        if(!use(self->index_buffer->gpu,false,D3D12_RESOURCE_STATE_INDEX_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
+        const auto& indices=self->index_buffer->gpu;
+        index={indices.resource->GetGPUVirtualAddress()+indices.offset+self->index_offset,
+            self->index_buffer->desc.standard.ByteWidth-self->index_offset,self->index_format};
+    }
     if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
     Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
     if(!completed.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
@@ -3094,8 +3156,9 @@ HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
     self->command_list->RSSetScissorRects(1,&scissor);
     self->command_list->OMSetBlendFactor(self->blend_factor.data());self->command_list->OMSetStencilRef(self->stencil_reference);
     self->command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    self->command_list->IASetVertexBuffers(0,UINT(vertices.size()),vertices.data());self->command_list->IASetIndexBuffer(&index);
-    self->command_list->DrawIndexedInstanced(count,1,first,base,0);
+    self->command_list->IASetVertexBuffers(0,UINT(vertices.size()),vertices.data());self->command_list->IASetIndexBuffer(indexed ? &index : nullptr);
+    if(indexed) self->command_list->DrawIndexedInstanced(count,1,first,base,0);
+    else self->command_list->DrawInstanced(count,1,first,0);
     for(auto& entry : uses) {
         hr=entry.texture ? end_title_gpu_texture(*entry.gpu,self->command_list.Get()) : end_title_gpu_buffer(*entry.gpu,self->command_list.Get());
         if(FAILED(hr)) return hr;
@@ -3110,13 +3173,28 @@ HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
     if(FAILED(hr)) default_trap("graphics submission retirement",14);
     for(auto& entry : uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return hr;}
     ++self->completed_draws;
-    if(stop_on_missing_service() && self->completed_draws<=2) std::fprintf(stderr,"xone-era: native indexed draw %llu completed, %u indices, original VS/PS\n",self->completed_draws,count);
+    if((stop_on_missing_service() || self->device->legacy) && self->completed_draws<=2)
+        std::fprintf(stderr,"xone-era: native %s draw %llu completed, %u %s, original VS/PS\n",indexed ? "indexed" : "non-indexed",
+            self->completed_draws,count,indexed ? "indices" : "vertices");
     return S_OK;
 }
 void STDMETHODCALLTYPE context_draw_indexed(Context* self,UINT64 packed,INT base) {
     HRESULT hr=E_OUTOFMEMORY;
-    try {hr=execute_indexed(self,packed,base);} catch(const std::bad_alloc&) {}
+    try {hr=execute_draw(self,UINT(packed>>32),UINT(packed),base,true);} catch(const std::bad_alloc&) {}
     if(FAILED(hr)) {std::fprintf(stderr,"xone-era: indexed draw failed 0x%08lX\n",hr);default_trap("indexed draw submission",14);}
+}
+void STDMETHODCALLTYPE legacy_context_draw(Context* self,UINT count,UINT first) {
+    HRESULT hr=E_OUTOFMEMORY;
+    try {hr=execute_draw(self,count,first,0,false);} catch(const std::bad_alloc&) {}
+    if(FAILED(hr)) {
+        std::fprintf(stderr,"xone-era: non-indexed draw refused 0x%08lX\n",hr);
+        if(self->input_layout) for(const auto& e:self->input_layout->elements) {
+            const auto* buffer=self->vertex_buffers[e.InputSlot];
+            std::fprintf(stderr,"xone-era: Draw input %s%u format %u slot %u element_offset %u stride %u buffer_offset %u bytes %u\n",e.SemanticName,e.SemanticIndex,
+                e.Format,e.InputSlot,e.AlignedByteOffset,self->vertex_strides[e.InputSlot],self->vertex_offsets[e.InputSlot],buffer ? buffer->desc.standard.ByteWidth : 0);
+        }
+        (void)trap_slot<kind_context,14>(self,count,first);
+    }
 }
 const std::array<const void*, vtable_slots>& context_vtable() {
     static const auto table = [] {
@@ -3179,7 +3257,8 @@ void STDMETHODCALLTYPE context_unbind_geometry_shader(Context* self, void* shade
     context_unbind_shader_stage<24, 0x1d8, 0x3000, 8>(self, shader);
 }
 void STDMETHODCALLTYPE context_clear_state(Context* self) {
-    clear_context_bindings(self);
+    // 11295 18000d060 preserves the public input-layout cache at +0x178.
+    clear_context_bindings(self,self->device->legacy);
     self->viewports={}; self->viewport_count=0;
     self->vertex_strides={}; self->vertex_offsets={};
     self->index_format=DXGI_FORMAT_UNKNOWN; self->index_offset=0;
@@ -3333,6 +3412,8 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[23] = reinterpret_cast<const void*>(&context_constants<2,23>); // 11295 180011350, GS constant buffers.
         t[71] = reinterpret_cast<const void*>(&context_constants<3,71>); // 11295 180011ef0, CS constant buffers.
         t[19] = reinterpret_cast<const void*>(&legacy_context_vertices); // 11295 180010580 -> 18001ee50.
+        t[11] = reinterpret_cast<const void*>(&context_pixel_samplers); // 11295 180009230 -> 18001b900.
+        t[14] = reinterpret_cast<const void*>(&legacy_context_draw); // 11295 180009480, Draw(vertex count, first vertex).
         return t;
     }();
     return table;

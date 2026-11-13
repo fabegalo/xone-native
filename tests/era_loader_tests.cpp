@@ -21,6 +21,7 @@
 #include <activation.h>
 #include <roapi.h>
 #include <winstring.h>
+#include <weakreference.h>
 
 #include <fstream>
 #include <filesystem>
@@ -655,7 +656,7 @@ int main(int argc, char** argv) {
             const auto present_array=reinterpret_cast<PresentArray>(resolve_d3d11x({"d3d11_x.dll","DXGIXPresentArray",0}));
             check(present_array!=nullptr,"legacy PresentArray export is bound to the presentation runtime");
             if(present_array) {
-                struct PresentParameters {UINT reserved[2]{};RECT source{};POINT destination{};FLOAT scale[2]{1,1};UINT64 token=0;UINT flags=0,tail=0;} p;
+                struct PresentParameters {UINT reserved[2]{};RECT source{};POINT destination{};FLOAT scale[2]{1,1};UINT64 cookie=0;UINT flags=0,tail=0;} p;
                 static_assert(sizeof p==56);
                 void* chain=nullptr;
                 check(present_array(2,20,0,0,&chain,&p)==E_INVALIDARG && present_array(5,20,0,1,&chain,&p)==E_INVALIDARG,
@@ -663,9 +664,11 @@ int main(int argc, char** argv) {
                 check(present_array(2,21,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED &&
                       present_array(2,20,1,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED && present_array(2,20,0,2,&chain,&p)==DXGI_ERROR_UNSUPPORTED,
                       "unknown presentation profiles, flags and multi-plane composition remain explicit");
-                p.token=1;
-                check(present_array(2,20,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED,"unknown presentation synchronization token cannot be discarded");
-                p.token=0;p.scale[0]=2;
+                p.cookie=1;
+                check(present_array(2,20,0,1,&chain,&p)==E_INVALIDARG,"opaque frame cookie is accepted before validating the null chain");
+                p.cookie=UINT64_MAX;
+                check(present_array(2,20,0,1,&chain,&p)==E_INVALIDARG,"frame cookie is never dereferenced or interpreted as a synchronization handle");
+                p.cookie=0;p.scale[0]=2;
                 check(present_array(2,20,0,1,&chain,&p)==DXGI_ERROR_UNSUPPORTED,"scaled presentation cannot silently become identity composition");
                 p.scale[0]=1;
                 check(present_array(2,20,0,1,&chain,reinterpret_cast<void*>(1))==E_INVALIDARG &&
@@ -3051,6 +3054,83 @@ int main(int argc, char** argv) {
                 set_title_package_root(root.wstring(),"owned.exe",hash);
                 check(get(factory,&current)==S_OK && current,"Current binds only the verified selected manifest and executable");
                 if(current) {
+                    constexpr GUID iid_watcher_statics{0xa306e506,0x12f9,0x460a,{0xb0,0xae,0x50,0xba,0x32,0x8c,0x78,0x6c}};
+                    IInspectable* watcher_factory=nullptr;
+                    check(activate(L"Windows.Xbox.Management.Deployment.PackageTransferWatcher",iid_watcher_statics,
+                        reinterpret_cast<void**>(&watcher_factory))==S_OK && watcher_factory,"watcher statics match the original factory IID");
+                    if(watcher_factory) {
+                        const auto create=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable*,IInspectable**)>(
+                            (*reinterpret_cast<void***>(watcher_factory))[7]);
+                        const auto chunks=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable*,IInspectable*,IInspectable**)>(
+                            (*reinterpret_cast<void***>(watcher_factory))[6]);
+                        IInspectable* observer=reinterpret_cast<IInspectable*>(1);
+                        check(create(watcher_factory,current,nullptr)==E_POINTER && create(watcher_factory,nullptr,&observer)==E_INVALIDARG && !observer,
+                            "watcher creation validates outputs and package arguments");
+                        check(create(watcher_factory,factory,&observer)==E_INVALIDARG && !observer,
+                            "watcher refuses a foreign package identity without dereferencing it");
+                        check(chunks(watcher_factory,current,nullptr,&observer)==E_NOTIMPL && !observer,
+                            "unproved chunk selection remains explicitly unsupported");
+                        check(create(watcher_factory,current,&observer)==S_OK && observer,"watcher observes the verified package without deployment");
+                        if(observer) {
+                            struct Handler : IUnknown {
+                                ULONG refs=1;unsigned calls=0;
+                                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override {if(!out)return E_POINTER;*out=nullptr;return E_NOINTERFACE;}
+                                ULONG STDMETHODCALLTYPE AddRef() override {return ++refs;}
+                                ULONG STDMETHODCALLTYPE Release() override {return --refs;}
+                                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable*) {++calls;return S_OK;}
+                            } handler;
+                            constexpr GUID iid_watcher{0xe74b8e43,0xba51,0x4b09,{0xad,0x3f,0x01,0xba,0xff,0x31,0xf9,0x34}};
+                            IInspectable* same=nullptr;
+                            check(observer->QueryInterface(iid_watcher,reinterpret_cast<void**>(&same))==S_OK && same==observer,
+                                "watcher preserves the Xbox instance IID and identity");
+                            if(same)same->Release();
+                            auto** vt=*reinterpret_cast<void***>(observer);
+                            for(UINT slot:{7u,9u,11u}) {
+                                auto add=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*,std::int64_t*)>(vt[slot]);
+                                auto remove=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,std::int64_t)>(vt[slot+1]);
+                                std::int64_t token=0;
+                                check(add(observer,nullptr,&token)==E_INVALIDARG && add(observer,&handler,nullptr)==E_INVALIDARG && handler.refs==1,
+                                    "watcher refuses invalid registrations without retaining handlers");
+                                check(add(observer,&handler,&token)==S_OK && token!=0 && handler.refs==2 && handler.calls==0,
+                                    "watcher retains subscriptions without inventing transfer events");
+                                check(remove(observer,token)==S_OK && remove(observer,token)==S_OK && handler.refs==1,
+                                    "watcher removes each event subscription exactly once");
+                            }
+                            std::int64_t token=0;
+                            reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*,std::int64_t*)>(vt[7])(observer,&handler,&token);
+                            IWeakReferenceSource* source=nullptr;IWeakReference* weak=nullptr;
+                            check(observer->QueryInterface(__uuidof(IWeakReferenceSource),reinterpret_cast<void**>(&source))==S_OK && source,
+                                "watcher supports the original caller's weak event ownership");
+                            if(source) {
+                                IUnknown* identity=nullptr;
+                                check(source->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity))==S_OK && identity==observer,
+                                    "weak source shares the watcher's COM identity");
+                                if(identity)identity->Release();
+                                check(source->GetWeakReference(nullptr)==E_POINTER && source->GetWeakReference(&weak)==S_OK && weak,
+                                    "weak references validate outputs and retain their own control");
+                                source->Release();
+                            }
+                            if(weak) {
+                                check(weak->Resolve(iid_watcher,&same)==S_OK && same==observer,"live weak reference resolves the original watcher");
+                                if(same)same->Release();
+                                same=reinterpret_cast<IInspectable*>(1);
+                                check(weak->Resolve(GUID_NULL,&same)==E_NOINTERFACE && !same,"weak resolution preserves unsupported IID failures");
+                            }
+                            set_title_package_root({});
+                            IInspectable* absent=reinterpret_cast<IInspectable*>(1);
+                            check(create(watcher_factory,current,&absent)==HRESULT_FROM_WIN32(APPMODEL_ERROR_NO_PACKAGE) && !absent,
+                                "watcher cannot create an observer after session unbinding");
+                            observer->Release();
+                            check(handler.refs==1 && handler.calls==0,"watcher teardown releases pending handlers without completion callbacks");
+                            if(weak) {
+                                same=reinterpret_cast<IInspectable*>(1);
+                                check(weak->Resolve(iid_watcher,&same)==S_OK && !same,"expired weak reference cannot resurrect a destroyed watcher");
+                                weak->Release();
+                            }
+                            set_title_package_root(root.wstring(),"owned.exe",hash);
+                        }
+                        watcher_factory->Release();
+                    }
                     IInspectable* second=nullptr;
                     check(get(factory,&second)==S_OK && second==current,"Current retains one COM identity for an immutable package revision");
                     if(second)second->Release();
@@ -3259,8 +3339,44 @@ int main(int argc, char** argv) {
                 if (instance) {
                     using Installed = HRESULT(STDMETHODCALLTYPE*)(void*, UINT32, boolean*);
                     const auto installed = reinterpret_cast<Installed>((*reinterpret_cast<void***>(instance))[7]);
+                    const auto batch=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable*,boolean*)>(
+                        (*reinterpret_cast<void***>(instance))[8]);
+                    struct Sequence : WinrtObject {
+                        struct Cursor : WinrtObject {Sequence* owner=nullptr;} cursor;
+                        std::vector<UINT32> values;size_t position=0;ULONG cursor_refs=0;
+                        HRESULT failure=S_OK;bool null_cursor=false;
+                        static HRESULT STDMETHODCALLTYPE first(Sequence* self,void** out) {
+                            *out=nullptr;self->position=0;
+                            if(self->null_cursor)return S_OK;
+                            ++self->cursor_refs;*out=&self->cursor;return S_OK;
+                        }
+                        static ULONG STDMETHODCALLTYPE retain(Cursor* self) {return ++self->owner->cursor_refs;}
+                        static ULONG STDMETHODCALLTYPE release(Cursor* self) {return --self->owner->cursor_refs;}
+                        static HRESULT STDMETHODCALLTYPE current(Cursor* self,UINT32* out) {
+                            if(FAILED(self->owner->failure))return self->owner->failure;
+                            if(self->owner->position>=self->owner->values.size())return E_BOUNDS;
+                            *out=self->owner->values[self->owner->position];return S_OK;
+                        }
+                        static HRESULT STDMETHODCALLTYPE has(Cursor* self,boolean* out) {
+                            *out=self->owner->position<self->owner->values.size();return S_OK;
+                        }
+                        static HRESULT STDMETHODCALLTYPE next(Cursor* self,boolean* out) {++self->owner->position;return has(self,out);}
+                        Sequence() {
+                            static const auto collection=[] {auto t=winrt_vtable();t[6]=reinterpret_cast<const void*>(&first);return t;}();
+                            static const auto iterator=[] {auto t=winrt_vtable();t[1]=reinterpret_cast<const void*>(&retain);t[2]=reinterpret_cast<const void*>(&release);
+                                t[6]=reinterpret_cast<const void*>(&current);t[7]=reinterpret_cast<const void*>(&has);t[8]=reinterpret_cast<const void*>(&next);return t;}();
+                            static_cast<WinrtObject&>(*this)={collection.data(),L"Owned.Chunks",
+                                winrt_pinterface_iid("pinterface({faa585ea-6214-4217-afda-7f46de5869b3};u4)"),nullptr};
+                            static_cast<WinrtObject&>(cursor)={iterator.data(),L"Owned.ChunkIterator",GUID_NULL,nullptr};cursor.owner=this;
+                        }
+                    } sequence;
+                    auto* iterable=reinterpret_cast<IInspectable*>(&sequence);
                     check(installed(instance, 69, nullptr) == E_POINTER, "chunk query validates its output");
                     boolean present = true;
+                    check(batch(instance,iterable,nullptr)==E_POINTER && batch(instance,nullptr,&present)==E_INVALIDARG && !present,
+                        "batch chunk query validates arguments and clears failed outputs");
+                    check(FAILED(batch(instance,iterable,&present)) && !present && !sequence.cursor_refs,
+                        "empty batch cannot hide a missing catalog or leak its iterator");
                     check(FAILED(installed(instance, 69, &present)) && !present, "missing catalog is an error, never installed");
                     const auto catalog = package + L"\\hash.manifest";
                     {
@@ -3271,6 +3387,8 @@ int main(int argc, char** argv) {
                     present = true;
                     check(installed(instance, 69, &present) == HRESULT_FROM_WIN32(ERROR_INVALID_DATA) && !present,
                           "malformed local catalog rejected");
+                    check(batch(instance,iterable,&present)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA) && !present && !sequence.cursor_refs,
+                        "empty batch preserves malformed catalog failures");
                     {
                         std::ofstream out(catalog, std::ios::binary | std::ios::trunc);
                         const unsigned char record[12]{0,0,0,0,0,0,0,0,69,0,0,0};
@@ -3279,9 +3397,23 @@ int main(int argc, char** argv) {
                     check(installed(instance, 69, &present) == S_OK && present, "local catalog supplies installed chunk");
                     check(installed(instance, 70, &present) == S_OK && !present, "absent chunk is not invented");
                     check(installed(instance, 0xffffffff, &present) == S_OK && !present, "reserved chunk never installed");
+                    check(batch(instance,iterable,&present)==S_OK && present && !sequence.cursor_refs,"empty batch is true only for a valid catalog");
+                    sequence.values={69,69};
+                    check(batch(instance,iterable,&present)==S_OK && present && !sequence.cursor_refs,"batch checks every requested local chunk, including duplicates");
+                    sequence.values={69,70};
+                    check(batch(instance,iterable,&present)==S_OK && !present,"a missing batch member is never reported installed");
+                    sequence.values={0xffffffff};
+                    check(batch(instance,iterable,&present)==S_OK && !present,"reserved batch chunk is never invented");
+                    sequence.failure=E_ABORT;
+                    check(batch(instance,iterable,&present)==E_ABORT && !present && !sequence.cursor_refs,"iterator failure propagates without publishing partial success");
+                    sequence.failure=S_OK;sequence.null_cursor=true;
+                    check(batch(instance,iterable,&present)==E_UNEXPECTED && !present,"malformed iterable cannot return a null successful iterator");
+                    sequence.null_cursor=false;
+                    check(batch(instance,instance,&present)==E_NOINTERFACE && !present,"batch refuses an object without IIterable<UInt32>");
                     set_title_package_root(package);
                     DeleteFileW(catalog.c_str());
                     check(FAILED(installed(instance, 69, &present)), "package rebinding invalidates cached chunk state");
+                    check(FAILED(batch(instance,iterable,&present)) && !present,"batch shares catalog invalidation with single-chunk queries");
                     IInspectable* same = nullptr;
                     check(instance->QueryInterface(iid_transfer, reinterpret_cast<void**>(&same)) == S_OK && same == instance,
                           "transfer manager has the declared default interface");

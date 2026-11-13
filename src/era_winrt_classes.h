@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace xboxone::appmodel { struct Manifest; }
 namespace xboxone::era {
@@ -18,6 +19,7 @@ HRESULT xbox_live_configuration_factory(REFIID iid, void** factory);
 // EntryPoint of the package manifest's first Application element.
 HRESULT title_entry_point(std::wstring& entry_point);
 HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed);
+HRESULT title_installed_chunks(std::vector<std::uint32_t>& chunks);
 HRESULT title_package_metadata(appmodel::Manifest& manifest, std::wstring& root, std::string& revision);
 HRESULT package_factory(REFIID iid, void** factory);
 // HWND behind a CoreWindow handed to the title, or null if `window` is not ours.
@@ -43,6 +45,7 @@ std::size_t xbox_user_removed_handlers(); // Test observation.
 // Windows.Xbox.Management.Deployment.DownloadableContentPackageManager.
 HRESULT dlc_package_manager_factory(REFIID iid, void** factory);
 HRESULT package_transfer_manager_factory(REFIID iid, void** factory);
+HRESULT package_transfer_watcher_factory(REFIID iid, void** factory);
 // Windows.ApplicationModel.Core.CoreApplication (view lifecycle driven here).
 HRESULT core_application_factory(REFIID iid, void** factory);
 HRESULT core_window_factory(REFIID iid, void** factory);

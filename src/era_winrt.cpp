@@ -35,6 +35,7 @@ constexpr TitleClass title_classes[]{
     {L"Windows.Xbox.Input.Gamepad", &xbox_gamepad_factory},
     {L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", &dlc_package_manager_factory},
     {L"Windows.Xbox.Management.Deployment.PackageTransferManager", &package_transfer_manager_factory},
+    {L"Windows.Xbox.Management.Deployment.PackageTransferWatcher", &package_transfer_watcher_factory},
     {L"Windows.ApplicationModel.Core.CoreApplication", &core_application_factory},
     {L"Windows.UI.Core.CoreWindow", &core_window_factory},
 };

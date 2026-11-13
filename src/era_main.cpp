@@ -30,6 +30,7 @@ namespace {
 
 std::uintptr_t title_base = 0, title_end = 0;
 volatile LONG reported = 0;
+volatile LONG reported_access_violations = 0;
 std::array<xboxone::era::ImportRequest, 256> stopped_imports;
 std::size_t stopped_count = 0;
 std::atomic<bool> diagnostic_exceptions{false};
@@ -101,7 +102,10 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
     if (code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C || code == 0x406D1388)
         return EXCEPTION_CONTINUE_SEARCH; // Debug print and thread naming are not faults.
-    if (InterlockedIncrement(&reported) > 16) return EXCEPTION_CONTINUE_SEARCH;
+    // Handled C++ failures must not exhaust the evidence budget for the first
+    // actual memory fault. Both categories remain independently bounded.
+    if (code==EXCEPTION_ACCESS_VIOLATION ? InterlockedIncrement(&reported_access_violations)>2 :
+        InterlockedIncrement(&reported)>16) return EXCEPTION_CONTINUE_SEARCH;
     const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
     char line[256];
     if (at >= title_base && at < title_end)

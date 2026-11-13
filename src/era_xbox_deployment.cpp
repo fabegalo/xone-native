@@ -13,6 +13,9 @@
 #include <activation.h>
 #include <atomic>
 #include <memory>
+#include <weakreference.h>
+#include <wrl/client.h>
+#include <algorithm>
 
 namespace xboxone::era {
 namespace {
@@ -121,10 +124,38 @@ HRESULT STDMETHODCALLTYPE is_chunk_installed(WinrtObject*, UINT32 chunk, boolean
     return hr;
 }
 
+HRESULT STDMETHODCALLTYPE are_chunks_installed(WinrtObject*,IInspectable* chunks,boolean* out) {
+    if(!out)return E_POINTER;*out=false;if(!chunks)return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<IInspectable> iterable,iterator;
+    const auto iid=winrt_pinterface_iid("pinterface({faa585ea-6214-4217-afda-7f46de5869b3};u4)");
+    HRESULT hr=chunks->QueryInterface(iid,reinterpret_cast<void**>(iterable.GetAddressOf()));
+    if(FAILED(hr))return hr;if(!iterable)return E_UNEXPECTED;
+    auto** vt=*reinterpret_cast<void***>(iterable.Get());
+    hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable**)>(vt[6])(iterable.Get(),iterator.GetAddressOf());
+    if(FAILED(hr))return hr;if(!iterator)return E_UNEXPECTED;
+    vt=*reinterpret_cast<void***>(iterator.Get());
+    boolean more=false;
+    hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>(vt[7])(iterator.Get(),&more);
+    bool all=true;
+    std::vector<std::uint32_t> catalog;
+    // Even an empty request must not mask an absent/malformed package catalog.
+    if(SUCCEEDED(hr))hr=title_installed_chunks(catalog);
+    while(SUCCEEDED(hr) && more) {
+        UINT32 chunk=0;
+        hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT32*)>(vt[6])(iterator.Get(),&chunk);
+        if(SUCCEEDED(hr)) {
+            all=all && std::binary_search(catalog.begin(),catalog.end(),chunk);
+            hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>(vt[8])(iterator.Get(),&more);
+        }
+    }
+    if(SUCCEEDED(hr))*out=all;return hr;
+}
+
 WinrtObject& current() {
     static const auto vt = [] {
         auto t = winrt_vtable();
         t[7] = reinterpret_cast<const void*>(&is_chunk_installed);
+        t[8] = reinterpret_cast<const void*>(&are_chunks_installed);
         return t;
     }();
     static WinrtObject object{vt.data(), name, iid_manager, &self_query};
@@ -242,6 +273,119 @@ WinrtObject& activation() {
 
 HRESULT package_factory(REFIID iid,void** out) {
     if(!out)return E_POINTER;*out=nullptr;auto& object=package::activation();
+    return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(WinrtObject*,REFIID,void**)>(const_cast<void*>(object.vtable[0]))(&object,iid,out);
+}
+
+namespace watcher {
+constexpr wchar_t name[]=L"Windows.Xbox.Management.Deployment.PackageTransferWatcher";
+// FH2 1411cf610/1411cf6d0 and the public deployment IDL agree on these contracts.
+constexpr GUID iid_statics{0xa306e506,0x12f9,0x460a,{0xb0,0xae,0x50,0xba,0x32,0x8c,0x78,0x6c}};
+constexpr GUID iid_watcher{0xe74b8e43,0xba51,0x4b09,{0xad,0x3f,0x01,0xba,0xff,0x31,0xf9,0x34}};
+struct Watcher;
+HRESULT STDMETHODCALLTYPE query(Watcher*,REFIID,void**);
+ULONG STDMETHODCALLTYPE retain(Watcher*);
+ULONG STDMETHODCALLTYPE release(Watcher*);
+
+// The weak control outlives the observer. A nonzero strong count pins the
+// observer during Resolve; zero cannot be resurrected by a racing callback.
+struct Weak final : IWeakReference {
+    std::atomic<ULONG> refs{1},strong{1};
+    Watcher* owner=nullptr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+        if(!out)return E_POINTER;*out=nullptr;
+        if(iid!=__uuidof(IUnknown) && iid!=__uuidof(IWeakReference) && iid!=__uuidof(IAgileObject))return E_NOINTERFACE;
+        *out=static_cast<IWeakReference*>(this);AddRef();return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {return ++refs;}
+    ULONG STDMETHODCALLTYPE Release() override {const auto n=--refs;if(!n)delete this;return n;}
+    HRESULT STDMETHODCALLTYPE Resolve(REFIID iid,IInspectable** out) override {
+        if(!out)return E_POINTER;*out=nullptr;
+        auto count=strong.load();
+        while(count && !strong.compare_exchange_weak(count,count+1)) {}
+        if(!count)return S_OK;
+        const auto hr=query(owner,iid,reinterpret_cast<void**>(out));
+        release(owner);return hr;
+    }
+};
+struct Source final : IWeakReferenceSource {
+    Watcher* owner=nullptr;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {return query(owner,iid,out);}
+    ULONG STDMETHODCALLTYPE AddRef() override {return retain(owner);}
+    ULONG STDMETHODCALLTYPE Release() override {return release(owner);}
+    HRESULT STDMETHODCALLTYPE GetWeakReference(IWeakReference** out) override;
+};
+struct Watcher : WinrtObject {
+    Weak* weak=nullptr;
+    Source source;
+    IInspectable* package=nullptr;
+    WinrtEvent chunk,progress,completed;
+    ~Watcher() {
+        chunk.clear();progress.clear();completed.clear();
+        if(package)package->Release();
+        if(weak)weak->Release();
+    }
+};
+HRESULT STDMETHODCALLTYPE Source::GetWeakReference(IWeakReference** out) {
+    if(!out)return E_POINTER;*out=owner->weak;owner->weak->AddRef();return S_OK;
+}
+ULONG STDMETHODCALLTYPE retain(Watcher* self) {return ++self->weak->strong;}
+ULONG STDMETHODCALLTYPE release(Watcher* self) {const auto n=--self->weak->strong;if(!n)delete self;return n;}
+HRESULT STDMETHODCALLTYPE query(Watcher* self,REFIID iid,void** out) {
+    if(!out)return E_POINTER;*out=nullptr;
+    if(iid==__uuidof(IWeakReferenceSource))*out=&self->source;
+    else if(iid==iid_watcher || iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==__uuidof(IAgileObject))*out=self;
+    else return E_NOINTERFACE;
+    retain(self);return S_OK;
+}
+template<WinrtEvent Watcher::* Event>
+HRESULT STDMETHODCALLTYPE add(Watcher* self,IUnknown* handler,std::int64_t* token) {return (self->*Event).add(handler,token);}
+template<WinrtEvent Watcher::* Event>
+HRESULT STDMETHODCALLTYPE remove(Watcher* self,std::int64_t token) {return (self->*Event).remove(token);}
+const auto& table() {
+    static const auto methods=[] {auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&query);t[1]=reinterpret_cast<const void*>(&retain);t[2]=reinterpret_cast<const void*>(&release);
+        t[7]=reinterpret_cast<const void*>(&add<&Watcher::chunk>);t[8]=reinterpret_cast<const void*>(&remove<&Watcher::chunk>);
+        t[9]=reinterpret_cast<const void*>(&add<&Watcher::progress>);t[10]=reinterpret_cast<const void*>(&remove<&Watcher::progress>);
+        t[11]=reinterpret_cast<const void*>(&add<&Watcher::completed>);t[12]=reinterpret_cast<const void*>(&remove<&Watcher::completed>);
+        return t;}();return methods;
+}
+HRESULT STDMETHODCALLTYPE create(WinrtObject*,IInspectable* selected,void** out) {
+    if(!out)return E_POINTER;*out=nullptr;if(!selected)return E_INVALIDARG;
+    IInspectable* current=nullptr;
+    const auto hr=package::current(nullptr,reinterpret_cast<void**>(&current));if(FAILED(hr))return hr;
+    const bool matches=selected==current;current->Release();if(!matches)return E_INVALIDARG;
+    try {
+        auto value=std::make_unique<Watcher>();
+        value->vtable=table().data();value->runtime_class=name;value->iid=iid_watcher;value->query=nullptr;
+        value->weak=new Weak();value->weak->owner=value.get();value->source.owner=value.get();
+        selected->AddRef();value->package=selected;
+        // A read-only session has no transfer producer. Registration never
+        // synthesizes chunk/progress/completion events or installation success.
+        *out=value.release();return S_OK;
+    } catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+}
+HRESULT STDMETHODCALLTYPE create_chunks(WinrtObject*,IInspectable*,IInspectable*,void** out) {
+    if(!out)return E_POINTER;*out=nullptr;return E_NOTIMPL;
+}
+WinrtObject& activation();
+HRESULT factory_query(WinrtObject*,REFIID,void**);
+WinrtObject& statics() {
+    static const auto methods=[] {auto t=winrt_vtable();t[6]=reinterpret_cast<const void*>(&create_chunks);t[7]=reinterpret_cast<const void*>(&create);return t;}();
+    static WinrtObject object{methods.data(),name,iid_statics,&factory_query};return object;
+}
+HRESULT factory_query(WinrtObject*,REFIID iid,void** out) {
+    if(iid==iid_statics){*out=&statics();return S_OK;}
+    if(iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==__uuidof(IActivationFactory)){*out=&activation();return S_OK;}
+    return E_NOINTERFACE;
+}
+WinrtObject& activation() {
+    static const auto methods=[] {auto t=winrt_vtable();t[6]=reinterpret_cast<const void*>(&package::activate);return t;}();
+    static WinrtObject object{methods.data(),name,__uuidof(IActivationFactory),&factory_query};return object;
+}
+} // namespace watcher
+
+HRESULT package_transfer_watcher_factory(REFIID iid,void** out) {
+    if(!out)return E_POINTER;*out=nullptr;auto& object=watcher::activation();
     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(WinrtObject*,REFIID,void**)>(const_cast<void*>(object.vtable[0]))(&object,iid,out);
 }
 

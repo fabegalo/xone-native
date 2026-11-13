@@ -294,6 +294,7 @@ struct DxgiObject : GraphicsObject {
     Microsoft::WRL::ComPtr<ID3D12Fence> present_fence;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> present_source,present_target;
     UINT64 present_value = 0;
+    UINT64 completed_present_cookie = 0;
     LONGLONG present_frequency = 0, present_tick = 0;
     UINT present_fraction = 0;
     Microsoft::WRL::Wrappers::FileHandle present_timer;
@@ -2448,7 +2449,7 @@ HRESULT pace_legacy_present(DxgiObject* self,UINT interval) {
     return S_OK;
 }
 void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary="presented title") {
-    if(!graphics_diagnostics.load() || frame!=1) return;
+    if(!graphics_diagnostics.load() || !frame || frame>8) return;
     const auto& desc=source->desc.standard;
     const bool packed10=desc.Format==DXGI_FORMAT_R10G10B10A2_UNORM || desc.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS;
     const bool packed11=desc.Format==DXGI_FORMAT_R11G11B10_FLOAT;
@@ -2472,7 +2473,7 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary
             static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str());
     } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
 }
-HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input,bool legacy) {
+HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input,bool legacy,UINT64 cookie=0) {
     if(!self->host || self->device->legacy!=legacy || interval>4) return DXGI_ERROR_UNSUPPORTED;
     DXGI_PRESENT_PARAMETERS parameters{};SIZE_T read=0;
     if(input && (!ReadProcessMemory(GetCurrentProcess(),input,&parameters,sizeof parameters,&read) || read!=sizeof parameters)) return E_INVALIDARG;
@@ -2530,8 +2531,12 @@ HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESE
     if(FAILED(hr)) return hr;
     if(legacy) {hr=pace_legacy_present(self,interval);if(FAILED(hr)) return hr;}
     hr=chain->Present(legacy ? 0 : interval,0);
+    // The +0x28 PresentArray field is an opaque frame-statistics cookie, not
+    // a fence or pointer to dereference. Publish it only after real retirement.
+    // DXGIXGetFrameStatistics remains unsupported rather than inventing timing.
+    if(hr==S_OK) self->completed_present_cookie=cookie;
     if((stop_on_missing_service() || graphics_diagnostics.load()) && value<=3)
-        std::fprintf(stderr,"xone-era: native frame %llu presented, host HRESULT 0x%08lX interval %u\n",value,hr,interval);
+        std::fprintf(stderr,"xone-era: native frame %llu presented, host HRESULT 0x%08lX interval %u cookie 0x%llX\n",value,hr,interval,self->completed_present_cookie);
     if(hr==S_OK) diagnose_presented_pixels(source,value);
     return hr;
 }
@@ -2620,10 +2625,10 @@ struct LegacyPresentParameters {
     RECT source;
     POINT destination;
     FLOAT scale[2];
-    UINT64 token;
+    UINT64 cookie;
     UINT flags,reserved_tail;
 };
-static_assert(sizeof(LegacyPresentParameters)==56 && offsetof(LegacyPresentParameters,token)==40);
+static_assert(sizeof(LegacyPresentParameters)==56 && offsetof(LegacyPresentParameters,cookie)==40);
 HRESULT WINAPI era_DXGIXPresentArray(UINT interval,UINT threshold,UINT flags,UINT count,DxgiObject* const* input,const LegacyPresentParameters* parameters) {
     const auto fail=[&](HRESULT hr,const char* stage) {
         if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: PresentArray %s failed 0x%08lX interval %u threshold %u flags 0x%X count %u\n",stage,hr,interval,threshold,flags,count);
@@ -2634,8 +2639,14 @@ HRESULT WINAPI era_DXGIXPresentArray(UINT interval,UINT threshold,UINT flags,UIN
     LegacyPresentParameters p{};p.scale[0]=p.scale[1]=1;
     SIZE_T read=0;
     if(parameters && (!ReadProcessMemory(GetCurrentProcess(),parameters,&p,sizeof p,&read) || read!=sizeof p)) return fail(E_INVALIDARG,"parameter read");
-    if(p.reserved[0] || p.reserved[1] || p.destination.x || p.destination.y || p.scale[0]!=1 || p.scale[1]!=1 || p.token || p.flags || p.reserved_tail)
+    if(p.reserved[0] || p.reserved[1] || p.destination.x || p.destination.y || p.scale[0]!=1 || p.scale[1]!=1 || p.flags || p.reserved_tail) {
+        static std::atomic<UINT> observations{0};
+        if(graphics_diagnostics.load() && observations.fetch_add(1)<4)
+            std::fprintf(stderr,"xone-era: PresentArray parameters reserved=%X/%X source=%ld,%ld,%ld,%ld destination=%ld,%ld scale=%g,%g cookie=%llX flags=%X tail=%X\n",
+                p.reserved[0],p.reserved[1],p.source.left,p.source.top,p.source.right,p.source.bottom,p.destination.x,p.destination.y,
+                p.scale[0],p.scale[1],p.cookie,p.flags,p.reserved_tail);
         return fail(DXGI_ERROR_UNSUPPORTED,"composition");
+    }
     DxgiObject* chain=nullptr;
     if(!ReadProcessMemory(GetCurrentProcess(),input,&chain,sizeof chain,&read) || read!=sizeof chain || !chain) return fail(E_INVALIDARG,"chain read");
     struct Prefix {const void* table;UINT refs,flags;void* private_data;Device* device;IUnknown* host;} prefix{};
@@ -2645,7 +2656,7 @@ HRESULT WINAPI era_DXGIXPresentArray(UINT interval,UINT threshold,UINT flags,UIN
     const RECT full{0,0,LONG(chain->requested_desc.Width),LONG(chain->requested_desc.Height)};
     const RECT empty{};
     if(std::memcmp(&p.source,&full,sizeof full) && std::memcmp(&p.source,&empty,sizeof empty)) return fail(DXGI_ERROR_UNSUPPORTED,"source rectangle");
-    const HRESULT hr=present_frame(chain,interval,0,nullptr,true);
+    const HRESULT hr=present_frame(chain,interval,0,nullptr,true,p.cookie);
     return FAILED(hr) ? fail(hr,"native transport") : hr;
 }
 
@@ -3312,7 +3323,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     // Keep descriptors/PSO alive on every in-flight failure path.
     if(FAILED(hr)) default_trap("graphics submission retirement",14);
     for(auto& entry : uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return hr;}
-    if (graphics_diagnostics.load() && self->completed_draws<2) {
+    if (graphics_diagnostics.load() && self->completed_draws<8) {
         for (UINT i=0;i<counts[0][1];++i) {
             const auto* view=self->shader_resources[4][i];
             if (view && view->resource->vtable==texture_vtable().data()) {

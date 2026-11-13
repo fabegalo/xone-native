@@ -207,9 +207,8 @@ HRESULT title_package_metadata(appmodel::Manifest& manifest,std::wstring& root,s
     return S_OK;
 }
 
-HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed) {
-    installed = false;
-    std::lock_guard lock(package_mutex);
+// package_mutex is held by both single-chunk queries and batch snapshots.
+static HRESULT load_installed_chunks() {
     if (package_root.empty()) return HRESULT_FROM_WIN32(ERROR_NOT_READY);
     if (!chunks_loaded) {
         const auto path = detail::file_path(std::filesystem::path(package_root) / L"hash.manifest");
@@ -223,8 +222,20 @@ HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed) {
         } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
         chunks_loaded = true; // Immutable package revision; reset on an explicit package binding.
     }
-    installed = std::binary_search(installed_chunks.begin(), installed_chunks.end(), chunk);
     return S_OK;
+}
+
+HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed) {
+    installed=false;std::lock_guard lock(package_mutex);
+    const auto hr=load_installed_chunks();
+    if(SUCCEEDED(hr))installed=std::binary_search(installed_chunks.begin(),installed_chunks.end(),chunk);
+    return hr;
+}
+
+HRESULT title_installed_chunks(std::vector<std::uint32_t>& chunks) {
+    chunks.clear();std::lock_guard lock(package_mutex);
+    const auto hr=load_installed_chunks();if(FAILED(hr))return hr;
+    try {chunks=installed_chunks;return S_OK;}catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 }
 
 HRESULT title_entry_point(std::wstring& entry_point) {

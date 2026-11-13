@@ -84,7 +84,7 @@ private:
 HRESULT WINAPI create_xaudio2_object(IXAudio2** out,UINT32 flags,UINT32 processor,void* reserved) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (flags || !processor || (processor & ~0xffu) || reserved) {
+    if ((flags & ~0x400u) || !processor || (processor!=0xffffffffu && (processor & ~0xffu)) || reserved) {
         std::fprintf(stderr,"xone-era: unsupported XAudio2 creation flags 0x%X processor 0x%X reserved %p\n",flags,processor,reserved);
         return E_NOTIMPL;
     }
@@ -92,7 +92,8 @@ HRESULT WINAPI create_xaudio2_object(IXAudio2** out,UINT32 flags,UINT32 processo
     const auto create = reinterpret_cast<Create>(GetProcAddress(host_xaudio2(),"XAudio2Create"));
     if (!create) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
     ComPtr<IXAudio2> engine;
-    // Logical Xbox processor indices are not physical Windows CPU indices.
+    // Original 11295 initializer 180004684: bit 10 bypasses ACP hardware setup.
+    // The host mixer is software; logical Xbox processors (including ANY) are not Windows CPU indices.
     HRESULT hr = create(&engine,0,XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(hr)) return hr;
     try { *out = new XAudioEngine(engine.Get()); return S_OK; }

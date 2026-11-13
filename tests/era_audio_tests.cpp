@@ -124,6 +124,14 @@ int main(int argc,char** argv) {
         if (!create || FAILED(create(&engine,0,0x10,nullptr))) return 1;
         IXAudio2* rejected=engine.Get();
         check(create(&rejected,0x80000000,0x10,nullptr)==E_NOTIMPL && !rejected,"unknown Xbox audio flags fail without an engine");
+        for(UINT32 processor : {0x10u,0xffffffffu}) {
+            ComPtr<IXAudio2> software;
+            check(create(&software,0x400,processor,nullptr)==S_OK && software,
+                  "Xbox software audio flag accepts explicit and ANY logical processor with a real host engine");
+        }
+        check(create(&rejected,0x400,0,nullptr)==E_NOTIMPL && !rejected &&
+              create(&rejected,0x400,0x10,reinterpret_cast<void*>(1))==E_NOTIMPL && !rejected,
+              "software audio still rejects an empty processor mask and unimplemented device parameters");
         IXAudio2MasteringVoice* master=nullptr;
         HRESULT hr=engine->CreateMasteringVoice(&master,0,0,0,nullptr,nullptr,AudioCategory_GameEffects);
         check(SUCCEEDED(hr) && master,"real host endpoint accepts the Xbox mastering mix");

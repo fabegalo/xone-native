@@ -902,6 +902,46 @@ int main(int argc, char** argv) {
             check(create_esram_buffer(device,&esram_buffer,nullptr,&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
                   "buffer cannot extend beyond the physical ESRAM pool");
             check(release_virtual(esram_mirror,0,MEM_RELEASE),"ESRAM fixture releases its own title mapping");
+            {
+                using PlaceBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const EsramBufferDesc*,void*,void**);
+                const auto place_buffer=reinterpret_cast<PlaceBuffer>(vt(device)[62]);
+                auto* storage=static_cast<unsigned char*>(allocate(1024,attributes));
+                if (!storage) return 1;
+                std::memset(storage,0x35,1024);
+                EsramBufferDesc placed{};
+                placed.standard={128,D3D11_USAGE_IMMUTABLE,D3D11_BIND_CONSTANT_BUFFER,0,0,0};
+                void* buffer=nullptr;
+                check(place_buffer(device,&placed,storage+256,nullptr)==S_FALSE,"placement buffer validation does not acquire backing ownership");
+                check(place_buffer(device,&placed,storage+256,&buffer)==S_OK && buffer,"placement constant buffer pins the supplied canonical range");
+                if (buffer) {
+                    void* base=nullptr;std::memcpy(&base,static_cast<char*>(buffer)+48,sizeof base);
+                    std::array<UINT32,4> srd{};std::memcpy(srd.data(),static_cast<char*>(buffer)+32,sizeof srd);
+                    check(base==storage+256 && (UINT64(srd[0])|(UINT64(srd[1]&255)<<32))==reinterpret_cast<std::uintptr_t>(base) &&
+                          (srd[1]&0x3fff0000)==(16u<<16) && srd[2]==8,"placement CBV preserves physical base, sixteen-byte stride and count");
+                    struct { EsramBufferDesc desc{}; UINT64 guard=0x1122334455667788ull; } queried;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,EsramBufferDesc*)>(vt(buffer)[12])(buffer,&queried.desc);
+                    check(!std::memcmp(&queried.desc,&placed,sizeof placed) && queried.guard==0x1122334455667788ull,
+                          "placement buffer GetDesc preserves caller semantics and exact ABI extent");
+                    reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                }
+                MEMORY_BASIC_INFORMATION info{};
+                check(VirtualQuery(storage,&info,sizeof info) && info.State==MEM_COMMIT &&
+                      std::all_of(storage,storage+1024,[](auto x){return x==0x35;}),
+                      "placement retirement leaves borrowed allocation and every guard intact");
+                placed.standard={128,D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS,0};
+                check(place_buffer(device,&placed,storage+512,&buffer)==S_OK && buffer,"placement raw buffer reuses the same canonical allocation");
+                free_memory(storage,attributes);
+                check(VirtualQuery(storage,&info,sizeof info) && info.State==MEM_COMMIT,"live placement buffer defers title allocation retirement");
+                if (buffer) reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                check(VirtualQuery(storage,&info,sizeof info) && info.State==MEM_FREE,"last placement owner retires the allocation the title already released");
+                check(FAILED(place_buffer(device,&placed,reinterpret_cast<void*>(1),&buffer)) && !buffer,
+                      "placement refuses an unregistered address without acquiring or freeing it");
+                check(place_buffer(device,&placed,reinterpret_cast<void*>(0x10000000000ull-64),&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
+                      "placement rejects a span extending beyond the native forty-bit descriptor address range");
+                placed.standard.BindFlags=D3D11_BIND_VERTEX_BUFFER;
+                check(place_buffer(device,&placed,reinterpret_cast<void*>(1),&buffer)==DXGI_ERROR_UNSUPPORTED && !buffer,
+                      "placement buffer keeps unsupported binding semantics explicit");
+            }
             for (const auto storage_format:{DXGI_FORMAT_R8_TYPELESS,DXGI_FORMAT_R10G10B10A2_TYPELESS,DXGI_FORMAT_R16G16_FLOAT}) {
                 Desc color{};
                 color.standard={32,16,1,1,storage_format,{1,0},D3D11_USAGE_DEFAULT,
@@ -960,6 +1000,23 @@ int main(int argc, char** argv) {
                             bool exact=true;
                             for (SIZE_T at=0;at<linear.size();++at) exact=exact && linear[at]==(storage_format==DXGI_FORMAT_R16G16_FLOAT ? (at%2 ? 0x3c : 0) : 0xff);
                             check(exact,"legacy context slot 50 clears every pixel with exact typed values");
+                            if (storage_format==DXGI_FORMAT_R8_TYPELESS) {
+                                using Deferred=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
+                                void* deferred=nullptr;
+                                check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&deferred)==S_OK && deferred,
+                                      "observed deferred mode has its own real context state");
+                                if (deferred) {
+                                    const std::vector<unsigned char> before(static_cast<unsigned char*>(alias),static_cast<unsigned char*>(alias)+pixels.bytes);
+                                    static UINT clear_slot=0;
+                                    set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{clear_slot=slot;return 0;});
+                                    const FLOAT black[]{0,0,0,0};
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(deferred)[50])(deferred,view,black);
+                                    set_d3d11x_trap_handler(nullptr);
+                                    check(clear_slot==50 && !std::memcmp(before.data(),alias,before.size()),
+                                          "deferred clear stays explicit and cannot execute immediately or modify canonical pixels");
+                                    reinterpret_cast<Count>(vt(deferred)[2])(deferred);
+                                }
+                            }
                             reinterpret_cast<Count>(vt(srv_view)[2])(srv_view);
                         }
                     }
@@ -979,52 +1036,72 @@ int main(int argc, char** argv) {
                 check(create_uav(device,texture,&invalid,&view)==DXGI_ERROR_UNSUPPORTED && !view,"texture UAV refuses an incompatible format without replacing its parent");
                 reinterpret_cast<Count>(vt(texture)[2])(texture);
             }
-            Desc initialized{};
-            initialized.standard={8,8,3,1,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,0};
-            std::array<std::vector<unsigned char>,3> sources;
-            std::array<D3D11_SUBRESOURCE_DATA,3> initial{};
-            for (UINT mip=0;mip<3;++mip) {
-                const UINT width=8>>mip,pitch=width*4+12;
-                sources[mip].assign(pitch*width+16,0x5a);
-                for (UINT y=0;y<width;++y) for (UINT x=0;x<width*4;++x) sources[mip][y*pitch+x]=static_cast<unsigned char>(mip*53+y*7+x);
-                initial[mip]={sources[mip].data(),pitch,0};
-            }
-            const auto original_sources=sources;
-            using CreateInitialized=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
-            const auto create_initialized=reinterpret_cast<CreateInitialized>(vt(device)[5]);
-            texture=nullptr;
-            check(create_initialized(device,&initialized,initial.data(),&texture)==S_OK && texture,
-                  "initial texture upload accepts padded source rows and every mip");
-            if (texture) {
-                void* view=nullptr;
-                using MakeSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
-                check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,texture,nullptr,&view)==S_OK && view,
-                      "initialized texture retains a native view of all uploaded mips");
-                if (view) {
-                    void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
-                    TitleTextureLayout pixels;
-                    hr=create_xg_texture_layout(8,8,3,1,DXGI_FORMAT_R8G8B8A8_UNORM,UINT_MAX,pixels,D3D11_BIND_SHADER_RESOURCE);
-                    check(SUCCEEDED(hr),"initialized texture keeps the original XG mip layout");
-                    for (UINT mip=0;SUCCEEDED(hr) && mip<3;++mip) {
-                        const UINT width=8>>mip,pitch=width*4;
-                        std::vector<unsigned char> linear(pitch*width);
-                        check(pixels.copy(pixels.context.get(),false,linear.data(),canonical,mip,pitch,pitch*width)==S_OK,
-                              "initialized texture exposes tiled mip pixels through original XG");
-                        bool exact=true;
-                        for (UINT y=0;y<width;++y) exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
-                        check(exact,"upload preserves every source pixel without copying row padding");
-                    }
-                    reinterpret_cast<Count>(vt(view)[2])(view);
+            for (const UINT faces:{1u,6u}) {
+                Desc initialized{};
+                initialized.standard={8,8,3,faces,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,faces==6 ? UINT(D3D11_RESOURCE_MISC_TEXTURECUBE) : 0};
+                std::vector<std::vector<unsigned char>> sources(faces*3);
+                std::vector<D3D11_SUBRESOURCE_DATA> initial(faces*3);
+                for (UINT mip=0;mip<faces*3;++mip) {
+                    const UINT width=8>>(mip%3),pitch=width*4+12;
+                    sources[mip].assign(pitch*width+16,0x5a);
+                    for (UINT y=0;y<width;++y) for (UINT x=0;x<width*4;++x) sources[mip][y*pitch+x]=static_cast<unsigned char>(mip*53+y*7+x);
+                    initial[mip]={sources[mip].data(),pitch,0};
                 }
-                reinterpret_cast<Count>(vt(texture)[2])(texture);
+                const auto original_sources=sources;
+                using CreateInitialized=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                const auto create_initialized=reinterpret_cast<CreateInitialized>(vt(device)[5]);
+                texture=nullptr;
+                check(create_initialized(device,&initialized,initial.data(),&texture)==S_OK && texture,
+                      "initial texture upload accepts padded source rows and every mip");
+                if (texture) {
+                    void* view=nullptr;
+                    using MakeSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                    check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,texture,nullptr,&view)==S_OK && view,
+                          "initialized texture retains a native view of all uploaded mips");
+                    if (view) {
+                        if (faces==6) {
+                            struct { D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; UINT guard=0xaabbccdd; } queried;
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(view)[9])(view,&queried.desc);
+                            check(queried.desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM && queried.desc.ViewDimension==D3D11_SRV_DIMENSION_TEXTURECUBE &&
+                                  queried.desc.TextureCube.MostDetailedMip==0 && queried.desc.TextureCube.MipLevels==3 && queried.guard==0xaabbccdd,
+                                  "default cube SRV preserves its native dimension, mip range and ABI bounds");
+                            std::array<UINT32,8> srd{};std::memcpy(srd.data(),static_cast<char*>(view)+48,sizeof srd);
+                            check((srd[3]>>28)==11 && (srd[4]&0x1fff)==0 && (srd[5]&0x3ffffff)==(5u<<13),
+                                  "cube SRD retains faces zero through five and encodes the last cube like original UMD");
+                        }
+                        void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
+                        TitleTextureLayout pixels;
+                        hr=create_xg_texture_layout(8,8,3,faces,DXGI_FORMAT_R8G8B8A8_UNORM,UINT_MAX,pixels,D3D11_BIND_SHADER_RESOURCE);
+                        check(SUCCEEDED(hr),"initialized texture keeps the original XG mip layout");
+                        for (UINT mip=0;SUCCEEDED(hr) && mip<faces*3;++mip) {
+                            const UINT width=8>>(mip%3),pitch=width*4;
+                            std::vector<unsigned char> linear(pitch*width);
+                            check(pixels.copy(pixels.context.get(),false,linear.data(),canonical,mip,pitch,pitch*width)==S_OK,
+                                  "initialized texture exposes tiled mip pixels through original XG");
+                            bool exact=true;
+                            for (UINT y=0;y<width;++y) exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
+                            check(exact,"upload preserves every source pixel without copying row padding");
+                        }
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                    }
+                    reinterpret_cast<Count>(vt(texture)[2])(texture);
+                }
+                check(sources==original_sources,"texture initialization leaves source pixels, padding and guards intact");
+                initial[2].SysMemPitch=1;
+                check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
+                      "short initial mip pitch fails without publishing a partial texture");
+                initial[2].SysMemPitch=20; initial[2].pSysMem=reinterpret_cast<void*>(1);
+                check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
+                      "unreadable initial pixels fail without dereferencing untrusted memory");
+                if (faces==6) {
+                    initialized.standard.Height=4;
+                    check(create_initialized(device,&initialized,nullptr,&texture)==E_INVALIDARG && !texture,
+                          "cube texture rejects non-square faces");
+                    initialized.standard.Height=8; initialized.standard.ArraySize=5;
+                    check(create_initialized(device,&initialized,nullptr,&texture)==E_INVALIDARG && !texture,
+                          "cube texture rejects an incomplete face set");
+                }
             }
-            check(sources==original_sources,"texture initialization leaves source pixels, padding and guards intact");
-            initial[2].SysMemPitch=1;
-            check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
-                  "short initial mip pitch fails without publishing a partial texture");
-            initial[2].SysMemPitch=20; initial[2].pSysMem=reinterpret_cast<void*>(1);
-            check(create_initialized(device,&initialized,initial.data(),&texture)==E_INVALIDARG && !texture,
-                  "unreadable initial pixels fail without dereferencing untrusted memory");
             TitleTextureLayout placed_color;
             const UINT color_binds=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS;
             hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,14,placed_color,color_binds);
@@ -2459,60 +2536,62 @@ int main(int argc, char** argv) {
                 check(create_deferred(device, 0, nullptr) == E_POINTER, "deferred context output required");
                 check(create_deferred(device, 0x80000, &deferred) == DXGI_ERROR_UNSUPPORTED && !deferred,
                       "unimplemented deferred context flags rejected");
-                check(create_deferred(device, 0, &deferred) == S_OK && deferred && deferred != context,
-                      "deferred context has independent identity");
-                if (deferred) {
-                    using State = UINT (STDMETHODCALLTYPE*)(void*);
-                    const auto data = static_cast<unsigned char*>(deferred);
-                    check((reinterpret_cast<std::uintptr_t>(deferred) & 63) == 0 &&
-                          reinterpret_cast<const void*>(vt(deferred)) == data + 0x3d0 && data[0x390] == 1,
-                          "old context contains its inline function table and out-of-line dispatch marker");
-                    check(reinterpret_cast<State>(vt(deferred)[112])(deferred) == 1 &&
-                          reinterpret_cast<State>(vt(deferred)[113])(deferred) == 0,
-                          "deferred type and creation flags match the requested contract");
-                    UINT64 domain = 0x1234, shader_flags = 0x100;
-                    UINT32 dirty = 0x80;
-                    std::memcpy(data + 0x1c8, &domain, sizeof domain);
-                    std::memcpy(data + 0x168, &dirty, sizeof dirty);
-                    std::memcpy(data + 0x218, &shader_flags, sizeof shader_flags);
-                    using Shader = void (STDMETHODCALLTYPE*)(void*, void*);
-                    reinterpret_cast<Shader>(vt(deferred)[64])(deferred, nullptr);
-                    std::memcpy(&domain, data + 0x1c8, sizeof domain);
-                    std::memcpy(&dirty, data + 0x168, sizeof dirty);
-                    std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
-                    check(!domain && dirty == 0x2480 && shader_flags == 0x104,
-                          "domain unbind preserves unrelated public state and marks the native dirty bits");
-                    UINT64 hull = 0x5678;
-                    std::memcpy(data + 0x1c0, &hull, sizeof hull);
-                    reinterpret_cast<Shader>(vt(deferred)[60])(deferred, nullptr);
-                    std::memcpy(&hull, data + 0x1c0, sizeof hull);
-                    std::memcpy(&dirty, data + 0x168, sizeof dirty);
-                    std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
-                    check(!hull && dirty == 0x2680 && shader_flags == 0x106,
-                          "hull unbind preserves domain state and native dirty bits");
-                    UINT64 geometry[2]{0x1234, 0x5678};
-                    std::memcpy(data + 0x1d0, geometry, sizeof geometry);
-                    reinterpret_cast<Shader>(vt(deferred)[24])(deferred, nullptr);
-                    std::memcpy(geometry, data + 0x1d0, sizeof geometry);
-                    std::memcpy(&dirty, data + 0x168, sizeof dirty);
-                    std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
-                    check(!geometry[0] && !geometry[1] && dirty == 0x3e80 && shader_flags == 0x10e,
-                          "geometry unbind clears both native shader-data bindings without losing tessellation state");
-                    static unsigned command_slot = 0;
-                    set_d3d11x_trap_handler([](const char*, unsigned slot) -> std::uintptr_t {
-                        command_slot = slot; return static_cast<UINT32>(E_NOTIMPL);
-                    });
-                    using Finish = HRESULT (STDMETHODCALLTYPE*)(void*, BOOL, void**);
-                    void* command_list = nullptr;
-                    check(reinterpret_cast<Finish>(vt(deferred)[114])(deferred, FALSE, &command_list) == E_NOTIMPL && command_slot == 114,
-                          "native FinishCommandList slot stays unsupported, never aliases a successful flags getter");
-                    set_d3d11x_trap_handler(nullptr);
-                    void* owned = nullptr;
-                    reinterpret_cast<GetDevice>(vt(deferred)[3])(deferred, &owned);
-                    check(owned == device && refs(device) == 2, "inline dispatch GetDevice retains the same device");
-                    reinterpret_cast<Count>(vt(owned)[2])(owned);
-                    check(reinterpret_cast<Count>(vt(deferred)[2])(deferred) == 0 && refs(device) == 1,
-                          "deferred context releases internal device ownership");
+                for (const UINT flags:{0u,0x60000u,0xa0000u}) {
+                    check(create_deferred(device, flags, &deferred) == S_OK && deferred && deferred != context,
+                          "deferred context has independent identity");
+                    if (deferred) {
+                        using State = UINT (STDMETHODCALLTYPE*)(void*);
+                        const auto data = static_cast<unsigned char*>(deferred);
+                        check((reinterpret_cast<std::uintptr_t>(deferred) & 63) == 0 &&
+                              reinterpret_cast<const void*>(vt(deferred)) == data + 0x3d0 && data[0x390] == 1,
+                              "old context contains its inline function table and out-of-line dispatch marker");
+                        check(reinterpret_cast<State>(vt(deferred)[112])(deferred) == 1 &&
+                              reinterpret_cast<State>(vt(deferred)[113])(deferred) == flags,
+                              "deferred type and creation flags match the requested contract");
+                        UINT64 domain = 0x1234, shader_flags = 0x100;
+                        UINT32 dirty = 0x80;
+                        std::memcpy(data + 0x1c8, &domain, sizeof domain);
+                        std::memcpy(data + 0x168, &dirty, sizeof dirty);
+                        std::memcpy(data + 0x218, &shader_flags, sizeof shader_flags);
+                        using Shader = void (STDMETHODCALLTYPE*)(void*, void*);
+                        reinterpret_cast<Shader>(vt(deferred)[64])(deferred, nullptr);
+                        std::memcpy(&domain, data + 0x1c8, sizeof domain);
+                        std::memcpy(&dirty, data + 0x168, sizeof dirty);
+                        std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
+                        check(!domain && dirty == 0x2480 && shader_flags == 0x104,
+                              "domain unbind preserves unrelated public state and marks the native dirty bits");
+                        UINT64 hull = 0x5678;
+                        std::memcpy(data + 0x1c0, &hull, sizeof hull);
+                        reinterpret_cast<Shader>(vt(deferred)[60])(deferred, nullptr);
+                        std::memcpy(&hull, data + 0x1c0, sizeof hull);
+                        std::memcpy(&dirty, data + 0x168, sizeof dirty);
+                        std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
+                        check(!hull && dirty == 0x2680 && shader_flags == 0x106,
+                              "hull unbind preserves domain state and native dirty bits");
+                        UINT64 geometry[2]{0x1234, 0x5678};
+                        std::memcpy(data + 0x1d0, geometry, sizeof geometry);
+                        reinterpret_cast<Shader>(vt(deferred)[24])(deferred, nullptr);
+                        std::memcpy(geometry, data + 0x1d0, sizeof geometry);
+                        std::memcpy(&dirty, data + 0x168, sizeof dirty);
+                        std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
+                        check(!geometry[0] && !geometry[1] && dirty == 0x3e80 && shader_flags == 0x10e,
+                              "geometry unbind clears both native shader-data bindings without losing tessellation state");
+                        static unsigned command_slot = 0;
+                        set_d3d11x_trap_handler([](const char*, unsigned slot) -> std::uintptr_t {
+                            command_slot = slot; return static_cast<UINT32>(E_NOTIMPL);
+                        });
+                        using Finish = HRESULT (STDMETHODCALLTYPE*)(void*, BOOL, void**);
+                        void* command_list = nullptr;
+                        check(reinterpret_cast<Finish>(vt(deferred)[114])(deferred, FALSE, &command_list) == E_NOTIMPL && command_slot == 114,
+                              "native FinishCommandList slot stays unsupported, never aliases a successful flags getter");
+                        set_d3d11x_trap_handler(nullptr);
+                        void* owned = nullptr;
+                        reinterpret_cast<GetDevice>(vt(deferred)[3])(deferred, &owned);
+                        check(owned == device && refs(device) == 2, "inline dispatch GetDevice retains the same device");
+                        reinterpret_cast<Count>(vt(owned)[2])(owned);
+                        check(reinterpret_cast<Count>(vt(deferred)[2])(deferred) == 0 && refs(device) == 1,
+                              "deferred context releases internal device ownership");
+                    }
                 }
                 ++refs(context);
                 check(reinterpret_cast<Count>(vt(context)[2])(context) == 1, "legacy inline count honoured");

@@ -123,6 +123,7 @@ struct alignas(64) Context : GraphicsObject {
     std::array<const void*, vtable_slots> functions{};
     bool deferred = false;
     bool automatic_gpu_flush = false;
+    UINT creation_flags = 0;
     std::array<BufferView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets{};
     BufferView* depth_target = nullptr;
     std::array<D3D11_VIEWPORT,D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports{};
@@ -224,6 +225,7 @@ struct alignas(16) Buffer : GraphicsObject {
     TitleGpuResource gpu;
     Microsoft::WRL::ComPtr<ID3D12Fence> creation_fence;
     void* esram_reservation = nullptr;
+    bool borrowed = false;
     ~Buffer();
 };
 static_assert(offsetof(Buffer, descriptor) == 32 && offsetof(Buffer, allocation_start) == 48);
@@ -372,7 +374,7 @@ std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std:
                     desc[0], desc[1], desc[2], desc[3], desc[4], desc[5], desc[6], desc[7], desc[8], desc[9], desc[10], desc[11], desc[12],
                     static_cast<unsigned long long>(b), static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
         }
-        if constexpr (K == kind_device && Slot == 3) {
+        if constexpr (K == kind_device && (Slot == 3 || Slot == 62)) {
             D3D11_BUFFER_DESC desc{};
             SIZE_T read = 0;
             if (a && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), &desc, sizeof desc, &read) && read == sizeof desc)
@@ -1134,7 +1136,7 @@ Buffer::~Buffer() {
     if (gpu.resource && FAILED(release_title_gpu_resource(gpu, creation_fence.Get(), 0)))
         default_trap("buffer allocation retirement", 2);
     if (esram_reservation) release_esram_alias(esram_reservation);
-    else if (allocation_start) {
+    else if (allocation_start && !borrowed) {
         const auto release = reinterpret_cast<FreeBufferMemory>(resolve_kernelx({"kernelx.dll", "XMemFree", 0}));
         if (!release) default_trap("buffer memory service", 2);
         release(allocation_start, buffer_graphics_attributes);
@@ -1174,7 +1176,7 @@ const std::array<const void*, vtable_slots>& buffer_vtable() {
     }();
     return table;
 }
-HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferDesc* input, const D3D11_SUBRESOURCE_DATA* initial, void** out) {
+HRESULT create_buffer(Device* self, const LegacyBufferDesc* input, const D3D11_SUBRESOURCE_DATA* initial, void** out, void* placement=nullptr) {
     if (out) *out = nullptr;
     if (!self->legacy && !modern_display_abi_bound) return DXGI_ERROR_UNSUPPORTED;
     LegacyBufferDesc desc{};
@@ -1193,6 +1195,9 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
                        d.ByteWidth % d.StructureByteStride)) return E_INVALIDARG;
     constexpr UINT supported_misc = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS | D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
     if ((!esram && desc.extension) || d.Usage > D3D11_USAGE_DYNAMIC ||
+        (placement && (!self->legacy || d.Usage>D3D11_USAGE_IMMUTABLE || d.ByteWidth>0x4000000 ||
+            (d.BindFlags!=D3D11_BIND_CONSTANT_BUFFER && d.BindFlags!=D3D11_BIND_SHADER_RESOURCE) || esram ||
+            reinterpret_cast<std::uintptr_t>(placement)>0x10000000000ull-d.ByteWidth)) ||
         (esram && (initial || d.Usage!=D3D11_USAGE_DEFAULT || (d.BindFlags&D3D11_BIND_UNORDERED_ACCESS) ||
             esram_offset>=0x2000000 || d.ByteWidth>0x2000000-esram_offset || (esram_bytes && esram_bytes<d.ByteWidth))) ||
         (dynamic ? d.CPUAccessFlags != D3D11_CPU_ACCESS_WRITE ||
@@ -1200,15 +1205,19 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
         (d.MiscFlags & ~(supported_misc | (esram ? 0x20000u : 0u))) ||
         (!structured && d.StructureByteStride) ||
         (d.BindFlags & ~(D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER | D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS))) {
-        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 3>(self,
-            reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(initial), reinterpret_cast<std::uintptr_t>(out)));
+        if (stop_on_missing_service()) {
+            if (placement) return static_cast<HRESULT>(trap_slot<kind_device,62>(self,
+                reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(placement),reinterpret_cast<std::uintptr_t>(out)));
+            return static_cast<HRESULT>(trap_slot<kind_device,3>(self,
+                reinterpret_cast<std::uintptr_t>(input),reinterpret_cast<std::uintptr_t>(initial),reinterpret_cast<std::uintptr_t>(out)));
+        }
         return DXGI_ERROR_UNSUPPORTED;
     }
     if ((d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && (d.BindFlags != D3D11_BIND_CONSTANT_BUFFER || (d.ByteWidth & 15) || d.ByteWidth > 65536))
         return E_INVALIDARG;
     if (initial && (!ReadProcessMemory(GetCurrentProcess(), initial, &data, sizeof data, &read) || read != sizeof data || !data.pSysMem))
         return E_INVALIDARG;
-    if (d.Usage == D3D11_USAGE_IMMUTABLE && !initial) return E_INVALIDARG;
+    if (d.Usage == D3D11_USAGE_IMMUTABLE && !initial && !placement) return E_INVALIDARG;
     if (!out) return S_FALSE;
     try {
         auto buffer = std::make_unique<Buffer>();
@@ -1216,7 +1225,9 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
         buffer->device = self; buffer->desc = desc;
         HRESULT hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&buffer->creation_fence));
         if (FAILED(hr)) return hr;
-        if (esram) {
+        if (placement) {
+            buffer->borrowed=true; buffer->allocation_start=placement;
+        } else if (esram) {
             hr=reserve_esram_alias(esram_offset,d.ByteWidth,buffer->esram_reservation,buffer->allocation_start);
             if (FAILED(hr)) return hr;
         } else {
@@ -1239,6 +1250,20 @@ HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self, const LegacyBufferD
         retain_device(self); *out = buffer.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+HRESULT STDMETHODCALLTYPE device_create_buffer(Device* self,const LegacyBufferDesc* input,const D3D11_SUBRESOURCE_DATA* initial,void** out) {
+    return create_buffer(self,input,initial,out);
+}
+HRESULT STDMETHODCALLTYPE device_create_placement_buffer(Device* self,const LegacyBufferDesc* input,void* base,void** out) {
+    if (out) *out=nullptr;
+    if (!base) return E_INVALIDARG;
+    const HRESULT hr=create_buffer(self,input,nullptr,out,base);
+    if (FAILED(hr) && stop_on_missing_service()) {
+        std::fprintf(stderr,"xone-era: placement buffer binding failed 0x%08lX at %p\n",hr,base);
+        return static_cast<HRESULT>(trap_slot<kind_device,62>(self,reinterpret_cast<std::uintptr_t>(input),
+            reinterpret_cast<std::uintptr_t>(base),reinterpret_cast<std::uintptr_t>(out)));
+    }
+    return hr;
 }
 
 Texture::~Texture() {
@@ -1366,13 +1391,15 @@ HRESULT STDMETHODCALLTYPE device_create_texture2d(Device* self, const LegacyText
     const auto& d = desc.standard;
     if (!d.Width || !d.Height || !d.ArraySize) return E_INVALIDARG;
     const bool multisample = d.SampleDesc.Count > 1;
+    const bool cube=(d.MiscFlags&D3D11_RESOURCE_MISC_TEXTURECUBE)!=0;
+    if (cube && (d.Width!=d.Height || d.ArraySize%6 || multisample)) return E_INVALIDARG;
     const bool esram_request=self->legacy && (d.MiscFlags&0x20000);
     const bool dynamic = !self->legacy && d.Usage == D3D11_USAGE_DYNAMIC &&
         (d.Format == DXGI_FORMAT_B5G6R5_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
     if (!d.SampleDesc.Count || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1))) return E_INVALIDARG;
-    if ((!self->legacy && !modern_display_abi_bound) || (initial && (esram_request || multisample || dynamic || (d.BindFlags&D3D11_BIND_DEPTH_STENCIL))) || (!esram_request && (desc.extension[0] || desc.extension[1])) || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
+    if ((!self->legacy && !modern_display_abi_bound) || (cube && d.ArraySize!=6) || (initial && (esram_request || multisample || dynamic || (d.BindFlags&D3D11_BIND_DEPTH_STENCIL))) || (!esram_request && (desc.extension[0] || desc.extension[1])) || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
         (dynamic && (d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.MiscFlags)) ||
-        d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~(legacy_expanded_auxiliary | (esram_request ? 0x20000u : 0u))) || !d.BindFlags ||
+        d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~(legacy_expanded_auxiliary | D3D11_RESOURCE_MISC_TEXTURECUBE | (esram_request ? 0x20000u : 0u))) || !d.BindFlags ||
         ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & (D3D11_BIND_RENDER_TARGET|D3D11_BIND_DEPTH_STENCIL)))) ||
         (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & (D3D11_BIND_RENDER_TARGET|D3D11_BIND_DEPTH_STENCIL)) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
         ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) && d.Format != DXGI_FORMAT_D32_FLOAT &&
@@ -1892,9 +1919,10 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
         const UINT mips = texture->volume ? texture->volume_desc.standard.MipLevels : texture->desc.standard.MipLevels;
         const UINT binds = texture->volume ? texture->volume_desc.standard.BindFlags : texture->desc.standard.BindFlags;
         const bool multisample = !texture->volume && texture->desc.standard.SampleDesc.Count > 1;
+        const bool cube=!texture->volume && (texture->desc.standard.MiscFlags&D3D11_RESOURCE_MISC_TEXTURECUBE) && texture->desc.standard.ArraySize==6;
         const auto dimension = texture->volume ? D3D11_SRV_DIMENSION_TEXTURE3D :
-            multisample ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
-        if (!(binds & D3D11_BIND_SHADER_RESOURCE) || (!texture->volume && texture->desc.standard.ArraySize != 1) ||
+            cube ? D3D11_SRV_DIMENSION_TEXTURECUBE : multisample ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+        if (!(binds & D3D11_BIND_SHADER_RESOURCE) || (!texture->volume && !cube && texture->desc.standard.ArraySize != 1) ||
             format == DXGI_FORMAT_BC7_TYPELESS) return unsupported();
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         SIZE_T read = 0;
@@ -1984,6 +2012,14 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
             if (multisample) view->descriptor[3] &= ~0xf000u; // Preserve native log2(samples) at bits 16..19.
             else view->descriptor[3] = (view->descriptor[3] & ~0xff000u) | ((mips - 1) << 16);
             if (!texture->volume) view->descriptor[5] &= ~0x3ffffffu;
+            if (cube) {
+                if ((view->descriptor[3]>>28)!=13) return DXGI_ERROR_UNSUPPORTED;
+                // Original 1800b0320 -> 18009af70 keeps faces 0..5 and encodes
+                // the last cube (last face / 6) in word 4.
+                view->descriptor[5]|=5u<<13;
+                view->descriptor[3]=(view->descriptor[3]&0x0fffffffu)|0xb0000000u;
+                view->descriptor[4]&=~0x1fffu;
+            }
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
             const HRESULT hr = self->d3d12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view->heap));
             if (FAILED(hr)) return hr;
@@ -1991,7 +2027,7 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
             D3D12_SHADER_RESOURCE_VIEW_DESC native{};
             native.Format = desc.Format;
             native.ViewDimension = texture->volume ? D3D12_SRV_DIMENSION_TEXTURE3D :
-                multisample ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
+                cube ? D3D12_SRV_DIMENSION_TEXTURECUBE : multisample ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
             native.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             // Xbox exposes the physical R8 stencil plane as X. D3D12's typed
             // X32_G8 view supplies stencil in G; retain native zero/one channels.
@@ -1999,6 +2035,7 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
                 D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1,D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
                 D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1);
             if (texture->volume) native.Texture3D.MipLevels = mips;
+            else if (cube) native.TextureCube.MipLevels = mips;
             else if (!multisample) native.Texture2D.MipLevels = mips;
             self->d3d12->CreateShaderResourceView(texture->gpu.resource, &native, view->host);
             texture_add_ref(texture); view->resource = texture;
@@ -2508,11 +2545,14 @@ void initialize_legacy_context(Context* context) {
 HRESULT STDMETHODCALLTYPE device_create_deferred(Device* self, UINT flags, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    if (!self->legacy || flags) return DXGI_ERROR_UNSUPPORTED;
+    if (!self->legacy || (flags && flags!=0x60000 && flags!=0xa0000)) {
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device,27>(self,flags,reinterpret_cast<std::uintptr_t>(out)));
+        return DXGI_ERROR_UNSUPPORTED;
+    }
     auto* context = new (std::nothrow) Context;
     if (!context) return E_OUTOFMEMORY;
     context->device = self;
-    context->flags = 1; context->refcount = 0; context->deferred = true;
+    context->flags = 1; context->refcount = 0; context->deferred = true; context->creation_flags=flags;
     initialize_legacy_context(context);
     retain_device(self);
     *out = context;
@@ -2564,6 +2604,7 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
         t[10] = reinterpret_cast<const void*>(&device_create_dsv);
         t[64] = reinterpret_cast<const void*>(&device_create_placement_texture2d);
         t[65] = reinterpret_cast<const void*>(&device_create_placement_texture3d);
+        t[62] = reinterpret_cast<const void*>(&device_create_placement_buffer); // Original 11295 18002b340.
         t[8] = reinterpret_cast<const void*>(&device_create_uav);
         t[9] = reinterpret_cast<const void*>(&device_create_rtv);
         t[12] = reinterpret_cast<const void*>(&device_create_shader<1>);
@@ -2736,6 +2777,7 @@ void STDMETHODCALLTYPE context_get_viewports(Context* self, UINT* count, D3D11_V
     *count = self->viewport_count;
 }
 HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth) {
+    if (self->deferred) return DXGI_ERROR_UNSUPPORTED;
     if (!view || view->device != self->device || !view->resource ||
         view->resource->vtable != texture_vtable().data() || !view->heap || view->view_type != (color ? 0u : 1u)) return E_INVALIDARG;
     auto* texture = static_cast<Texture*>(view->resource);
@@ -2767,6 +2809,11 @@ HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth
     return hr;
 }
 void STDMETHODCALLTYPE context_clear_rtv(Context* self,BufferView* view,const FLOAT* color) {
+    if (self->deferred) {
+        if (self->device->legacy) (void)trap_slot<kind_context,50>(self,reinterpret_cast<std::uintptr_t>(view),reinterpret_cast<std::uintptr_t>(color));
+        else (void)trap_slot<kind_context,51>(self,reinterpret_cast<std::uintptr_t>(view),reinterpret_cast<std::uintptr_t>(color));
+        return;
+    }
     FLOAT value[4]{}; SIZE_T read=0;
     HRESULT hr=color && ReadProcessMemory(GetCurrentProcess(),color,value,sizeof value,&read) && read==sizeof value ? S_OK : E_INVALIDARG;
     if(SUCCEEDED(hr)) hr=clear_view(self,view,value,0);
@@ -3006,7 +3053,7 @@ const std::array<const void*, vtable_slots>& context_vtable() {
     return table;
 }
 UINT STDMETHODCALLTYPE context_get_type(Context* self) { return self->deferred ? 1 : 0; }
-UINT STDMETHODCALLTYPE context_get_flags(Context*) { return 0; } // Only creation flags zero are supported.
+UINT STDMETHODCALLTYPE context_get_flags(Context* self) { return self->creation_flags; }
 void STDMETHODCALLTYPE context_automatic_gpu_flush(Context* self, BOOL enabled) { self->automatic_gpu_flush = enabled != FALSE; }
 template<class T, std::size_t Offset> T context_state(Context* self) {
     static_assert(Offset >= 32 && Offset + sizeof(T) <= 0x3d0);

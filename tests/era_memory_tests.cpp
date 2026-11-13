@@ -882,6 +882,88 @@ int main(int argc, char** argv) {
         hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,UINT_MAX,typed_layout,D3D11_BIND_SHADER_RESOURCE);
         check(SUCCEEDED(hr) && texture_fixture(std::move(typed_layout),1,4,typed_signal+3,nullptr),
             "two-channel half-float preserves all packed bits through original XG and GPU copies");
+        TitleTextureLayout cube_layout;
+        hr=create_xg_texture_layout(8,8,2,6,DXGI_FORMAT_R8G8B8A8_UNORM,UINT_MAX,cube_layout,D3D11_BIND_SHADER_RESOURCE);
+        if (FAILED(hr)) return 1;
+        auto* cube_storage=static_cast<unsigned char*>(allocate(cube_layout.bytes+cube_layout.alignment,attributes));
+        auto* output=static_cast<UINT32*>(allocate(256,attributes));
+        if (!cube_storage || !output) return 1;
+        auto* canonical=reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(cube_storage)+cube_layout.alignment-1)&~(cube_layout.alignment-1));
+        std::memset(canonical,0x5a,cube_layout.bytes);
+        TitleGpuResource cube,results;
+        if (FAILED(acquire_title_gpu_texture(canonical,cube_layout,device.Get(),cube)) ||
+            FAILED(acquire_title_gpu_buffer(output,256,device.Get(),results,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,true))) return 1;
+        const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        const auto compile=compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")) : nullptr;
+        if (!compile) return 1;
+        constexpr char source[]=R"(
+TextureCube<float4> image:register(t0);SamplerState point_sampler:register(s0);RWByteAddressBuffer output:register(u0);
+[numthreads(24,1,1)]void main(uint3 id:SV_DispatchThreadID){
+ uint face=id.x/4,corner=id.x%4;float s=(corner&1)?0.875:-0.875,t=(corner&2)?0.875:-0.875;
+ float3 ray=face==0?float3(1,-t,-s):face==1?float3(-1,-t,s):face==2?float3(s,1,t):
+            face==3?float3(s,-1,-t):face==4?float3(s,-t,1):float3(-s,-t,-1);
+ uint4 c=(uint4)round(image.SampleLevel(point_sampler,ray,id.y)*255);
+ output.Store((id.y*24+id.x)*4,c.x|(c.y<<8)|(c.z<<16)|(c.w<<24));
+})";
+        ComPtr<ID3DBlob> shader,errors,serialized;
+        hr=compile(source,sizeof source-1,nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&shader,&errors);
+        D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,1,0,0,0};
+        D3D12_ROOT_PARAMETER parameters[2]{};
+        parameters[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;parameters[0].DescriptorTable={1,&range};
+        parameters[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;
+        D3D12_STATIC_SAMPLER_DESC sampler{};sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+        sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        sampler.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;sampler.MaxLOD=D3D12_FLOAT32_MAX;sampler.MaxAnisotropy=1;
+        const D3D12_ROOT_SIGNATURE_DESC root_desc{2,parameters,1,&sampler,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        if (SUCCEEDED(hr)) hr=D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,nullptr);
+        ComPtr<ID3D12RootSignature> root;
+        if (SUCCEEDED(hr)) hr=device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root));
+        ComPtr<ID3D12PipelineState> pipeline;
+        if (SUCCEEDED(hr)) {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};desc.pRootSignature=root.Get();desc.CS={shader->GetBufferPointer(),shader->GetBufferSize()};
+            hr=device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pipeline));
+        }
+        shader.Reset();errors.Reset();serialized.Reset();FreeLibrary(compiler);
+        check(SUCCEEDED(hr),"cube sampling compiles a real native compute pipeline");
+        if (FAILED(hr)) return 1;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        if (FAILED(device->CreateDescriptorHeap(&heap_desc,IID_PPV_ARGS(&heap)))) return 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};view.Format=DXGI_FORMAT_R8G8B8A8_UNORM;view.ViewDimension=D3D12_SRV_DIMENSION_TEXTURECUBE;
+        view.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;view.TextureCube.MipLevels=2;
+        device->CreateShaderResourceView(cube.resource,&view,heap->GetCPUDescriptorHandleForHeapStart());
+        for (UINT iteration=0;iteration<2;++iteration) {
+            for (UINT face=0;face<6;++face) for (UINT mip=0;mip<2;++mip) {
+                const UINT size=8>>mip;std::vector<UINT32> pixels(size*size);
+                for (UINT y=0;y<size;++y) for (UINT x=0;x<size;++x) pixels[y*size+x]=(face*31+iteration*5+mip)|(x*29<<8)|(y*27<<16)|0xff000000u;
+                if (FAILED(cube_layout.copy(cube_layout.context.get(),true,pixels.data(),canonical,face*2+mip,size*4,size*size*4))) return 1;
+            }
+            std::fill(output,output+64,0x5a5a5a5a);
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),pipeline.Get())) ||
+                FAILED(begin_title_gpu_texture(cube,list.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)) ||
+                FAILED(begin_title_gpu_buffer(results,list.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS))) return 1;
+            auto* bound=heap.Get();list->SetDescriptorHeaps(1,&bound);list->SetComputeRootSignature(root.Get());
+            list->SetComputeRootDescriptorTable(0,heap->GetGPUDescriptorHandleForHeapStart());
+            list->SetComputeRootUnorderedAccessView(1,results.resource->GetGPUVirtualAddress()+results.offset);list->Dispatch(1,2,1);
+            if (FAILED(end_title_gpu_texture(cube,list.Get())) || FAILED(end_title_gpu_buffer(results,list.Get())) || FAILED(list->Close())) return 1;
+            queue->ExecuteCommandLists(1,lists);
+            HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if (!event) return 1;
+            hr=queue->Signal(fence.Get(),70+iteration);
+            if (SUCCEEDED(hr)) hr=fence->SetEventOnCompletion(70+iteration,event);
+            const bool done=SUCCEEDED(hr) && WaitForSingleObject(event,3000)==WAIT_OBJECT_0;CloseHandle(event);
+            if (!done || FAILED(complete_title_gpu_resource(cube,fence.Get(),70+iteration)) || FAILED(complete_title_gpu_resource(results,fence.Get(),70+iteration))) return 1;
+            bool exact=true;
+            for (UINT mip=0;mip<2;++mip) for (UINT face=0;face<6;++face) for (UINT corner=0;corner<4;++corner) {
+                const UINT size=8>>mip,x=(corner&1)?size-1:0,y=(corner&2)?size-1:0;
+                const UINT32 expected=(face*31+iteration*5+mip)|(x*29<<8)|(y*27<<16)|0xff000000u;
+                exact=exact && output[mip*24+face*4+corner]==expected;
+            }
+            check(exact && std::all_of(output+48,output+64,[](auto x){return x==0x5a5a5a5a;}),
+                  "cube GPU sampling preserves every face orientation, two mip levels, guards and CPU refresh");
+        }
+        check(release_title_gpu_resource(cube,fence.Get(),71)==S_OK && release_title_gpu_resource(results,fence.Get(),71)==S_OK,
+              "cube sampling retires through its real GPU fence");
+        release(cube_storage,attributes);release(output,attributes);
     }
     // Independent pixel oracle: source samples include both transfer breakpoints,
     // out-of-range RGB, distinct rows, and all four two-bit alpha values.

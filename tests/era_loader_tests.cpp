@@ -981,6 +981,17 @@ int main(int argc, char** argv) {
                             ((descriptor[1]>>26)&15)==(integer ? 4u : format==DXGI_FORMAT_R16G16_FLOAT ? 7u : 0u),"typed SRV/UAV SRDs keep physical identity and native numeric interpretation");
                     }
                     if (kind==1 && format==formats[0]) {
+                        using SetTargets=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
+                        const auto bind_targets=reinterpret_cast<SetTargets>(vt(context)[33]);
+                        void* targets[]{view};
+                        check(reinterpret_cast<Count>(vt(view)[1])(view)==2,"RTV fixture observes its public reference count");
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                        bind_targets(context,1,targets,nullptr);
+                        check(reinterpret_cast<Count>(vt(view)[1])(view)==3,"legacy slot 33 retains its real render target view");
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(reinterpret_cast<Count>(vt(view)[1])(view)==2,"ClearState releases the render binding while retaining caller view ownership");
+                        reinterpret_cast<Count>(vt(view)[2])(view);
                         constexpr FLOAT white[]{1,1,1,1};
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
                         void* alias=nullptr;
@@ -1007,6 +1018,7 @@ int main(int argc, char** argv) {
                                       "observed deferred mode has its own real context state");
                                 if (deferred) {
                                     const std::vector<unsigned char> before(static_cast<unsigned char*>(alias),static_cast<unsigned char*>(alias)+pixels.bytes);
+                                    reinterpret_cast<SetTargets>(vt(deferred)[33])(deferred,1,targets,nullptr);
                                     static UINT clear_slot=0;
                                     set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{clear_slot=slot;return 0;});
                                     const FLOAT black[]{0,0,0,0};
@@ -1014,6 +1026,9 @@ int main(int argc, char** argv) {
                                     set_d3d11x_trap_handler(nullptr);
                                     check(clear_slot==50 && !std::memcmp(before.data(),alias,before.size()),
                                           "deferred clear stays explicit and cannot execute immediately or modify canonical pixels");
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[110])(deferred);
+                                    check(!std::memcmp(before.data(),alias,before.size()),
+                                          "deferred ClearState releases bindings without submitting GPU work or changing physical pixels");
                                     reinterpret_cast<Count>(vt(deferred)[2])(deferred);
                                 }
                             }
@@ -2194,6 +2209,11 @@ int main(int argc, char** argv) {
                         check(refs(state)==2,"rebinding a rasterizer preserves one context owner");
                         set_raster(context,nullptr);
                         check(refs(state)==1,"legacy raster reset releases context ownership");
+                        set_raster(context,state);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(refs(state)==1,"ClearState releases a retained rasterizer without retiring caller ownership");
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(refs(state)==1,"repeated ClearState cannot release a rasterizer twice");
                         void* duplicate = nullptr;
                         check(factory(device, &desc, &duplicate) == S_OK && duplicate == state && refs(state) == 2,
                               "identical rasterizer shares live state");
@@ -2235,6 +2255,9 @@ int main(int argc, char** argv) {
                         check(refs(state)==2,"rebinding the same legacy blend preserves exactly one context owner");
                         set_blend(context,nullptr,nullptr,UINT_MAX);
                         check(refs(state)==1,"legacy blend unbind retires context ownership");
+                        set_blend(context,state,factor,0x55555555);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(refs(state)==1,"ClearState releases blend ownership and permits later state reuse");
                         void* duplicate = nullptr;
                         check(factory(device, &desc, &duplicate) == S_OK && duplicate == state && refs(state) == 2,
                               "identical live blend state shares identity");
@@ -2576,6 +2599,35 @@ int main(int argc, char** argv) {
                         std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
                         check(!geometry[0] && !geometry[1] && dirty == 0x3e80 && shader_flags == 0x10e,
                               "geometry unbind clears both native shader-data bindings without losing tessellation state");
+                        const UINT64 pipeline[]={0x1234,0x5678,0x9abc,0xdef0,0x1357,0x2468};
+                        std::memcpy(data+0x180,pipeline,16);
+                        std::memcpy(data+0x1c0,pipeline+2,32);
+                        const UINT64 predicate=0x5678,unrelated=0x1122334455667788ull;
+                        const UINT hash=0x1234;
+                        const UINT8 predicate_flags=0x80;
+                        dirty=0x400000;shader_flags=0x10000000000ull;
+                        std::memcpy(data+0x168,&dirty,4);std::memcpy(data+0x218,&shader_flags,8);
+                        std::memcpy(data+0x1e4,&hash,4);std::memcpy(data+0x1f0,&predicate,8);
+                        std::memcpy(data+0x1f8,&predicate_flags,1);std::memcpy(data+0x350,&unrelated,8);
+                        const auto table=vt(deferred);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(table[110])(deferred);
+                        UINT64 observed[6]{};
+                        std::memcpy(observed,data+0x180,16);std::memcpy(observed+2,data+0x1c0,32);
+                        UINT64 guard=0,condition=1;UINT cleared_hash=1;UINT8 condition_flags=0;
+                        std::memcpy(&dirty,data+0x168,4);std::memcpy(&shader_flags,data+0x218,8);
+                        std::memcpy(&guard,data+0x350,8);std::memcpy(&condition,data+0x1f0,8);
+                        std::memcpy(&condition_flags,data+0x1f8,1);std::memcpy(&cleared_hash,data+0x1e4,4);
+                        check(std::all_of(std::begin(observed),std::end(observed),[](auto x){return !x;}) && !condition && !cleared_hash && condition_flags==0x81,
+                              "ClearState resets public shader bindings, blend key and predication with original flag semantics");
+                        check(dirty==0x42bfb0 && shader_flags==0x1004c00002eull && guard==unrelated && vt(deferred)==table && data[0x390]==1 &&
+                              reinterpret_cast<State>(table[112])(deferred)==1 && reinterpret_cast<State>(table[113])(deferred)==flags,
+                              "ClearState preserves unrelated public state, dispatch, type and creation flags while marking native dirty fields");
+                        const UINT64 vertex_marker=0x398,pixel_marker=0x400;
+                        std::memcpy(data+0x180,&vertex_marker,8);std::memcpy(data+0x188,&pixel_marker,8);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(table[110])(deferred);
+                        std::memcpy(observed,data+0x180,16);
+                        check(observed[0]==vertex_marker && observed[1]==pixel_marker && data[0x390]==1,
+                              "ClearState preserves the original special shader markers and out-of-line dispatch");
                         static unsigned command_slot = 0;
                         set_d3d11x_trap_handler([](const char*, unsigned slot) -> std::uintptr_t {
                             command_slot = slot; return static_cast<UINT32>(E_NOTIMPL);

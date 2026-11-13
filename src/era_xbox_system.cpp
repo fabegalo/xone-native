@@ -7,8 +7,8 @@
 //
 // Observed (Sonic Mania 1.0.4.2): slot 12 called first with (handler, token*),
 // then slot 10.
-// There is one local user and no hot-plug on this host, so registered user
-// events are stored and never raised.
+// Event registration alone does not establish a local user. Enumeration,
+// profile identity and sign-in state remain explicit implementation gaps.
 #include "era_winrt_classes.h"
 #include "era_winrt_object.h"
 

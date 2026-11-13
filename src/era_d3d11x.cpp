@@ -2633,20 +2633,21 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
     }();
     return table;
 }
-Context::~Context() {
-    for (auto* view : render_targets) if (view) view_release(view);
-    if (depth_target) view_release(depth_target);
-    if (raster_state) raster_state_release(raster_state);
-    if (depth_state) depth_state_release(depth_state);
-    if (blend_state) blend_state_release(blend_state);
-    for(auto* shader : shaders) if(shader) shader_release(shader);
-    if(input_layout) input_layout_release(input_layout);
-    for(auto* sampler : pixel_samplers) if(sampler) sampler_release(sampler);
-    for(auto* view : pixel_resources) if(view) view_release(view);
-    for(auto& stage : constants) for(auto* buffer : stage) if(buffer) buffer_release(buffer);
-    for(auto* buffer : vertex_buffers) if(buffer) buffer_release(buffer);
-    if(index_buffer) buffer_release(index_buffer);
+void clear_context_bindings(Context* self) {
+    for (auto*& view:self->render_targets) { if (view) view_release(view); view=nullptr; }
+    if (self->depth_target) view_release(self->depth_target); self->depth_target=nullptr;
+    if (self->raster_state) raster_state_release(self->raster_state); self->raster_state=nullptr;
+    if (self->depth_state) depth_state_release(self->depth_state); self->depth_state=nullptr;
+    if (self->blend_state) blend_state_release(self->blend_state); self->blend_state=nullptr;
+    for (auto*& shader:self->shaders) { if (shader) shader_release(shader); shader=nullptr; }
+    if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr;
+    for (auto*& sampler:self->pixel_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
+    for (auto*& view:self->pixel_resources) { if (view) view_release(view); view=nullptr; }
+    for (auto& stage:self->constants) for (auto*& buffer:stage) { if (buffer) buffer_release(buffer); buffer=nullptr; }
+    for (auto*& buffer:self->vertex_buffers) { if (buffer) buffer_release(buffer); buffer=nullptr; }
+    if (self->index_buffer) buffer_release(self->index_buffer); self->index_buffer=nullptr;
 }
+Context::~Context() { clear_context_bindings(this); }
 template<class T,std::size_t N,class Valid,class Release>
 bool bind_range(std::array<T*,N>& current,UINT start,UINT count,T* const* input,Valid valid,Release release) {
     if(start>N || count>N-start) return false;
@@ -2732,7 +2733,8 @@ void STDMETHODCALLTYPE context_set_blend(Context* self,BlendState* state,const F
 void STDMETHODCALLTYPE context_set_render_targets(Context* self, UINT count, BufferView* const* views, BufferView* depth) {
     std::array<BufferView*,D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> next{};
     const auto invalid = [&] {
-        (void)trap_slot<kind_context,34>(self,count,reinterpret_cast<std::uintptr_t>(views),reinterpret_cast<std::uintptr_t>(depth));
+        if (self->device->legacy) (void)trap_slot<kind_context,33>(self,count,reinterpret_cast<std::uintptr_t>(views),reinterpret_cast<std::uintptr_t>(depth));
+        else (void)trap_slot<kind_context,34>(self,count,reinterpret_cast<std::uintptr_t>(views),reinterpret_cast<std::uintptr_t>(depth));
     };
     SIZE_T read = 0;
     if (count > next.size() || (views && count &&
@@ -3080,6 +3082,29 @@ void STDMETHODCALLTYPE context_unbind_geometry_shader(Context* self, void* shade
     context_unbind_shader_stage<24, 0x1d0, 0x2800, 8>(self, shader);
     context_unbind_shader_stage<24, 0x1d8, 0x3000, 8>(self, shader);
 }
+void STDMETHODCALLTYPE context_clear_state(Context* self) {
+    clear_context_bindings(self);
+    self->viewports={}; self->viewport_count=0;
+    self->vertex_strides={}; self->vertex_offsets={};
+    self->index_format=DXGI_FORMAT_UNKNOWN; self->index_offset=0;
+    self->stencil_reference=0; self->sample_mask=UINT_MAX; self->blend_factor={1,1,1,1};
+    // 11295 18000d060 preserves unrelated public bits and dispatch storage.
+    UINT dirty=context_state<UINT,0x168>(self)|0x28030;
+    const auto vertex=context_state<UINT64,0x180>(self);
+    if (vertex && vertex!=0x3a8 && vertex!=0x398) { context_state<UINT64,0x180>(self,0); dirty|=0x2080; }
+    const auto pixel=context_state<UINT64,0x188>(self);
+    if (pixel && pixel!=0x400 && pixel!=0x3f0) { context_state<UINT64,0x188>(self,0); dirty|=0x100; }
+    if (context_state<UINT,0x1e4>(self)) { context_state<UINT,0x1e4>(self,0); dirty|=0x100; }
+    context_state<UINT,0x168>(self,dirty);
+    context_unbind_shader_stage<110,0x1c0,0x2200,2>(self,nullptr);
+    context_unbind_shader_stage<110,0x1c8,0x2400,4>(self,nullptr);
+    context_unbind_shader_stage<110,0x1d0,0x2800,8>(self,nullptr);
+    context_unbind_shader_stage<110,0x1d8,0x3000,8>(self,nullptr);
+    auto predicate_flags=context_state<UINT8,0x1f8>(self);
+    if (!(predicate_flags&1) && context_state<UINT64,0x1f0>(self)) ++predicate_flags;
+    context_state<UINT8,0x1f8>(self,predicate_flags); context_state<UINT64,0x1f0>(self,0);
+    context_state<UINT64,0x218>(self,context_state<UINT64,0x218>(self)|0x4c000020ull);
+}
 HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
         D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* out) {
     if (!out) return E_INVALIDARG;
@@ -3180,6 +3205,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         auto t = context_vtable();
         for(UINT slot : {9u,10u,11u,12u,13u,14u,18u,19u,20u,21u,25u}) t[slot]=traps<kind_context>()[slot];
         t[34] = reinterpret_cast<const void*>(&trap_slot<kind_context,34>);
+        t[33] = reinterpret_cast<const void*>(&context_set_render_targets); // Original 11295 180014fc0.
         t[45] = reinterpret_cast<const void*>(&trap_slot<kind_context,45>);
         t[96] = reinterpret_cast<const void*>(&trap_slot<kind_context,96>);
         t[51] = reinterpret_cast<const void*>(&trap_slot<kind_context,51>);
@@ -3199,6 +3225,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         // Native 6.2.11295 table: public reference headers differ by one here.
         t[112] = reinterpret_cast<const void*>(&context_get_type);
         t[113] = reinterpret_cast<const void*>(&context_get_flags);
+        t[110] = reinterpret_cast<const void*>(&context_clear_state);
         t[196] = reinterpret_cast<const void*>(&context_automatic_gpu_flush);
         return t;
     }();

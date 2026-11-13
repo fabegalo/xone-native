@@ -9,7 +9,8 @@
 namespace xboxone::era {
 static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format, UINT samples,
         const char* source, const D3D_SHADER_MACRO* macros,
-        Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline) {
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline,
+        bool depth_target = false, UINT srv_count = 1, UINT stencil_bit = UINT_MAX) {
     if (!device) return E_INVALIDARG;
     struct CompilerModule {
         HMODULE handle;
@@ -25,7 +26,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
         D3DCOMPILE_ENABLE_STRICTNESS, 0, &pixel, &errors);
     if (FAILED(hr) && errors) std::fprintf(stderr, "xone-era: display shader: %.4096s\n", static_cast<const char*>(errors->GetBufferPointer()));
     if (FAILED(hr)) return hr;
-    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0};
+    D3D12_DESCRIPTOR_RANGE range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srv_count, 0, 0, 0};
     D3D12_ROOT_PARAMETER parameters[2]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     parameters[0].DescriptorTable = {1, &range}; parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
@@ -58,6 +59,16 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     desc.NumRenderTargets = 1; desc.RTVFormats[0] = output_format; desc.SampleDesc.Count = samples;
+    if (depth_target) {
+        desc.NumRenderTargets = 0; desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+        desc.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        auto& state = desc.DepthStencilState;
+        state.DepthEnable = TRUE; state.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        state.StencilEnable = stencil_bit<8; state.StencilReadMask = 255;
+        state.StencilWriteMask = stencil_bit<8 ? static_cast<UINT8>(1u<<stencil_bit) : 255;
+        if (stencil_bit<8) { state.DepthEnable=FALSE; state.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO; }
+        state.FrontFace = state.BackFace = {D3D12_STENCIL_OP_REPLACE,D3D12_STENCIL_OP_REPLACE,D3D12_STENCIL_OP_REPLACE,D3D12_COMPARISON_FUNC_ALWAYS};
+    }
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
     hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     if (SUCCEEDED(hr)) { out_root = std::move(root); out_pipeline = std::move(pipeline); }
@@ -67,7 +78,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
 static HRESULT fullscreen(ID3D12GraphicsCommandList* list, ID3D12RootSignature* root, ID3D12PipelineState* pipeline,
         ID3D12DescriptorHeap* source_heap,
         D3D12_GPU_DESCRIPTOR_HANDLE source, D3D12_CPU_DESCRIPTOR_HANDLE target,
-        UINT width, UINT height, UINT parameter) {
+        UINT width, UINT height, UINT parameter, bool depth_target = false) {
     if (!list || !source_heap || !source.ptr || !target.ptr || !width || !height || width > 16384 || height > 16384) return E_INVALIDARG;
     if (!root || !pipeline) return E_UNEXPECTED;
     if (list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT) return DXGI_ERROR_UNSUPPORTED;
@@ -77,7 +88,7 @@ static HRESULT fullscreen(ID3D12GraphicsCommandList* list, ID3D12RootSignature* 
     list->SetDescriptorHeaps(1, &source_heap); list->SetGraphicsRootDescriptorTable(0, source);
     list->SetGraphicsRoot32BitConstant(1, parameter, 0);
     list->RSSetViewports(1, &viewport); list->RSSetScissorRects(1, &scissor);
-    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list->OMSetRenderTargets(depth_target ? 0 : 1, depth_target ? nullptr : &target, FALSE, depth_target ? &target : nullptr);
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     list->DrawInstanced(3, 1, 0, 0);
     return S_OK;
@@ -115,6 +126,7 @@ HRESULT DisplayTransfer::record(ID3D12GraphicsCommandList* list, ID3D12Descripto
 }
 HRESULT SampleTransfer::initialize(ID3D12Device* device, DXGI_FORMAT format, UINT samples) {
     if (samples < 2 || samples > 8 || (samples & (samples - 1))) return E_INVALIDARG;
+    const bool depth_stencil = format==DXGI_FORMAT_R32G8X24_TYPELESS;
     static constexpr char source[] = R"(
 cbuffer Transfer : register(b0) { uint sample_index; };
 struct Vertex { float4 position : SV_Position; };
@@ -125,9 +137,31 @@ Vertex vs_main(uint id : SV_VertexID) {
     return v;
 }
 #ifdef INTO_MSAA
+#ifdef DEPTH_STENCIL
+Texture2DArray<uint2> image : register(t0);
+#ifdef STENCIL_BIT
+void ps_main(Vertex v, uint sample_id : SV_SampleIndex) {
+    uint2 bits = image.Load(int4(int2(v.position.xy), sample_id, 0));
+    if (!(bits.y & (1u << sample_index))) discard;
+}
+#else
+float ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Depth {
+    return asfloat(image.Load(int4(int2(v.position.xy), sample_id, 0)).x);
+}
+#endif
+#else
 Texture2DArray<float4> image : register(t0);
 float4 ps_main(Vertex v, uint sample_id : SV_SampleIndex) : SV_Target {
     return image.Load(int4(int2(v.position.xy), sample_id, 0));
+}
+#endif
+#else
+#ifdef DEPTH_STENCIL
+Texture2DMS<float> depth_image : register(t0);
+Texture2DMS<uint2> stencil_image : register(t1);
+uint2 ps_main(Vertex v) : SV_Target {
+    int2 xy = int2(v.position.xy);
+    return uint2(asuint(depth_image.Load(xy, sample_index)),stencil_image.Load(xy, sample_index).y);
 }
 #else
 Texture2DMS<float4> image : register(t0);
@@ -135,13 +169,22 @@ float4 ps_main(Vertex v) : SV_Target {
     return image.Load(int2(v.position.xy), sample_index);
 }
 #endif
+#endif
 )";
     std::array<Microsoft::WRL::ComPtr<ID3D12RootSignature>, 2> roots;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 2> pipelines;
-    const D3D_SHADER_MACRO macros[]{{"INTO_MSAA", "1"}, {nullptr, nullptr}};
-    HRESULT hr = graphics_pipeline(device, format, samples, source, macros, roots[0], pipelines[0]);
-    if (SUCCEEDED(hr)) hr = graphics_pipeline(device, format, 1, source, nullptr, roots[1], pipelines[1]);
-    if (SUCCEEDED(hr)) { roots_ = std::move(roots); pipelines_ = std::move(pipelines); samples_ = samples; }
+    const D3D_SHADER_MACRO into[]{{"INTO_MSAA", "1"}, {depth_stencil ? "DEPTH_STENCIL" : nullptr,"1"}, {nullptr,nullptr}};
+    const D3D_SHADER_MACRO out[]{{depth_stencil ? "DEPTH_STENCIL" : nullptr,"1"}, {nullptr,nullptr}};
+    HRESULT hr = graphics_pipeline(device, format, samples, source, into, roots[0], pipelines[0],depth_stencil);
+    if (SUCCEEDED(hr)) hr = graphics_pipeline(device, depth_stencil ? DXGI_FORMAT_R32G32_UINT : format, 1, source, out,
+        roots[1], pipelines[1],false,depth_stencil ? 2 : 1);
+    std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,8> stencil;
+    if (depth_stencil) for (UINT bit=0;bit<8 && SUCCEEDED(hr);++bit) {
+        const D3D_SHADER_MACRO masks[]{{"INTO_MSAA","1"},{"DEPTH_STENCIL","1"},{"STENCIL_BIT","1"},{nullptr,nullptr}};
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+        hr=graphics_pipeline(device,format,samples,source,masks,root,stencil[bit],true,1,bit);
+    }
+    if (SUCCEEDED(hr)) { roots_ = std::move(roots); pipelines_ = std::move(pipelines); stencil_pipelines_=std::move(stencil); samples_ = samples; depth_stencil_=depth_stencil; }
     return hr;
 }
 HRESULT SampleTransfer::record(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* heap,
@@ -149,6 +192,15 @@ HRESULT SampleTransfer::record(ID3D12GraphicsCommandList* list, ID3D12Descriptor
         UINT width, UINT height, UINT sample, bool into_msaa) const {
     if (sample >= samples_) return E_INVALIDARG;
     const UINT index = into_msaa ? 0 : 1;
-    return fullscreen(list, roots_[index].Get(), pipelines_[index].Get(), heap, source, target, width, height, sample);
+    HRESULT hr=fullscreen(list, roots_[index].Get(), pipelines_[index].Get(), heap, source, target, width, height, sample,depth_stencil_ && into_msaa);
+    if (SUCCEEDED(hr) && depth_stencil_ && into_msaa) {
+        // Eight write masks reconstruct every stencil bit on hosts without the
+        // optional PS stencil export. Sample-frequency shading preserves MSAA.
+        list->ClearDepthStencilView(target,D3D12_CLEAR_FLAG_STENCIL,0,0,0,nullptr);
+        list->OMSetStencilRef(255);
+        for (UINT bit=0;bit<8 && SUCCEEDED(hr);++bit)
+            hr=fullscreen(list,roots_[0].Get(),stencil_pipelines_[bit].Get(),heap,source,target,width,height,bit,true);
+    }
+    return hr;
 }
 }

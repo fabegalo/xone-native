@@ -74,7 +74,7 @@ struct GpuWindow {
     std::vector<UINT> rows;
     UINT64 staging_bytes = 0;
     Microsoft::WRL::ComPtr<ID3D12Resource> sample_array;
-    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sample_srv, sample_rtv;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sample_srv, sample_rtv, sample_dsv;
     std::unique_ptr<SampleTransfer> sample_transfer;
     UINT sample_srv_step = 0, sample_rtv_step = 0;
     std::vector<unsigned char> sample_linear;
@@ -818,8 +818,10 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
         d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
     if (d.SampleDesc.Count != 1 && (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 ||
         d.DepthOrArraySize != 1 || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1)) ||
-        !(d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
-        (d.Format != DXGI_FORMAT_R11G11B10_FLOAT && d.Format != DXGI_FORMAT_R10G10B10A2_UNORM && d.Format != DXGI_FORMAT_R8G8B8A8_UNORM)))
+        !((d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
+          (d.Format==DXGI_FORMAT_R32G8X24_TYPELESS && (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) ||
+        (d.Format != DXGI_FORMAT_R11G11B10_FLOAT && d.Format != DXGI_FORMAT_R10G10B10A2_UNORM &&
+         d.Format != DXGI_FORMAT_R8G8B8A8_UNORM && d.Format!=DXGI_FORMAT_R32G8X24_TYPELESS)))
         return DXGI_ERROR_UNSUPPORTED;
     return acquire_gpu_resource(address, layout.bytes, device, out, D3D12_RESOURCE_FLAG_NONE, true, &layout);
 }
@@ -1000,17 +1002,19 @@ HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList
 
 static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D12_RESOURCE_DESC& desc) {
     const UINT samples = desc.SampleDesc.Count;
-    const UINT64 bytes = desc.Width * desc.Height * samples * 4;
+    const bool depth_stencil=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
+    const UINT64 bytes = desc.Width * desc.Height * samples * (depth_stencil ? 8 : 4);
     if (!bytes || bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
     auto transfer = std::make_unique<SampleTransfer>();
     HRESULT hr = transfer->initialize(device, desc.Format, samples);
     if (FAILED(hr)) return hr;
     desc.SampleDesc = {1, 0}; desc.DepthOrArraySize = static_cast<UINT16>(samples); desc.Alignment = 0;
+    if (depth_stencil) { desc.Format=DXGI_FORMAT_R32G32_UINT; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; }
     D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     Microsoft::WRL::ComPtr<ID3D12Resource> array;
     hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&array));
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> srv, rtv;
-    const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC srv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, depth_stencil ? 3u : 2u, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     const D3D12_DESCRIPTOR_HEAP_DESC rtv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, samples + 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&srv_desc, IID_PPV_ARGS(&srv));
     if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&rtv_desc, IID_PPV_ARGS(&rtv));
@@ -1022,9 +1026,13 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
     view.Format = desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY; view.Texture2DArray.ArraySize = samples; view.Texture2DArray.MipLevels = 1;
     device->CreateShaderResourceView(array.Get(), &view, srv_handle);
-    view = {}; view.Format = desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view = {}; view.Format = depth_stencil ? DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS : desc.Format; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS; srv_handle.ptr += srv_step;
     device->CreateShaderResourceView(window.resource.Get(), &view, srv_handle);
+    if (depth_stencil) {
+        srv_handle.ptr+=srv_step; view.Format=DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+        device->CreateShaderResourceView(window.resource.Get(),&view,srv_handle);
+    }
     auto rtv_handle = rtv->GetCPUDescriptorHandleForHeapStart();
     for (UINT sample = 0; sample < samples; ++sample) {
         D3D12_RENDER_TARGET_VIEW_DESC target{};
@@ -1032,9 +1040,20 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
         target.Texture2DArray.FirstArraySlice = sample; target.Texture2DArray.ArraySize = 1;
         device->CreateRenderTargetView(array.Get(), &target, rtv_handle); rtv_handle.ptr += rtv_step;
     }
-    D3D12_RENDER_TARGET_VIEW_DESC target{};
-    target.Format = desc.Format; target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
-    device->CreateRenderTargetView(window.resource.Get(), &target, rtv_handle);
+    if (depth_stencil) {
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> dsv;
+        const D3D12_DESCRIPTOR_HEAP_DESC dsv_desc{D3D12_DESCRIPTOR_HEAP_TYPE_DSV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        hr=device->CreateDescriptorHeap(&dsv_desc,IID_PPV_ARGS(&dsv));
+        if (FAILED(hr)) return hr;
+        D3D12_DEPTH_STENCIL_VIEW_DESC target{};
+        target.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; target.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
+        device->CreateDepthStencilView(window.resource.Get(),&target,dsv->GetCPUDescriptorHandleForHeapStart());
+        window.sample_dsv=std::move(dsv);
+    } else {
+        D3D12_RENDER_TARGET_VIEW_DESC target{};
+        target.Format = desc.Format; target.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        device->CreateRenderTargetView(window.resource.Get(), &target, rtv_handle);
+    }
     window.sample_linear.resize(static_cast<SIZE_T>(bytes));
     window.sample_array = std::move(array); window.sample_transfer = std::move(transfer);
     window.sample_srv = std::move(srv); window.sample_rtv = std::move(rtv);
@@ -1045,12 +1064,13 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
 static void interleave_samples(GpuWindow& window, void* mapped, bool into_array) {
     const auto& desc = window.texture.resource_desc;
     const UINT samples = desc.SampleDesc.Count;
+    const UINT element=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4;
     for (UINT sample = 0; sample < samples; ++sample) {
         const auto& footprint = window.footprints[sample];
         for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x) {
-            auto* linear = window.sample_linear.data() + ((SIZE_T(y) * desc.Width + x) * samples + sample) * 4;
-            auto* array = static_cast<unsigned char*>(mapped) + footprint.Offset + SIZE_T(y) * footprint.Footprint.RowPitch + x * 4;
-            std::memcpy(into_array ? array : linear, into_array ? linear : array, 4);
+            auto* linear = window.sample_linear.data() + ((SIZE_T(y) * desc.Width + x) * samples + sample) * element;
+            auto* array = static_cast<unsigned char*>(mapped) + footprint.Offset + SIZE_T(y) * footprint.Footprint.RowPitch + x * element;
+            std::memcpy(into_array ? array : linear, into_array ? linear : array, element);
         }
     }
 }
@@ -1094,8 +1114,14 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
         if (FAILED(hr)) return hr;
         if (window.sample_array) {
             const auto& desc = window.texture.resource_desc;
-            const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * 4;
+            const UINT element=desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4;
+            const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * element;
             hr = window.texture.copy(window.texture.context.get(), false, window.sample_linear.data(), canonical, 0, row, row * desc.Height);
+            if (SUCCEEDED(hr) && element==8) for (SIZE_T at=0;at<window.sample_linear.size();at+=8) {
+                UINT32 bits; std::memcpy(&bits,window.sample_linear.data()+at,4);
+                // SV_Depth cannot promise lossless NaN, signed-zero or denormal payloads.
+                if (bits>0x3f800000u || (bits && !(bits&0x7f800000u))) { hr=DXGI_ERROR_UNSUPPORTED; break; }
+            }
             if (SUCCEEDED(hr)) interleave_samples(window, mapped, true);
         } else for (UINT i = 0; i < window.footprints.size(); ++i) {
             const auto& footprint = window.footprints[i];
@@ -1137,15 +1163,17 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
     }
     if (window->sample_array) {
         gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        gpu_transition(list, texture.resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        const auto write_state=window->sample_dsv ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+        gpu_transition(list, texture.resource, D3D12_RESOURCE_STATE_COMMON, write_state);
         auto target = window->sample_rtv->GetCPUDescriptorHandleForHeapStart();
         const auto& desc = window->texture.resource_desc;
         target.ptr += SIZE_T(desc.SampleDesc.Count) * window->sample_rtv_step;
+        if (window->sample_dsv) target=window->sample_dsv->GetCPUDescriptorHandleForHeapStart();
         hr = window->sample_transfer->record(list, window->sample_srv.Get(), window->sample_srv->GetGPUDescriptorHandleForHeapStart(),
             target, UINT(desc.Width), desc.Height, 0, true);
         if (FAILED(hr)) return hr;
         gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-        gpu_transition(list, texture.resource, D3D12_RESOURCE_STATE_RENDER_TARGET, state);
+        gpu_transition(list, texture.resource, write_state, state);
     } else gpu_transition(list, texture.resource, D3D12_RESOURCE_STATE_COPY_DEST, state);
     return S_OK;
 }
@@ -1210,7 +1238,7 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
                 else if (window->sample_array) {
                     interleave_samples(*window, mapped, false);
                     const auto& desc = window->texture.resource_desc;
-                    const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * 4;
+                    const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * (desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS ? 8 : 4);
                     converted = window->texture.copy(window->texture.context.get(), true, window->sample_linear.data(), commit.data(),
                         0, row, row * desc.Height);
                 } else for (UINT i = 0; i < window->footprints.size(); ++i) {

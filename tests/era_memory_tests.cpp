@@ -704,44 +704,68 @@ int main(int argc, char** argv) {
               "typed R8 metadata preserves canonical bytes through independent GPU mutation");
     }
     const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal, void* reserved = nullptr) -> bool {
+        const bool depth_stencil=layout.resource_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;
+        if (depth_stencil) {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+            const HRESULT feature=device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS,&options,sizeof options);
+            std::cout << "depth/stencil features hr=0x" << std::hex << feature << std::dec
+                      << " PSStencilRef=" << options.PSSpecifiedStencilRefSupported << '\n';
+        }
+        const UINT words=depth_stencil ? 2 : 1, row=512*words, slice=8192*words;
         auto* storage = reserved ? nullptr : static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
         if (!reserved && !storage) return false;
         auto* canonical = reserved ? static_cast<unsigned char*>(reserved) :
             reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(storage) + 16 + layout.alignment - 1) & ~(layout.alignment - 1));
         std::memset(canonical - 16, 0x5a, layout.bytes + 32);
-        std::vector<UINT32> expected(32 * 16 * 4), actual(expected.size());
+        std::vector<UINT32> expected(32 * 16 * 4 * words), actual(expected.size());
         for (UINT i = 0; i < expected.size(); ++i) {
-            const UINT sample = i % 4;
-            expected[i] = ((15 + sample) << 6) | (((16 + sample) << 6) << 11) | (((14 + sample) << 5) << 22);
+            const UINT sample = (i/words) % 4;
+            expected[i] = depth_stencil ? (i%2 ? ((i/2*17+3)&255) : 0x3e000000u+i*13) :
+                ((15 + sample) << 6) | (((16 + sample) << 6) << 11) | (((14 + sample) << 5) << 22);
         }
-        if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, 512, 8192))) return false;
+        if (depth_stencil) {
+            const UINT32 edges[]{0,0x00800000u,0x3f7fffffu,0x3f800000u};
+            for (UINT sample=0;sample<4;++sample) expected[sample*2]=edges[sample];
+        }
+        if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, row, slice))) return false;
         TitleGpuResource texture;
         HRESULT hr = acquire_title_gpu_texture(canonical, layout, device.Get(), texture);
         check(SUCCEEDED(hr), "four-sample resource acquires a real native MSAA texture");
         if (FAILED(hr)) return false;
         check(texture.resource->GetDesc().SampleDesc.Count == 4, "MSAA storage retains all four hardware samples");
         ComPtr<ID3D12DescriptorHeap> targets;
-        const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{depth_stencil ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&targets)))) return false;
         D3D12_RENDER_TARGET_VIEW_DESC view{};
         view.Format = DXGI_FORMAT_R11G11B10_FLOAT; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
-        device->CreateRenderTargetView(texture.resource, &view, targets->GetCPUDescriptorHandleForHeapStart());
+        if (depth_stencil) {
+            D3D12_DEPTH_STENCIL_VIEW_DESC depth_view{};
+            depth_view.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; depth_view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
+            device->CreateDepthStencilView(texture.resource,&depth_view,targets->GetCPUDescriptorHandleForHeapStart());
+        } else device->CreateRenderTargetView(texture.resource, &view, targets->GetCPUDescriptorHandleForHeapStart());
         for (UINT iteration = 0; iteration < 3; ++iteration) {
             if (iteration == 2) {
                 void* cpu = nullptr;
                 if (FAILED(map_title_gpu_resource(texture, &cpu))) return false;
-                for (UINT i = 0; i < expected.size(); ++i) expected[i] ^= (i % 4 + 1) << 1; // Distinct finite mantissas in each sample.
-                hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, 512, 8192);
+                for (UINT i = 0; i < expected.size(); ++i) if (!depth_stencil || i>=8 || i%2)
+                    expected[i] ^= ((i/words) % 4 + 1) << 1; // Distinct finite mantissas in each sample.
+                hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, row, slice);
                 if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
             }
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
-            hr = begin_title_gpu_texture(texture, list.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+            hr = begin_title_gpu_texture(texture, list.Get(), depth_stencil ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (FAILED(hr)) std::cerr << "MSAA upload format=" << layout.resource_desc.Format << " hr=0x" << std::hex << hr << std::dec << '\n';
             check(SUCCEEDED(hr), "sample upload uses per-sample GPU shading without resolve");
             if (FAILED(hr)) return false;
             if (iteration == 1) {
                 const float color[]{.5f, 1, 2, 1};
-                list->ClearRenderTargetView(targets->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
-                std::fill(expected.begin(), expected.end(), (14u << 6) | ((15u << 6) << 11) | ((16u << 5) << 22));
+                if (depth_stencil) {
+                    list->ClearDepthStencilView(targets->GetCPUDescriptorHandleForHeapStart(),D3D12_CLEAR_FLAG_DEPTH|D3D12_CLEAR_FLAG_STENCIL,.375f,0xa7,0,nullptr);
+                    for (UINT i=0;i<expected.size();++i) expected[i]=i%2 ? 0xa7 : 0x3ec00000u;
+                } else {
+                    list->ClearRenderTargetView(targets->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
+                    std::fill(expected.begin(), expected.end(), (14u << 6) | ((15u << 6) << 11) | ((16u << 5) << 22));
+                }
             }
             if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
             queue->ExecuteCommandLists(1, lists);
@@ -753,7 +777,7 @@ int main(int argc, char** argv) {
             if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(signal + iteration, ready);
             const bool completed = SUCCEEDED(hr) && WaitForSingleObject(ready, 3000) == WAIT_OBJECT_0;
             CloseHandle(ready); if (!completed || FAILED(complete_title_gpu_resource(texture, fence.Get(), signal + iteration))) return false;
-            hr = layout.copy(layout.context.get(), false, actual.data(), canonical, 0, 512, 8192);
+            hr = layout.copy(layout.context.get(), false, actual.data(), canonical, 0, row, slice);
             check(SUCCEEDED(hr) && actual == expected, iteration == 1 ? "independent native MSAA clear updates every canonical sample" :
                 "all four distinct MSAA samples survive GPU upload/readback and CPU reuse");
             for (UINT i = 0; i < 16; ++i)
@@ -776,6 +800,10 @@ int main(int argc, char** argv) {
         hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, sample_layout,
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 4);
         check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout), 30), "original XG MSAA layout completes per-sample GPU coherence");
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,1,sample_layout,
+            D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
+        check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout),33),
+            "original XG depth/stencil preserves all sample bits through native GPU transfers and independent clears");
     }
     // Independent pixel oracle: source samples include both transfer breakpoints,
     // out-of-range RGB, distinct rows, and all four two-bit alpha values.
@@ -960,6 +988,14 @@ int main(int argc, char** argv) {
     auto* mixed_texture = pool_memory + 3 * 65536 - 4096;
     check(sample_fixture(pool_texture, 210, mixed_texture), "four-sample texture spans ESRAM and private graphics pages coherently");
     check(!std::memcmp(mixed_texture, pool_alias + 65536 - 4096, 4096), "MSAA writeback reaches the physical ESRAM alias");
+    if (original_xg && !bgra_only) {
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,1,pool_texture,
+            D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
+        auto* mixed_depth=pool_memory+2*65536-8192;
+        check(SUCCEEDED(hr) && sample_fixture(std::move(pool_texture),220,mixed_depth),
+            "original depth/stencil planes remain coherent across shared ESRAM and private DDR pages");
+        check(!std::memcmp(mixed_depth+8192,pool_alias,65536),"depth/stencil writeback reaches every byte of its real ESRAM alias");
+    }
     check(virtual_free(pool_memory, 0, MEM_RELEASE) && virtual_free(pool_alias, 0, MEM_RELEASE), "GPU ESRAM fixtures release every owned reservation after retirement");
     return failures ? 1 : 0;
 }

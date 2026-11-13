@@ -11,6 +11,8 @@
 #include <evntprov.h>
 #include <d3dcommon.h>
 #include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <cmath>
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -268,6 +270,106 @@ int main(int argc, char** argv) {
                             for(UINT i=0;i<pixels.size();i+=4) equal=equal && pixels[i]==51 && pixels[i+1]==34 && pixels[i+2]==17+pass*17 && pixels[i+3]==68;
                             check(equal,"title clear executes on D3D12 and publishes every BGRA pixel after its fence, including reuse");
                         }
+                        // Exercise an indexed textured quad through the same Xbox ABI.
+                        // Separate VS/PS b0 values expose accidental cross-stage binding.
+                        const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+                        const auto compile=compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")) : nullptr;
+                        const char* sources[]{
+                            "cbuffer C:register(b0){float4 scale;} struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};"
+                            "V main(float2 p:POSITION,float2 uv:TEXCOORD0){V v;v.p=float4(p*scale.xy,0,1);v.uv=uv;return v;}",
+                            "cbuffer C:register(b0){float4 tint;} Texture2D image:register(t0); SamplerState sample_state:register(s0);"
+                            "float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return image.Sample(sample_state,uv)*tint;}"};
+                        Microsoft::WRL::ComPtr<ID3DBlob> codes[2];
+                        void* objects[10]{}; // VS, PS, layout, vertex/index, VS/PS CB, image, SRV, sampler.
+                        bool ready=compile!=nullptr;
+                        using CreateShader=HRESULT(STDMETHODCALLTYPE*)(void*,const void*,SIZE_T,void*,void**);
+                        for(UINT i=0;i<2 && ready;++i) {
+                            ready=SUCCEEDED(compile(sources[i],std::strlen(sources[i]),nullptr,nullptr,nullptr,"main",i ? "ps_5_0" : "vs_5_0",0,0,&codes[i],nullptr));
+                            if(ready) ready=reinterpret_cast<CreateShader>(vt(device)[i ? 15 : 12])(device,codes[i]->GetBufferPointer(),codes[i]->GetBufferSize(),nullptr,&objects[i])==S_OK;
+                        }
+                        using CreateLayout=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_INPUT_ELEMENT_DESC*,UINT,const void*,SIZE_T,void**);
+                        const D3D12_INPUT_ELEMENT_DESC elements[]{
+                            {"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
+                            {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,8,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}};
+                        if(ready) ready=reinterpret_cast<CreateLayout>(vt(device)[11])(device,elements,2,codes[0]->GetBufferPointer(),codes[0]->GetBufferSize(),&objects[2])==S_OK;
+                        const FLOAT vertices[]{-1,-1,0,1,-1,1,0,0,1,1,1,0,1,-1,1,1};
+                        const UINT16 indices[]{0,1,2,0,2,3};
+                        for(UINT i=3;i<7 && ready;++i) {
+                            const D3D11_BUFFER_DESC d{i==3 ? UINT(sizeof vertices) : i==4 ? UINT(sizeof indices) : 16,
+                                i<5 ? D3D11_USAGE_IMMUTABLE : D3D11_USAGE_DYNAMIC,
+                                UINT(i==3 ? D3D11_BIND_VERTEX_BUFFER : i==4 ? D3D11_BIND_INDEX_BUFFER : D3D11_BIND_CONSTANT_BUFFER),
+                                i<5 ? 0u : D3D11_CPU_ACCESS_WRITE,0,0};
+                            const D3D11_SUBRESOURCE_DATA initial{i==3 ? static_cast<const void*>(vertices) : static_cast<const void*>(indices),0,0};
+                            ready=create_buffer(device,&d,i<5 ? &initial : nullptr,&objects[i])==S_OK;
+                        }
+                        TextureDesc image{};
+                        image.standard={8,8,1,1,DXGI_FORMAT_B8G8R8A8_UNORM,{1,0},D3D11_USAGE_DYNAMIC,D3D11_BIND_SHADER_RESOURCE,0,0};
+                        if(ready) ready=reinterpret_cast<Texture>(vt(device)[5])(device,&image,nullptr,&objects[7])==S_OK;
+                        if(ready) ready=reinterpret_cast<View>(vt(device)[7])(device,objects[7],nullptr,&objects[8])==S_OK;
+                        D3D12_SAMPLER_DESC sampler_desc{};
+                        sampler_desc.Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+                        sampler_desc.AddressU=sampler_desc.AddressV=sampler_desc.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                        sampler_desc.MaxAnisotropy=1;sampler_desc.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
+                        if(ready) ready=reinterpret_cast<CreateSampler>(vt(device)[23])(device,&sampler_desc,&objects[9])==S_OK;
+                        void* raster_object=nullptr;
+                        if(ready) ready=reinterpret_cast<CreateState>(vt(device)[22])(device,&raster,&raster_object)==S_OK;
+                        check(ready,"indexed draw fixture prepares original-ABI shaders, vertices, constants, texture and sampler");
+                        if(ready) {
+                            using Map=HRESULT(STDMETHODCALLTYPE*)(void*,void*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*);
+                            using Unmap=void(STDMETHODCALLTYPE*)(void*,void*);
+                            const auto map=reinterpret_cast<Map>(embedded[16]);const auto unmap=reinterpret_cast<Unmap>(embedded[17]);
+                            D3D11_MAPPED_SUBRESOURCE mapped{};
+                            const HRESULT mapped_image=map(context,objects[7],0,D3D11_MAP_WRITE_DISCARD,0,&mapped);
+                            check(mapped_image==S_OK,"draw texture is writable through the coherent map path");
+                            if(SUCCEEDED(mapped_image)) {std::memset(mapped.pData,255,mapped.DepthPitch);unmap(context,objects[7]);}
+                            using Object=void(STDMETHODCALLTYPE*)(void*,void*);
+                            reinterpret_cast<Object>(embedded[13])(context,objects[0]);reinterpret_cast<Object>(embedded[11])(context,objects[1]);
+                            reinterpret_cast<Object>(embedded[19])(context,objects[2]);reinterpret_cast<Object>(embedded[44])(context,raster_object);
+                            const UINT stride=16,offset=0;
+                            using Vertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
+                            reinterpret_cast<Vertices>(embedded[20])(context,0,1,&objects[3],&stride,&offset);
+                            using Indices=void(STDMETHODCALLTYPE*)(void*,UINT,void*,UINT);
+                            reinterpret_cast<Indices>(embedded[21])(context,0,objects[4],0);
+                            using Range=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                            reinterpret_cast<Range>(embedded[9])(context,0,1,&objects[5]);reinterpret_cast<Range>(embedded[18])(context,0,1,&objects[6]);
+                            reinterpret_cast<Range>(embedded[12])(context,0,1,&objects[9]);
+                            using Resources=void(STDMETHODCALLTYPE*)(void*,void* const*,UINT,UINT);
+                            reinterpret_cast<Resources>(embedded[10])(context,&objects[8],0,0x76b40);
+                            using Targets=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
+                            reinterpret_cast<Targets>(embedded[34])(context,1,&rtv,nullptr);
+                            const D3D11_VIEWPORT viewport{0,0,32,16,0,1};set_viewports(context,1,&viewport);
+                            const UINT64 topology=0x000009ffc0009e00ull;std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);
+                            for(UINT pass=0;pass<2;++pass) {
+                                const FLOAT constants[2][4]{{1,1,1,1},{pass ? .5f : .25f,pass ? .25f : .5f,pass ? .125f : .75f,1}};
+                                bool written=true;
+                                for(UINT stage=0;stage<2;++stage) {
+                                    const HRESULT result=map(context,objects[5+stage],0,D3D11_MAP_WRITE_DISCARD,0,&mapped);
+                                    written=written && SUCCEEDED(result);
+                                    if(SUCCEEDED(result)) {std::memcpy(mapped.pData,constants[stage],16);unmap(context,objects[5+stage]);}
+                                }
+                                check(written,"per-stage constants update between indexed draws");
+                                using Draw=void(STDMETHODCALLTYPE*)(void*,UINT64,INT);
+                                reinterpret_cast<Draw>(embedded[14])(context,6ull<<32,0);
+                                std::array<unsigned char,32*16*4> pixels{};
+                                const HRESULT copied=layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048);
+                                bool equal=SUCCEEDED(copied);
+                                // D3D FLOAT->UNORM allows 0.6 ULP on the integer side.
+                                for(UINT i=0;i<pixels.size();i+=4) equal=equal && std::abs(FLOAT(pixels[i])-255*constants[1][2])<=.6f &&
+                                    std::abs(FLOAT(pixels[i+1])-255*constants[1][1])<=.6f && std::abs(FLOAT(pixels[i+2])-255*constants[1][0])<=.6f && pixels[i+3]==255;
+                                check(equal,"native indexed draw produces expected textured pixels, separate stage constants and fresh CPU updates");
+                                if(!equal) std::cerr << "draw pixels first BGRA " << UINT(pixels[0]) << ',' << UINT(pixels[1]) << ',' << UINT(pixels[2]) << ',' << UINT(pixels[3])
+                                    << " center " << UINT(pixels[1024]) << ',' << UINT(pixels[1025]) << ',' << UINT(pixels[1026]) << ',' << UINT(pixels[1027]) << '\n';
+                            }
+                            reinterpret_cast<Object>(embedded[13])(context,nullptr);reinterpret_cast<Object>(embedded[11])(context,nullptr);
+                            reinterpret_cast<Object>(embedded[19])(context,nullptr);reinterpret_cast<Object>(embedded[44])(context,nullptr);
+                            reinterpret_cast<Vertices>(embedded[20])(context,0,1,nullptr,&stride,&offset);reinterpret_cast<Indices>(embedded[21])(context,0,nullptr,0);
+                            reinterpret_cast<Range>(embedded[9])(context,0,1,nullptr);reinterpret_cast<Range>(embedded[18])(context,0,1,nullptr);
+                            reinterpret_cast<Range>(embedded[12])(context,0,1,nullptr);reinterpret_cast<Resources>(embedded[10])(context,nullptr,0,0x76b40);
+                            reinterpret_cast<Targets>(embedded[34])(context,0,nullptr,nullptr);
+                        }
+                        if(raster_object) reinterpret_cast<Count>(vt(raster_object)[2])(raster_object);
+                        for(auto* object : objects) if(object) reinterpret_cast<Count>(vt(object)[2])(object);
+                        codes[0].Reset();codes[1].Reset();if(compiler) FreeLibrary(compiler);
                     }
                     if(rtv) reinterpret_cast<Count>(vt(rtv)[2])(rtv);
                     if(srv) reinterpret_cast<Count>(vt(srv)[2])(srv);
@@ -341,12 +443,104 @@ int main(int argc, char** argv) {
             hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
                 D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 4);
             std::cout << "original XG depth/stencil MSAA4 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
-            check(hr == DXGI_ERROR_UNSUPPORTED && !layout.context && !layout.bytes,
-                "three-plane depth/stencil layout is explicitly refused until every plane is translated");
+            check(SUCCEEDED(hr) && layout.context && layout.bytes==98304,
+                "three-plane depth/stencil layout retains the original physical allocation");
+            if (SUCCEEDED(hr)) {
+                std::vector<unsigned char> physical(layout.bytes+32,0x5a), samples(32*16*4*8), restored(samples.size(),0x3c);
+                for (SIZE_T at=0;at<samples.size();at+=8) {
+                    const UINT32 depth_bits=0x3e000000u+UINT32(at*13);
+                    std::memcpy(samples.data()+at,&depth_bits,4);
+                    samples[at+4]=static_cast<unsigned char>(at/8*17+3);
+                }
+                hr=layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1024,16384);
+                if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384);
+                check(SUCCEEDED(hr) && samples==restored,"depth/stencil CPU roundtrip preserves every sample's depth bits and stencil byte");
+                check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
+                    std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"depth/stencil tiling preserves allocation guards");
+                physical[16]^=1;
+                const auto before=restored;
+                check(layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384)==DXGI_ERROR_UNSUPPORTED && restored==before,
+                    "unknown HTILE encoding refuses readback without modifying the linear destination");
+                const auto tiled_before=physical;
+                check(layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1,16384)==E_INVALIDARG && physical==tiled_before,
+                    "invalid depth/stencil pitch preserves every physical plane");
+            }
             hr = create_xg_texture_layout(1920, 1080, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
                 D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 4);
-            check(hr == DXGI_ERROR_UNSUPPORTED && !layout.context && !layout.bytes,
-                "observed full-size FH2 depth descriptor preserves the same explicit plane boundary");
+            check(SUCCEEDED(hr) && layout.context && layout.bytes==41910272,
+                "observed full-size FH2 descriptor preserves the exact ESRAM and DDR allocation span");
+            using CreateComputer = HRESULT(*)(const void*,void**);
+            const auto create_computer = reinterpret_cast<CreateComputer>(resolve_xg_module({"xg_x.dll","XGCreateTexture2DComputer",0}));
+            check(create_computer != nullptr,"revision-bound XG exposes its original depth layout factory");
+            if (!create_computer) return 1;
+            for (const auto dimensions : {std::array<UINT,2>{32,16},std::array<UINT,2>{1920,1080}}) {
+                std::array<UINT,15> descriptor{dimensions[0],dimensions[1],1,1,19,4,0,0,0x40,0,0,0,0,1,0};
+                void* computer = nullptr;
+                hr = create_computer(descriptor.data(),&computer);
+                check(SUCCEEDED(hr) && computer,"original XG constructs the observed depth/stencil descriptor");
+                if (FAILED(hr) || !computer) continue;
+                auto** table = *static_cast<void***>(computer);
+                std::array<unsigned char,0xd40+16> raw;
+                raw.fill(0x5a);
+                hr = reinterpret_cast<HRESULT(*)(void*,void*)>(table[2])(computer,raw.data());
+                const auto u64 = [&](SIZE_T offset) { UINT64 value; std::memcpy(&value,raw.data()+offset,8); return value; };
+                const auto u32 = [&](SIZE_T offset) { UINT value; std::memcpy(&value,raw.data()+offset,4); return value; };
+                const UINT64 bytes = u64(0);
+                check(SUCCEEDED(hr) && u32(16)==1 && u32(20)==3 && bytes==(dimensions[0]==32 ? 98304ull : 41910272ull),
+                    "original depth layout has verified size and three physical planes");
+                check(std::all_of(raw.begin()+0xd40,raw.end(),[](auto x){return x==0x5a;}),"depth layout preserves ABI output bounds");
+                std::cout << "original depth " << dimensions[0] << 'x' << dimensions[1] << " bytes=" << bytes << '\n';
+                if (dimensions[0]==32) {
+                    std::array<UINT32,8> words{};
+                    std::memcpy(words.data(),static_cast<char*>(computer)+0x10,sizeof words);
+                    check(std::all_of(words.begin(),words.end(),[](auto word){return !word;}),
+                        "original XG depth computer does not publish a ready-made shader SRD");
+                }
+                // Reference helpers 140167760/1401677d0 establish the 11295 inline plane/mip strides.
+                for (UINT plane=0;plane<3;++plane) {
+                    const SIZE_T offset=24+plane*0x460;
+                    const UINT usage=u32(offset), element=u32(offset+32);
+                    const UINT64 size=u64(offset+8), base=u64(offset+16);
+                    std::cout << " plane=" << plane << " usage=" << usage << " bytes=" << size << " base=" << base
+                              << " alignment=" << u64(offset+24) << " element=" << element << '\n';
+                    check(base<=bytes && size<=bytes-base,"depth plane fits the original allocation");
+                    check(usage==(plane==0 ? 4u : plane==1 ? 7u : 8u),"physical plane order matches the original HTILE/depth/stencil layout");
+                    if (dimensions[0]!=32 || usage==4) continue;
+                    check((usage==7 || usage==8) && element==(usage==7 ? 4u : 1u),
+                        "depth and stencil have independent verified element widths");
+                    if ((usage!=7 && usage!=8) || element!=(usage==7 ? 4u : 1u)) continue;
+                    using Address=UINT64(*)(void*,UINT,UINT,UINT64,UINT,UINT,UINT);
+                    const auto address=reinterpret_cast<Address>(table[4]);
+                    auto* plane_context=static_cast<unsigned char*>(computer)+0xd8+plane*0x1c18;
+                    using PhysicalAddress=INT64(*)(UINT64,UINT,UINT,UINT,UINT64,UINT64,const void*);
+                    const auto physical=reinterpret_cast<PhysicalAddress>(static_cast<unsigned char*>(table[4])+
+                        ((plane_context[0x68]&0x80) ? 0xb440 : 0x88d0)-0x2a70);
+                    auto typed_descriptor=descriptor;
+                    typed_descriptor[4]=usage==7 ? 41 : 62; typed_descriptor[8]=0;
+                    void* typed=nullptr;
+                    const HRESULT typed_hr=create_computer(typed_descriptor.data(),&typed);
+                    bool same_typed=SUCCEEDED(typed_hr) && typed;
+                    void** typed_table=same_typed ? *static_cast<void***>(typed) : nullptr;
+                    const auto typed_address=typed_table ? reinterpret_cast<Address>(typed_table[4]) : nullptr;
+                    std::vector<unsigned char> touched(static_cast<SIZE_T>(bytes));
+                    bool valid=true;
+                    for (UINT y=0;y<16;++y) for (UINT x=0;x<32;++x) for (UINT sample=0;sample<4;++sample) {
+                        const INT64 bits=physical(x,y,0,sample,0,0,plane_context);
+                        const UINT64 at=static_cast<UINT64>(bits>>12);
+                        if (!sample && at!=address(computer,plane,0,x,y,0,0)) valid=false;
+                        if (sample && address(computer,plane,0,x,y,0,sample)!=UINT64_MAX) valid=false;
+                        if (typed_address && typed_address(typed,0,0,x,y,0,sample)+base!=at) same_typed=false;
+                        if (at<base || at>base+size || element>base+size-at) { valid=false; continue; }
+                        for (UINT byte=0;byte<element;++byte) {
+                            if (touched[static_cast<SIZE_T>(at+byte)]++) valid=false;
+                        }
+                    }
+                    check(valid,"every depth/stencil sample has a distinct in-plane byte address");
+                    check(same_typed,"typed XG computer preserves the exact depth/stencil address of every sample");
+                    if (typed_table) reinterpret_cast<ULONG(*)(void*)>(typed_table[1])(typed);
+                }
+                reinterpret_cast<ULONG(*)(void*)>(table[1])(computer);
+            }
             return failures ? 1 : 0;
         }
         if (SUCCEEDED(hr)) hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
@@ -434,6 +628,67 @@ int main(int argc, char** argv) {
             VirtualQuery(root, &memory, sizeof memory);
             check(memory.State == MEM_COMMIT, "placed texture release preserves borrowed canonical storage");
             free_memory(root, attributes);
+            Desc placed_depth{};
+            placed_depth.standard={32,16,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,{4,0},D3D11_USAGE_DEFAULT,
+                D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,0,0x40000};
+            auto* depth_storage=static_cast<unsigned char*>(allocate(98304+8192+32,attributes));
+            if (!depth_storage) return 1;
+            std::memset(depth_storage,0x5a,98304+8192+32);
+            void* depth_base=reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(depth_storage)+16+8191)&~std::uintptr_t(8191));
+            texture=nullptr;
+            const auto place_texture=reinterpret_cast<CreateTexture>(vt(device)[64]);
+            check(place_texture(device,&placed_depth,1,1,depth_base,&texture)==DXGI_ERROR_UNSUPPORTED && !texture,
+                "depth placement rejects unknown flags before acquiring the original storage");
+            check(place_texture(device,&placed_depth,1,0,depth_base,&texture)==S_OK && texture,
+                "depth placement binds the original three-plane allocation to native MSAA depth/stencil");
+            if (texture) {
+                using CreateDsv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_DEPTH_STENCIL_VIEW_DESC*,void**);
+                using CreateSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                const auto create_srv=reinterpret_cast<CreateSrv>(vt(device)[7]);
+                for (const auto format:{DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,DXGI_FORMAT_X32_TYPELESS_G8X24_UINT}) {
+                    D3D11_SHADER_RESOURCE_VIEW_DESC description{};
+                    description.Format=format; description.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2DMS;
+                    void* view=nullptr;
+                    check(create_srv(device,texture,&description,&view)==S_OK && view,"depth/stencil SRV binds a typed view of the same native resource");
+                    if (!view) continue;
+                    std::array<UINT32,8> descriptor{};
+                    std::memcpy(descriptor.data(),static_cast<char*>(view)+48,sizeof descriptor);
+                    const UINT64 plane_offset=format==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ? 16384 : 81920;
+                    check(descriptor[0]==((reinterpret_cast<std::uintptr_t>(depth_base)+plane_offset)>>8) &&
+                        ((descriptor[3]>>16)&15)==2 && (descriptor[3]>>28)>=14,
+                        "depth/stencil SRD preserves its physical plane base and four-sample address contract");
+                    struct { D3D11_SHADER_RESOURCE_VIEW_DESC value{}; UINT guard=0xaabbccdd; } actual;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(view)[9])(view,&actual.value);
+                    check(actual.value.Format==format && actual.value.ViewDimension==description.ViewDimension && actual.guard==0xaabbccdd,
+                        "typed MSAA SRV queries preserve format, dimension and output extent");
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                const auto create_dsv=reinterpret_cast<CreateDsv>(vt(device)[10]);
+                D3D11_DEPTH_STENCIL_VIEW_DESC depth_view{};
+                depth_view.Format=DXGI_FORMAT_D32_FLOAT; depth_view.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2DMS;
+                void* view=nullptr;
+                check(create_dsv(device,texture,&depth_view,&view)==DXGI_ERROR_UNSUPPORTED && !view,
+                    "combined depth/stencil rejects a depth-only reinterpretation");
+                depth_view.Format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+                depth_view.Flags=D3D11_DSV_READ_ONLY_DEPTH|D3D11_DSV_READ_ONLY_STENCIL;
+                check(create_dsv(device,texture,&depth_view,nullptr)==S_FALSE,
+                    "read-only depth/stencil validation does not create ownership");
+                check(create_dsv(device,texture,&depth_view,&view)==S_OK && view,
+                    "original DSV factory creates a typed native four-sample view");
+                if (view) {
+                    struct { D3D11_DEPTH_STENCIL_VIEW_DESC desc{}; UINT guard=0xaabbccdd; } actual_view;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_DEPTH_STENCIL_VIEW_DESC*)>(vt(view)[9])(view,&actual_view.desc);
+                    check(!std::memcmp(&actual_view.desc,&depth_view,sizeof depth_view) && actual_view.guard==0xaabbccdd,
+                        "MSAA DSV description preserves both read-only aspects and its ABI extent");
+                    check(reinterpret_cast<Count>(vt(texture)[2])(texture)==1,"MSAA DSV retains its original parent storage");
+                    texture=nullptr;
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            check(std::all_of(depth_storage,depth_storage+98304+8192+32,[](auto x){return x==0x5a;}),
+                "depth placement and view retirement preserve every borrowed physical byte");
+            free_memory(depth_storage,attributes);
             struct VolumeDesc { D3D11_TEXTURE3D_DESC standard; std::array<UINT, 2> extension{}; } volume_desc{};
             static_assert(sizeof(VolumeDesc) == 44);
             volume_desc.standard = {16, 16, 16, 1, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_USAGE_DEFAULT,

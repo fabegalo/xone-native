@@ -90,6 +90,23 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
                       static_cast<unsigned long long>(at - reinterpret_cast<std::uintptr_t>(module)));
     }
     report(line);
+    if (code==0xE06D7363 && info->ExceptionRecord->NumberParameters==4 && xboxone::era::stop_on_missing_service()) {
+        // Diagnostic only: MSVC x64 EH metadata uses image-relative offsets.
+        // https://devblogs.microsoft.com/oldnewthing/20100730-00/?p=13273
+        const auto* data=info->ExceptionRecord->ExceptionInformation;
+        const auto relative=[&](std::uintptr_t address,UINT offset,std::uintptr_t& result) {
+            DWORD rva=0;SIZE_T read=0;
+            if(!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(address+offset),&rva,sizeof rva,&read) || read!=sizeof rva) return false;
+            result=data[3]+rva;return rva!=0;
+        };
+        std::uintptr_t types=0,type=0,name=0;
+        char type_name[96]{};SIZE_T read=0;
+        if(relative(data[2],12,types) && relative(types,4,type) && relative(type,4,name) &&
+            ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(name+16),type_name,sizeof type_name-1,&read)) {
+            std::snprintf(line,sizeof line,"xone-era:   C++ type %.95s metadata image 0x%llX\n",type_name,static_cast<unsigned long long>(data[3]));
+            report(line);
+        }
+    }
     if (code == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2) {
         std::snprintf(line, sizeof line, "xone-era:   %s 0x%llX\n",
                       info->ExceptionRecord->ExceptionInformation[0] ? "write to" : "read from",

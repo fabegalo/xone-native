@@ -26,6 +26,8 @@ public:
                    UINT width, UINT height, UINT sample, bool into_msaa) const;
 private:
     UINT samples_ = 0;
+    bool depth_stencil_ = false;
+    std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> stencil_pipelines_;
     std::array<Microsoft::WRL::ComPtr<ID3D12RootSignature>, 2> roots_;
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 2> pipelines_;
 };

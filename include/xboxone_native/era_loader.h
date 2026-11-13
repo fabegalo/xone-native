@@ -11,6 +11,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // In-process GameOS/ERA image loader: the original AMD64 title image is mapped
@@ -34,6 +35,7 @@ struct LoadResult {
     std::vector<ImportRequest> unresolved;
     std::size_t resolved = 0;
 };
+enum class ImageKind { title, module };
 
 class Image {
 public:
@@ -44,11 +46,16 @@ public:
 
     // Maps, relocates, binds and protects the image; registers .pdata unwind data.
     // On failure the image is released and result explains every blocker found.
-    bool load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result);
+    bool load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result,
+              ImageKind kind = ImageKind::title);
     // Runs the title's TLS callbacks for DLL_PROCESS_ATTACH on the calling thread.
     // Static TLS data is bound by load(); thread attach/detach is forwarded by
     // xone-era-tls.dll, which must sit next to the launcher executable.
     void process_attach() const;
+    // Explicit DLL initialization, never called by load/check. Module TLS is
+    // still unsupported; the existing static-TLS slot belongs to the title.
+    bool attach_module();
+    void* find_export(std::string_view name, std::uint16_t ordinal = 0) const;
     void* entry() const { return entry_; }
     std::uint8_t* base() const { return base_; }
     std::size_t size() const { return size_; }
@@ -61,6 +68,11 @@ private:
     void* function_table_ = nullptr;
     void* tls_callbacks_ = nullptr;
     void* tls_unbind_ = nullptr;
+    ImageKind kind_ = ImageKind::title;
+    bool attached_ = false;
+    std::uint32_t export_base_ = 0;
+    std::vector<std::uint32_t> export_rvas_;
+    std::vector<std::pair<std::string, std::uint32_t>> named_exports_;
 };
 
 // kernelx.dll contract. Exports whose console semantics match the same-named
@@ -77,6 +89,11 @@ void set_d3d11x_trap_handler(D3D11XTrapHandler handler);
 // Bind the graphics object ABI from the original package's system module,
 // without loading or executing that DLL. Unknown revisions stay unsupported.
 HRESULT bind_d3d11x_abi(const std::wstring& original_combase);
+// Reviewed original CPU layout helper, pinned to the supplied 6.2.11295 snapshot.
+// Binding maps/verifies it; initialization remains separate so check executes no original code.
+HRESULT bind_xg_module(const std::wstring& original_xg);
+HRESULT initialize_xg_module();
+void* resolve_xg_module(const ImportRequest& request);
 // Redirects a loaded host module's RoGetActivationFactory import (vccorlib110/140)
 // to the title activation boundary, which logs and forwards to the host.
 bool hook_winrt_activation(void* module_base);

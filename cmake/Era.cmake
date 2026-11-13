@@ -47,6 +47,14 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     target_link_options(era_component PRIVATE /NODEFAULTLIB /ENTRY:era_test_entry /SUBSYSTEM:CONSOLE
                         /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO)
 
+    add_library(era_module_component SHARED ${PROJECT_SOURCE_DIR}/tests/era_component.cpp)
+    add_dependencies(era_module_component era_kernelx_imports)
+    target_compile_definitions(era_module_component PRIVATE ERA_MODULE_FIXTURE)
+    target_compile_options(era_module_component PRIVATE /GS- /Zl)
+    target_link_libraries(era_module_component PRIVATE "${era_kernelx_lib}")
+    target_link_options(era_module_component PRIVATE /NODEFAULTLIB /ENTRY:era_test_dll_main
+                        /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO)
+
     add_executable(era_tls_component ${PROJECT_SOURCE_DIR}/tests/era_tls_component.cpp)
     add_dependencies(era_tls_component era_kernelx_imports)
     target_compile_options(era_tls_component PRIVATE /GS- /Zl)
@@ -55,6 +63,7 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
                         /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO /INCLUDE:_tls_used)
 
     add_executable(xboxone_era_loader_tests ${PROJECT_SOURCE_DIR}/tests/era_loader_tests.cpp)
+    add_dependencies(xboxone_era_loader_tests era_module_component)
     target_link_libraries(xboxone_era_loader_tests PRIVATE xboxone_era)
     add_executable(xboxone_era_memory_tests ${PROJECT_SOURCE_DIR}/tests/era_memory_tests.cpp)
     add_executable(xboxone_era_audio_tests ${PROJECT_SOURCE_DIR}/tests/era_audio_tests.cpp)
@@ -67,7 +76,7 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     set_tests_properties(era_memory_hardware PROPERTIES TIMEOUT 15 SKIP_RETURN_CODE 77 LABELS "windows;synthetic;era;hardware")
     set_tests_properties(era_memory_warp PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era;software-gpu")
     add_test(NAME era_loader_regressions COMMAND xboxone_era_loader_tests $<TARGET_FILE:era_component>
-             $<TARGET_FILE:era_tls_component>)
+             $<TARGET_FILE:era_tls_component> $<TARGET_FILE:era_module_component>)
     set_tests_properties(era_loader_regressions PROPERTIES TIMEOUT 20 LABELS "windows;synthetic;era")
     add_test(NAME era_check_cli COMMAND xone-era check $<TARGET_FILE:era_component>)
     set_tests_properties(era_check_cli PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "resolved 2, unresolved 0")

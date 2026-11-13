@@ -148,6 +148,11 @@ int wmain(int argc, wchar_t** argv) {
     // A missing/unknown module leaves revision-specific imports unresolved.
     (void)xboxone::era::bind_d3d11x_abi((title.parent_path().parent_path() /
         L"EmbeddedXvd/Windows/System32/combase.dll").wstring());
+    const HRESULT xg_binding = xboxone::era::bind_xg_module((title.parent_path().parent_path() /
+        L"EmbeddedXvd/Windows/System32/xg_x.dll").wstring());
+    if (FAILED(xg_binding) && xg_binding != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+        xg_binding != HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+        std::fprintf(stderr, "xone-era: original XG binding refused: 0x%08lX\n", xg_binding);
 
     xboxone::era::Image image;
     xboxone::era::LoadResult result;
@@ -191,6 +196,7 @@ int wmain(int argc, wchar_t** argv) {
 
     std::cout << "running title at 0x" << std::hex << title_base << std::dec << " (deadline " << timeout << " ms)\n"
               << std::flush;
+    if (FAILED(xboxone::era::initialize_xg_module())) { report("xone-era: XG module initialization failed\n"); return 1; }
     image.process_attach();
     reinterpret_cast<void (*)()>(image.entry())();
     report("xone-era: title entry returned\n");

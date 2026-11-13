@@ -106,6 +106,21 @@ HRESULT WINAPI era_RoReportUnhandledError(IUnknown* error) {
 } // namespace
 
 void* resolve_host_module(const ImportRequest& request) {
+    // The original XG helper uses only this plain-C CRT/unwind subset.
+    if (same_library(request.library, "msvcrt.dll") || same_library(request.library, "ntdll.dll")) {
+        if (request.name.empty()) return nullptr;
+        bool supported = false;
+        if (same_library(request.library, "msvcrt.dll")) {
+            for (const auto* name : {"memcpy", "memset", "vsprintf_s", "__C_specific_handler", "_initterm",
+                "malloc", "free", "_amsg_exit", "_XcptFilter", "sqrt"}) supported |= request.name == name;
+        } else {
+            for (const auto* name : {"RtlLookupFunctionEntry", "RtlCaptureContext", "RtlVirtualUnwind"}) supported |= request.name == name;
+        }
+        if (!supported) return nullptr;
+        const HMODULE module = LoadLibraryExW(same_library(request.library, "msvcrt.dll") ? L"msvcrt.dll" : L"ntdll.dll",
+            nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return module ? reinterpret_cast<void*>(GetProcAddress(module, request.name.c_str())) : nullptr;
+    }
     if (same_library(request.library, "ws2_32.dll")) return socket_import(request);
     if (same_library(request.library, "bcrypt.dll") && request.name == "BCryptGenRandom") {
         const HMODULE module = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -133,6 +148,7 @@ void* resolve_title_import(const ImportRequest& request) {
     if (void* address = resolve_kernelx(request)) return address;
     if (void* address = resolve_etwplus(request)) return address;
     if (void* address = resolve_d3d11x(request)) return address;
+    if (void* address = resolve_xg_module(request)) return address;
     return resolve_host_module(request);
 }
 

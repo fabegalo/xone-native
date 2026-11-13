@@ -3,6 +3,7 @@
 #include "xboxone_native/era_loader.h"
 #include "../src/era_winrt_classes.h"
 #include "../src/era_winrt_object.h"
+#include "../src/era_memory.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -26,6 +27,7 @@
 #include <thread>
 #include <cstring>
 #include <array>
+#include <algorithm>
 
 namespace {
 int failures = 0;
@@ -71,6 +73,104 @@ std::vector<std::uint8_t> read(const char* path) {
 
 int main(int argc, char** argv) {
     using namespace xboxone::era;
+    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics")) {
+        const bool graphics = std::string(argv[1]) == "--xg-graphics";
+        set_stop_on_missing_activation(true);
+        HRESULT hr = bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
+        if (SUCCEEDED(hr)) hr = bind_xg_module(std::filesystem::path(argv[3]).wstring());
+        if (SUCCEEDED(hr)) hr = initialize_xg_module();
+        TitleTextureLayout layout;
+        if (SUCCEEDED(hr)) hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
+        std::cout << "original XG BC7 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
+        if (FAILED(hr)) return 1;
+        std::vector<std::uint8_t> tiled(layout.bytes + 32, 0x5a);
+        std::array<std::vector<std::uint8_t>, 7> linear;
+        for (UINT mip = 0; mip < 7; ++mip) {
+            const UINT blocks = ((std::max)(1u, 64u >> mip) + 3) / 4;
+            linear[mip].resize(blocks * blocks * 16);
+            for (UINT i = 0; i < linear[mip].size(); ++i) linear[mip][i] = static_cast<std::uint8_t>(mip * 31 + i * 13 + 7);
+            hr = layout.copy(layout.context.get(), true, linear[mip].data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16);
+            check(SUCCEEDED(hr), "original XG tiles an owned BC7 mip");
+        }
+        for (UINT mip = 0; mip < 7; ++mip) {
+            const UINT blocks = ((std::max)(1u, 64u >> mip) + 3) / 4;
+            std::vector<std::uint8_t> actual(linear[mip].size(), 0);
+            hr = layout.copy(layout.context.get(), false, actual.data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16);
+            check(SUCCEEDED(hr) && actual == linear[mip], "original XG roundtrip preserves each owned mip's compressed blocks");
+        }
+        check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
+            std::all_of(tiled.end() - 16, tiled.end(), [](auto x) { return x == 0x5a; }), "original XG copies preserve canonical range guards");
+        check(layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 7, 256, 4096) == E_INVALIDARG &&
+            layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 0, 1, 4096) == E_INVALIDARG,
+            "layout adapter rejects invalid subresources and undersized linear pitches");
+        std::cout << "original XG CPU roundtrip " << (failures ? "FAILED" : "passed") << '\n';
+        if (graphics && !failures) {
+            set_stop_on_missing_activation(false);
+            struct Parameters { UINT version, flags; void* tess; void* factors; UINT affinity, de_ring, ce_ring, de_segment, ce_segment; } parameters{};
+            parameters.version = 0x1000b; parameters.flags = 0x4000000;
+            using CreateDevice = HRESULT (WINAPI*)(const Parameters*, void**, void**);
+            const auto create_device = reinterpret_cast<CreateDevice>(resolve_d3d11x({"d3d11_x.dll", "D3D11XCreateDeviceX", 0}));
+            void* device = nullptr; void* context = nullptr;
+            if (!create_device || FAILED(create_device(&parameters, &device, &context))) return 1;
+            const auto vt = [](void* object) { return *static_cast<void***>(object); };
+            using Count = ULONG (STDMETHODCALLTYPE*)(void*);
+            using Allocate = void* (WINAPI*)(SIZE_T, UINT64);
+            using Free = void (WINAPI*)(void*, UINT64);
+            const auto allocate = reinterpret_cast<Allocate>(resolve_kernelx({"kernelx.dll", "XMemAllocDefault", 0}));
+            const auto free_memory = reinterpret_cast<Free>(resolve_kernelx({"kernelx.dll", "XMemFreeDefault", 0}));
+            constexpr UINT64 attributes = 0x64804000;
+            void* root = allocate(layout.bytes + layout.alignment, attributes);
+            if (!root) return 1;
+            const auto aligned = (reinterpret_cast<std::uintptr_t>(root) + layout.alignment - 1) & ~(layout.alignment - 1);
+            void* canonical = reinterpret_cast<void*>(aligned);
+            struct Desc { D3D11_TEXTURE2D_DESC standard{}; UINT extension[2]{}; } desc;
+            desc.standard = {64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+            using CreateTexture = HRESULT (STDMETHODCALLTYPE*)(void*, const Desc*, UINT, UINT, void*, void**);
+            void* texture = nullptr;
+            hr = reinterpret_cast<CreateTexture>(vt(device)[64])(device, &desc, 14, 0, canonical, &texture);
+            check(hr == S_OK && texture, "placed texture factory binds original XG storage");
+            if (texture) {
+                using GetDesc = void (STDMETHODCALLTYPE*)(void*, Desc*);
+                struct { Desc desc{}; UINT guard = 0xaabbccdd; } actual;
+                reinterpret_cast<GetDesc>(vt(texture)[12])(texture, &actual.desc);
+                check(actual.desc.standard.MipLevels == 7 && actual.desc.standard.Format == desc.standard.Format &&
+                    actual.guard == 0xaabbccdd, "native texture GetDesc preserves descriptor and fifty-two-byte extent");
+                using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
+                const auto create_srv = reinterpret_cast<CreateSrv>(vt(device)[7]);
+                void* view = nullptr;
+                D3D11_SHADER_RESOURCE_VIEW_DESC partial{};
+                partial.Format = desc.standard.Format; partial.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                partial.Texture2D = {1, 6};
+                check(create_srv(device, texture, &partial, &view) == DXGI_ERROR_UNSUPPORTED && !view,
+                      "untranslated partial texture views remain explicit");
+                check(create_srv(device, texture, nullptr, nullptr) == S_FALSE, "default texture view validates without ownership changes");
+                check(create_srv(device, texture, nullptr, &view) == S_OK && view, "default texture SRV owns a native descriptor");
+                if (view) {
+                    std::array<UINT32, 8> srd{};
+                    std::memcpy(srd.data(), static_cast<char*>(view) + 48, sizeof srd);
+                    check(srd[0] == (aligned >> 8) && ((srd[3] >> 12) & 15) == 0 && ((srd[3] >> 16) & 15) == 6,
+                          "guest texture SRV preserves placement address and complete mip range");
+                    using GetSrvDesc = void (STDMETHODCALLTYPE*)(void*, D3D11_SHADER_RESOURCE_VIEW_DESC*);
+                    struct { D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; UINT guard = 0xaabbccdd; } view_desc;
+                    reinterpret_cast<GetSrvDesc>(vt(view)[9])(view, &view_desc.desc);
+                    check(view_desc.desc.Format == desc.standard.Format && view_desc.desc.Texture2D.MipLevels == 7 &&
+                        view_desc.guard == 0xaabbccdd, "texture view GetDesc returns the effective range and output extent");
+                    check(reinterpret_cast<Count>(vt(texture)[2])(texture) == 1, "view retains texture after its caller releases it");
+                    texture = nullptr;
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            MEMORY_BASIC_INFORMATION memory{};
+            VirtualQuery(root, &memory, sizeof memory);
+            check(memory.State == MEM_COMMIT, "placed texture release preserves borrowed canonical storage");
+            free_memory(root, attributes);
+            reinterpret_cast<Count>(vt(context)[2])(context);
+            reinterpret_cast<Count>(vt(device)[2])(device);
+            std::cout << "original XG graphics metadata " << (failures ? "FAILED" : "passed") << '\n';
+        }
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--missing-slot") {
         set_stop_on_missing_activation(true);
         const auto vt = winrt_vtable();
@@ -88,7 +188,7 @@ int main(int argc, char** argv) {
         get_title_activation_factory(name, __uuidof(IActivationFactory), &factory);
         return 1; // The diagnostic must terminate before returning here.
     }
-    if (argc != 3) { std::cerr << "usage: era_loader_tests <era_component.exe> <era_tls_component.exe>\n"; return 2; }
+    if (argc != 3 && argc != 4) { std::cerr << "usage: era_loader_tests <era_component.exe> <era_tls_component.exe> [era_module_component.dll]\n"; return 2; }
     {
         using Allocate = void* (WINAPI*)(SIZE_T, ULONGLONG);
         using Release = void (WINAPI*)(void*, ULONGLONG);
@@ -193,6 +293,23 @@ int main(int argc, char** argv) {
     }
     const auto file = read(argv[1]);
     check(file.size() > 512, "fixture readable");
+    check(bind_xg_module(std::filesystem::path(argv[1]).wstring()) == HRESULT_FROM_WIN32(ERROR_CRC),
+          "unregistered XG snapshot is refused before mapping or execution");
+    check(initialize_xg_module() == S_FALSE && !resolve_xg_module({"xg_x.dll", "XGComputeTexture2DLayout", 0}),
+          "unbound original XG has no fabricated exports or initialization");
+    {
+        for (const auto& item : {std::pair{"msvcrt.dll", L"msvcrt.dll"}, std::pair{"ntdll.dll", L"ntdll.dll"}}) {
+            const HMODULE host = LoadLibraryExW(item.second, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            const auto* symbol = same_library(item.first, "msvcrt.dll") ? "sqrt" : "RtlCaptureContext";
+            check(host && resolve_host_module({item.first, symbol, 0}) == reinterpret_cast<void*>(GetProcAddress(host, symbol)),
+                  "XG dependencies bind the audited named System32 function");
+            check(!resolve_host_module({item.first, "unreviewed_export", 0}) && !resolve_host_module({item.first, {}, 1}),
+                  "XG dependency support does not expose arbitrary names or ordinals");
+            if (host) FreeLibrary(host);
+        }
+        const auto root = reinterpret_cast<double (*)(double)>(resolve_host_module({"msvcrt.dll", "sqrt", 0}));
+        check(root && root(81.0) == 9.0, "plain-C CRT math dependency executes with the expected ABI");
+    }
 
     {
         Image image;
@@ -207,6 +324,48 @@ int main(int argc, char** argv) {
               "GetModuleHandleW(NULL) names the title image, not the launcher");
         check(module_handle && module_handle(L"kernel32.dll") == GetModuleHandleW(L"kernel32.dll"),
               "named GetModuleHandleW stays a host lookup");
+        if (argc >= 4) {
+            const auto module_file = read(argv[3]);
+            LoadResult module_result;
+            ULONG detached = 0;
+            {
+                Image module;
+                check(!module.load(module_file, resolve_kernelx, module_result), "DLL is still refused as a title entry");
+                check(!module.load(file, resolve_kernelx, module_result, ImageKind::module), "module route requires a DLL");
+                check(module.load(module_file, resolve_kernelx, module_result, ImageKind::module), "owned DLL maps through the same loader");
+                for (const auto& error : module_result.errors) std::cerr << "  module: " << error << '\n';
+                const auto exported = reinterpret_cast<unsigned long long (*)()>(module.find_export("era_test_module_export"));
+                const auto receipt = reinterpret_cast<void (*)(ULONG*)>(module.find_export("era_test_module_receipt"));
+                check(exported && receipt, "validated module exports resolve by name");
+                check(!module.find_export("unknown_export") && !module.find_export({}, 65000), "unknown names/ordinals stay unresolved");
+                bool ordinal_matches = false;
+                for (WORD ordinal = 1; ordinal <= 4; ++ordinal) ordinal_matches |= module.find_export({}, ordinal) == reinterpret_cast<void*>(exported);
+                check(exported && ordinal_matches, "module ordinal resolves the same actual export");
+                if (exported && receipt) {
+                    check(exported() == GetCurrentProcessId(), "mapping did not execute DLL initialization");
+                    check(module.attach_module() && module.attach_module(), "module attach is explicit and idempotent");
+                    check(exported() == (1ull << 32 | GetCurrentProcessId()), "DLL initialization ran once and used audited kernel imports");
+                    receipt(&detached);
+                }
+                check(module_handle && module_handle(nullptr) == reinterpret_cast<HMODULE>(image.base()), "helper loading preserves the title's module identity");
+            }
+            check(detached == 1, "module detach runs once before unmapping");
+            check(module_handle && module_handle(nullptr) == reinterpret_cast<HMODULE>(image.base()), "helper destruction does not clear title identity");
+            auto malformed = module_file;
+            if (malformed.size() > sizeof(IMAGE_DOS_HEADER)) {
+                const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(malformed.data());
+                auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(malformed.data() + dos->e_lfanew);
+                nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT] = {nt->OptionalHeader.SizeOfImage - 8, 64};
+                Image rejected;
+                check(!rejected.load(malformed, resolve_kernelx, module_result, ImageKind::module) && !rejected.base(),
+                      "module with export tables outside the image cannot publish a mapping");
+                auto tls_module = read(argv[2]);
+                const auto tls_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(tls_module.data());
+                reinterpret_cast<IMAGE_NT_HEADERS64*>(tls_module.data() + tls_dos->e_lfanew)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
+                check(!rejected.load(tls_module, resolve_kernelx, module_result, ImageKind::module), "module TLS cannot reuse the title's single static slot");
+                check(module_handle && module_handle(nullptr) == reinterpret_cast<HMODULE>(image.base()), "failed module validation preserves title identity");
+            }
+        }
         if (image.entry()) {
             MEMORY_BASIC_INFORMATION info{};
             VirtualQuery(image.entry(), &info, sizeof info);
@@ -669,6 +828,29 @@ int main(int argc, char** argv) {
                             check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &result.mapped) == S_OK,
                                   "completed dynamic buffer can be mapped again");
                             if (result.mapped.pData) unmap(context, buffer, 0);
+                        }
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                    }
+                    desc.standard = {1332, D3D11_USAGE_DYNAMIC, D3D11_BIND_SHADER_RESOURCE,
+                        D3D11_CPU_ACCESS_WRITE, D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, 36};
+                    check(factory(device, &desc, nullptr, &buffer) == S_OK && buffer,
+                          "observed dynamic structured buffer retains its Xbox CPU-write contract");
+                    if (buffer) {
+                        using Map = HRESULT (STDMETHODCALLTYPE*)(void*, void*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+                        using Unmap = void (STDMETHODCALLTYPE*)(void*, void*, UINT);
+                        const auto map = reinterpret_cast<Map>(vt(context)[15]);
+                        D3D11_MAPPED_SUBRESOURCE mapped{};
+                        check(map(context, buffer, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped) == DXGI_ERROR_UNSUPPORTED && !mapped.pData,
+                              "structured SRV no-overwrite remains unsupported");
+                        check(map(context, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) == S_OK && mapped.pData && mapped.RowPitch == 1332,
+                              "dynamic structured map exposes the complete canonical span");
+                        if (mapped.pData) {
+                            static_cast<unsigned char*>(mapped.pData)[1331] = 0xa7;
+                            reinterpret_cast<Unmap>(vt(context)[16])(context, buffer, 0);
+                            void* allocation = nullptr;
+                            std::memcpy(&allocation, static_cast<char*>(buffer) + 48, sizeof allocation);
+                            check(allocation == mapped.pData && static_cast<unsigned char*>(allocation)[1331] == 0xa7,
+                                  "structured writes preserve shared memory identity");
                         }
                         reinterpret_cast<Count>(vt(buffer)[2])(buffer);
                     }

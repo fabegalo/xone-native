@@ -7,6 +7,7 @@
 #include "era_tls_slot.h"
 
 #include <cstring>
+#include <algorithm>
 #include <string>
 
 namespace xboxone::era {
@@ -42,18 +43,43 @@ void Image::process_attach() const {
     for (auto* cb = static_cast<PIMAGE_TLS_CALLBACK*>(tls_callbacks_); cb && *cb; ++cb)
         (*cb)(base_, DLL_PROCESS_ATTACH, nullptr);
 }
+bool Image::attach_module() {
+    if (!base_ || kind_ != ImageKind::module) return false;
+    if (attached_) return true;
+    using DllEntry = BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID);
+    if (entry_ && !reinterpret_cast<DllEntry>(entry_)(reinterpret_cast<HINSTANCE>(base_), DLL_PROCESS_ATTACH, nullptr)) return false;
+    attached_ = true;
+    return true;
+}
+
+void* Image::find_export(std::string_view name, std::uint16_t ordinal) const {
+    if (!base_) return nullptr;
+    DWORD rva = 0;
+    if (name.empty()) {
+        if (ordinal < export_base_ || ordinal - export_base_ >= export_rvas_.size()) return nullptr;
+        rva = export_rvas_[ordinal - export_base_];
+    } else {
+        for (const auto& item : named_exports_) if (item.first == name) { rva = item.second; break; }
+    }
+    return rva ? base_ + rva : nullptr;
+}
 
 void Image::release() {
+    if (attached_ && entry_)
+        reinterpret_cast<BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID)>(entry_)(reinterpret_cast<HINSTANCE>(base_), DLL_PROCESS_DETACH, nullptr);
+    attached_ = false;
     if (tls_unbind_) reinterpret_cast<EraTlsUnbind>(tls_unbind_)();
     tls_unbind_ = nullptr; tls_callbacks_ = nullptr;
     if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));
-    if (base_) { set_title_module(nullptr); VirtualFree(base_, 0, MEM_RELEASE); }
+    if (base_) { if (kind_ == ImageKind::title) set_title_module(nullptr); VirtualFree(base_, 0, MEM_RELEASE); }
     base_ = nullptr; size_ = 0; entry_ = nullptr; function_table_ = nullptr;
+    export_rvas_.clear(); named_exports_.clear(); export_base_ = 0;
 }
 
-bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result) {
+bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver, LoadResult& result, ImageKind kind) {
     result = {};
     release();
+    kind_ = kind;
     const auto fail = [&](std::string error) { result.errors.push_back(std::move(error)); release(); return false; };
 
     if (file.size() < sizeof(IMAGE_DOS_HEADER)) return fail("truncated DOS header");
@@ -68,7 +94,9 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
     if (nt.Signature != IMAGE_NT_SIGNATURE || nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
         opt.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
         return fail("not a PE32+ AMD64 image");
-    if (nt.FileHeader.Characteristics & IMAGE_FILE_DLL) return fail("DLL images are not title entry images");
+    const bool dll = (nt.FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+    if (dll != (kind == ImageKind::module))
+        return fail(dll ? "DLL images are not title entry images" : "module binding requires a DLL image");
     if (opt.SizeOfImage == 0 || opt.SizeOfImage > max_image || opt.SizeOfHeaders > opt.SizeOfImage ||
         opt.SizeOfHeaders > file.size() || opt.NumberOfRvaAndSizes < IMAGE_DIRECTORY_ENTRY_TLS + 1)
         return fail("invalid image or header size");
@@ -82,6 +110,8 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
         return fail("delay-load imports not implemented");
     if (dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
         return fail("CLR images not supported");
+    if (kind == ImageKind::module && dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
+        return fail("module static TLS is not implemented");
 
     size_ = opt.SizeOfImage;
     base_ = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -168,6 +198,48 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
     if (!result.unresolved.empty())
         return fail(std::to_string(result.unresolved.size()) + " import(s) have no host implementation");
 
+    // Retain validated export metadata before applying section protections.
+    if (kind == ImageKind::module) {
+        if (!dir(IMAGE_DIRECTORY_ENTRY_EXPORT, rva, bytes)) return fail("export directory outside image");
+    } else { rva = 0; bytes = 0; }
+    if (rva) {
+        if (bytes < sizeof(IMAGE_EXPORT_DIRECTORY)) return fail("truncated export directory");
+        IMAGE_EXPORT_DIRECTORY exports;
+        std::memcpy(&exports, base_ + rva, sizeof exports);
+        if (exports.NumberOfFunctions > max_imports || exports.NumberOfNames > max_imports || exports.Base > 65535 ||
+            (exports.NumberOfFunctions && !exports.AddressOfFunctions) ||
+            (exports.NumberOfNames && (!exports.AddressOfNames || !exports.AddressOfNameOrdinals)) ||
+            (exports.NumberOfFunctions && exports.NumberOfFunctions - 1 > 65535 - exports.Base) ||
+            !within<DWORD>(exports.AddressOfFunctions, exports.NumberOfFunctions, size_) ||
+            !within<DWORD>(exports.AddressOfNames, exports.NumberOfNames, size_) ||
+            !within<WORD>(exports.AddressOfNameOrdinals, exports.NumberOfNames, size_)) return fail("invalid export tables");
+        export_base_ = exports.Base;
+        export_rvas_.resize(exports.NumberOfFunctions);
+        if (exports.NumberOfFunctions) std::memcpy(export_rvas_.data(), base_ + exports.AddressOfFunctions, exports.NumberOfFunctions * sizeof(DWORD));
+        for (const auto target : export_rvas_) {
+            if (!target) continue;
+            if (target >= rva && target - rva < bytes) return fail("forwarded exports are not implemented");
+            bool accessible = false;
+            for (const auto& section : sections) {
+                const auto span = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
+                if (target >= section.VirtualAddress && target - section.VirtualAddress < span &&
+                    (section.Characteristics & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_EXECUTE))) accessible = true;
+            }
+            if (!accessible) return fail("export target outside accessible sections");
+        }
+        std::size_t name_bytes = 0;
+        for (DWORD i = 0; i < exports.NumberOfNames; ++i) {
+            DWORD name_rva; WORD index;
+            std::memcpy(&name_rva, base_ + exports.AddressOfNames + i * sizeof(DWORD), sizeof name_rva);
+            std::memcpy(&index, base_ + exports.AddressOfNameOrdinals + i * sizeof(WORD), sizeof index);
+            if (!name_rva || name_rva >= size_ || index >= export_rvas_.size()) return fail("invalid export name/ordinal");
+            const char* name = reinterpret_cast<const char*>(base_ + name_rva);
+            const char* end = static_cast<const char*>(std::memchr(name, 0, (std::min)(size_ - name_rva, std::size_t{4096})));
+            if (!end || end == name || (name_bytes += static_cast<std::size_t>(end - name)) > (1u << 20)) return fail("invalid or oversized export names");
+            named_exports_.emplace_back(std::string(name, end), export_rvas_[index]);
+        }
+    }
+
     // Unwind data is required for exceptions, stack walks and C++ EH in title code.
     if (!dir(IMAGE_DIRECTORY_ENTRY_EXCEPTION, rva, bytes)) return fail("exception directory outside image");
     if (rva && bytes >= sizeof(RUNTIME_FUNCTION)) {
@@ -230,7 +302,7 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
     FlushInstructionCache(GetCurrentProcess(), base_, size_);
     if (opt.AddressOfEntryPoint >= size_) return fail("entry point outside image");
     entry_ = opt.AddressOfEntryPoint ? base_ + opt.AddressOfEntryPoint : nullptr;
-    set_title_module(base_);
+    if (kind == ImageKind::title) set_title_module(base_);
     return true;
 }
 

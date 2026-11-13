@@ -106,13 +106,16 @@ HRESULT WINAPI era_RoReportUnhandledError(IUnknown* error) {
 } // namespace
 
 void* resolve_host_module(const ImportRequest& request) {
-    // The original XG helper uses only this plain-C CRT/unwind subset.
+    // Audited imports of the pinned original XG helpers; named MSVC ABI exports
+    // are resolved from the same host CRT, never from console export ordinals.
     if (same_library(request.library, "msvcrt.dll") || same_library(request.library, "ntdll.dll")) {
         if (request.name.empty()) return nullptr;
         bool supported = false;
         if (same_library(request.library, "msvcrt.dll")) {
             for (const auto* name : {"memcpy", "memset", "vsprintf_s", "__C_specific_handler", "_initterm",
-                "malloc", "free", "_amsg_exit", "_XcptFilter", "sqrt"}) supported |= request.name == name;
+                "malloc", "free", "_amsg_exit", "_XcptFilter", "sqrt", "printf", "sprintf", "_purecall",
+                "__CxxFrameHandler3", "_CxxThrowException", "??1type_info@@UEAA@XZ", "?what@exception@@UEBAPEBDXZ",
+                "??1exception@@UEAA@XZ", "??0exception@@QEAA@AEBV0@@Z", "??0exception@@QEAA@AEBQEBD@Z"}) supported |= request.name == name;
         } else {
             for (const auto* name : {"RtlLookupFunctionEntry", "RtlCaptureContext", "RtlVirtualUnwind"}) supported |= request.name == name;
         }

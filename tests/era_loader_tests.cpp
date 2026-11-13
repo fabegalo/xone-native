@@ -478,6 +478,12 @@ int main(int argc, char** argv) {
             const auto* symbol = same_library(item.first, "msvcrt.dll") ? "sqrt" : "RtlCaptureContext";
             check(host && resolve_host_module({item.first, symbol, 0}) == reinterpret_cast<void*>(GetProcAddress(host, symbol)),
                   "XG dependencies bind the audited named System32 function");
+            if (same_library(item.first,"msvcrt.dll"))
+                for (const char* name : {"printf","sprintf","_purecall","__CxxFrameHandler3","_CxxThrowException",
+                    "??1type_info@@UEAA@XZ","?what@exception@@UEBAPEBDXZ","??1exception@@UEAA@XZ",
+                    "??0exception@@QEAA@AEBV0@@Z","??0exception@@QEAA@AEBQEBD@Z"})
+                    check(host && GetProcAddress(host,name) && resolve_host_module({item.first,name,0}) == reinterpret_cast<void*>(GetProcAddress(host,name)),
+                        "2018 XG CRT dependencies retain the exact host named ABI");
             check(!resolve_host_module({item.first, "unreviewed_export", 0}) && !resolve_host_module({item.first, {}, 1}),
                   "XG dependency support does not expose arbitrary names or ordinals");
             if (host) FreeLibrary(host);

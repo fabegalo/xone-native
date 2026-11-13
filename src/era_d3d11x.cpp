@@ -258,6 +258,8 @@ std::atomic<bool> legacy_abi_bound{false};
 std::atomic<bool> modern_display_abi_bound{false};
 std::atomic<std::shared_ptr<Image>> xg_module;
 std::atomic<bool> xg_initialized{false};
+std::atomic<bool> xg_modern{false};
+std::string xg_identity;
 std::mutex xg_module_mutex;
 std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
 
@@ -1204,7 +1206,7 @@ HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const Titl
     if (!out) return S_FALSE;
     try {
         auto texture = std::make_unique<Texture>();
-        texture->vtable = texture_vtable().data(); texture->flags = 1; texture->refcount = 0;
+        texture->vtable = texture_vtable().data(); texture->flags = self->legacy ? 1 : 0; texture->refcount = self->legacy ? 0 : 1;
         texture->device = self; texture->desc = desc; texture->desc.standard.MipLevels = layout.resource_desc.MipLevels;
         texture->creation_misc_flags = desc.standard.MiscFlags;
         texture->desc.standard.MiscFlags &= ~legacy_expanded_auxiliary;
@@ -1420,7 +1422,7 @@ HRESULT STDMETHODCALLTYPE device_create_rtv(Device* self, GraphicsObject* resour
     if (!out) return S_FALSE;
     try {
         auto view = std::make_unique<BufferView>();
-        view->vtable = rtv_vtable().data(); view->flags = 1; view->refcount = 0;
+        view->vtable = rtv_vtable().data(); view->flags = self->legacy ? 1 : 0; view->refcount = self->legacy ? 0 : 1;
         view->device = self; view->view_type = 0;
         view->rtv_desc.Format = desc.Format; view->rtv_desc.ViewDimension = desc.ViewDimension;
         if (!multisample) view->rtv_desc.Texture2D = desc.Texture2D;
@@ -2031,6 +2033,7 @@ const std::array<const void*, vtable_slots>& swapchain_vtable() {
         t[0] = reinterpret_cast<const void*>(&swapchain_query);
         t[1] = reinterpret_cast<const void*>(&dxgi_add_ref);
         t[2] = reinterpret_cast<const void*>(&dxgi_release);
+        t[9] = reinterpret_cast<const void*>(&swapchain_get_buffer);
         return t;
     }();
     return table;
@@ -2158,6 +2161,7 @@ const std::array<const void*, vtable_slots>& device_vtable() {
         t[0] = reinterpret_cast<const void*>(&device_query);
         t[1] = reinterpret_cast<const void*>(&device_add_ref);
         t[2] = reinterpret_cast<const void*>(&device_release);
+        t[9] = reinterpret_cast<const void*>(&device_create_rtv);
         t[85] = reinterpret_cast<const void*>(&device_set_gpu_memory_priority);
         return t;
     }();
@@ -2497,10 +2501,12 @@ HRESULT bind_xg_module(const std::wstring& original_xg) {
         if (read != bytes.size()) return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
         detail::Sha256 hash;
         hash.update(bytes);
-        if (hash.finish() != "9e3a06d02784699c252bea271090b9e2a04ef2cb29b5b0647c6ce6e73b19db67")
+        const auto identity = hash.finish();
+        const bool modern = identity == "044dbeedef84002976166ae964439159ed83a0b31feb6d185bee4f37af0d92bc";
+        if (!modern && identity != "9e3a06d02784699c252bea271090b9e2a04ef2cb29b5b0647c6ce6e73b19db67")
             return HRESULT_FROM_WIN32(ERROR_CRC);
-        if (!legacy_abi_bound) return DXGI_ERROR_UNSUPPORTED;
-        if (xg_module.load()) return S_FALSE;
+        if (modern ? !modern_display_abi_bound : !legacy_abi_bound) return DXGI_ERROR_UNSUPPORTED;
+        if (xg_module.load()) return xg_identity == identity ? S_FALSE : DXGI_ERROR_INVALID_CALL;
         auto module = std::make_shared<Image>();
         LoadResult result;
         if (!module->load(bytes, resolve_title_import, result, ImageKind::module)) {
@@ -2511,6 +2517,7 @@ HRESULT bind_xg_module(const std::wstring& original_xg) {
         }
         for (const auto* name : {"XGCreateTexture2DComputer", "XGComputeTexture2DLayout", "XGComputeOptimalTileMode"})
             if (!module->find_export(name)) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+        xg_identity = identity; xg_modern = modern;
         xg_module.store(std::move(module));
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -2522,7 +2529,7 @@ HRESULT initialize_xg_module() {
     if (!module) return S_FALSE;
     if (!module->attach_module()) return HRESULT_FROM_WIN32(ERROR_DLL_INIT_FAILED);
     xg_initialized = true;
-    std::fputs("xone-era: original XG 6.2.11295.0 CPU layout module initialized (pinned SHA-256)\n", stderr);
+    std::fprintf(stderr,"xone-era: original XG %s CPU layout module initialized (pinned SHA-256)\n",xg_modern ? "10.0.16299.5104" : "6.2.11295.0");
     return S_OK;
 }
 
@@ -2544,6 +2551,7 @@ struct XgTextureContext {
     void* computer = nullptr;
     UINT width = 0, height = 0, mips = 0, arrays = 0, block = 0, bytes_per_block = 0, samples = 1;
     SIZE_T bytes = 0;
+    bool modern = false;
     ~XgTextureContext() {
         if (computer) reinterpret_cast<ULONG (*)(void*)>((*static_cast<void***>(computer))[1])(computer);
     }
@@ -2561,7 +2569,7 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
         // Original CopyInto/FromSubresource at 2b40/2fa0 hardcodes sample 0.
         // Slot 4 (2a70) accepts the sample index and returns its exact byte offset.
         using Address = UINT64 (*)(void*, UINT, UINT, UINT64, UINT, UINT, UINT);
-        const auto address = reinterpret_cast<Address>((*static_cast<void***>(context->computer))[4]);
+        const auto address = reinterpret_cast<Address>((*static_cast<void***>(context->computer))[context->modern ? 6 : 4]);
         for (UINT y = 0; y < height; ++y) for (UINT x = 0; x < width; ++x) for (UINT sample = 0; sample < context->samples; ++sample) {
             const UINT64 offset = address(context->computer, 0, mip, x, y, subresource / context->mips, sample);
             if (offset > context->bytes || context->bytes - offset < context->bytes_per_block) return E_INVALIDARG;
@@ -2574,7 +2582,7 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
     // Slots 5/6 at 180002b40/180002fa0: tiled destination / linear destination.
     using Copy = HRESULT (*)(void*, void*, UINT, UINT, const void*, UINT, UINT);
     const auto functions = *static_cast<void***>(context->computer);
-    const auto copy = reinterpret_cast<Copy>(functions[into_tiled ? 5 : 6]);
+    const auto copy = reinterpret_cast<Copy>(functions[context->modern ? (into_tiled ? 8 : 9) : (into_tiled ? 5 : 6)]);
     return copy(context->computer, into_tiled ? tiled : linear, 0, subresource,
                 into_tiled ? linear : tiled, row_pitch, slice_pitch);
 }
@@ -2594,11 +2602,14 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
     const bool bc7 = format == DXGI_FORMAT_BC7_TYPELESS || format == DXGI_FORMAT_BC7_UNORM || format == DXGI_FORMAT_BC7_UNORM_SRGB;
     if ((!bc7 && format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
          format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
+         format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB &&
          format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
         ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
     if (samples > 1 && format == DXGI_FORMAT_R8_UINT) return DXGI_ERROR_UNSUPPORTED;
     try {
         auto context = std::make_shared<XgTextureContext>();
+        context->modern = xg_modern;
+        if (context->modern && depth) return DXGI_ERROR_UNSUPPORTED; // The volume ABI is separately revision-bound.
         context->module = module; context->width = width; context->height = height;
         context->mips = mips; context->arrays = arrays; context->block = bc7 ? 4 : 1; context->bytes_per_block = bc7 ? 16 : 4;
         if (format == DXGI_FORMAT_R8_UINT) context->bytes_per_block = 1;
@@ -2634,16 +2645,19 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         HRESULT hr = create(desc.data(), &context->computer);
         if (FAILED(hr)) return hr;
         if (!context->computer) return E_UNEXPECTED;
-        struct { alignas(16) std::array<std::uint8_t, 0xd40> bytes{}; UINT64 guard = 0xaabbccdd11223344ull; } layout;
+        const SIZE_T layout_bytes = context->modern ? 0x1740 : 0xd40;
+        std::vector<std::uint8_t> layout_storage(layout_bytes + 16,0x5a);
+        auto* layout = layout_storage.data();
         using GetLayout = HRESULT (*)(void*, void*);
         const auto get_layout = reinterpret_cast<GetLayout>((*static_cast<void***>(context->computer))[2]);
-        hr = get_layout(context->computer, layout.bytes.data());
+        hr = get_layout(context->computer, layout);
         if (FAILED(hr)) return hr;
-        if (layout.guard != 0xaabbccdd11223344ull) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (!std::all_of(layout_storage.begin()+layout_bytes,layout_storage.end(),[](auto byte){return byte==0x5a;}))
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         UINT64 bytes = 0, alignment = 0;
         UINT mip_count = 0, plane_count = 0;
-        std::memcpy(&bytes, layout.bytes.data(), 8); std::memcpy(&alignment, layout.bytes.data() + 8, 8);
-        std::memcpy(&mip_count, layout.bytes.data() + 16, 4); std::memcpy(&plane_count, layout.bytes.data() + 20, 4);
+        std::memcpy(&bytes, layout, 8); std::memcpy(&alignment, layout + 8, 8);
+        std::memcpy(&mip_count, layout + 16, 4); std::memcpy(&plane_count, layout + 20, 4);
         if (!bytes || bytes > (1ull << 30) || !alignment || alignment > (1u << 21) || (alignment & (alignment - 1)) ||
             mip_count != mips || plane_count != 1) {
             if (stop_on_missing_service()) std::fprintf(stderr, "xone-era: unsupported XG layout header size %llu alignment %llu mips %u planes %u\n",

@@ -55,7 +55,8 @@ HRESULT linear_sample_copy(void*, bool into, void* linear, void* canonical, UINT
 }
 int main(int argc, char** argv) {
     const bool warp = argc >= 2 && std::strcmp(argv[1], "warp") == 0;
-    const bool original_xg = argc == 4;
+    const bool bgra_only = argc == 5 && std::strcmp(argv[4],"--bgra") == 0;
+    const bool original_xg = argc == 4 || bgra_only;
     if (original_xg) {
         HRESULT hr = bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
         if (SUCCEEDED(hr)) hr = bind_xg_module(std::filesystem::path(argv[3]).wstring());
@@ -584,8 +585,9 @@ int main(int argc, char** argv) {
             view.Format = d.Format; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D; view.Texture2D.MipSlice = mutation_mip;
             device->CreateRenderTargetView(texture.resource, &view, render_heap->GetCPUDescriptorHandleForHeapStart());
             constexpr UINT packed = 0xa7a7a7a7;
-            const float color[]{float(packed & 1023) / 1023, float((packed >> 10) & 1023) / 1023,
+            float color[]{float(packed & 1023) / 1023, float((packed >> 10) & 1023) / 1023,
                 float((packed >> 20) & 1023) / 1023, float(packed >> 30) / 3};
+            if (d.Format == DXGI_FORMAT_B8G8R8A8_UNORM) std::fill(std::begin(color),std::end(color),167.f/255.f);
             list->ClearRenderTargetView(render_heap->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
         } else list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         std::fill(expected[mutation_mip].begin(), expected[mutation_mip].end(), 0xa7);
@@ -658,7 +660,13 @@ int main(int argc, char** argv) {
     linear_layout.resource_desc.DepthOrArraySize = 1; linear_layout.resource_desc.MipLevels = 3;
     linear_layout.resource_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; linear_layout.resource_desc.SampleDesc.Count = 1;
     check(texture_fixture(linear_layout, 1, 4, 7, linear_context.get()), "owned linear texture fixture completes");
-    if (original_xg) {
+    if (original_xg && bgra_only) {
+        TitleTextureLayout layout;
+        hr = create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_B8G8R8A8_UNORM,UINT_MAX,layout,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,4,9,nullptr),
+            "original 2018 XG BGRA backbuffer layout preserves independent GPU clears, canonical guards and CPU reuse");
+    } else if (original_xg) {
         TitleTextureLayout layout;
         hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 4, 16, 9, nullptr), "original XG BC7 texture completes the real GPU coherence path");
@@ -743,7 +751,7 @@ int main(int argc, char** argv) {
     sample_layout.resource_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT; sample_layout.resource_desc.SampleDesc.Count = 4;
     sample_layout.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     check(sample_fixture(sample_layout, 20), "owned four-sample texture completes GPU coherence");
-    if (original_xg) {
+    if (original_xg && !bgra_only) {
         hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, sample_layout,
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 4);
         check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout), 30), "original XG MSAA layout completes per-sample GPU coherence");

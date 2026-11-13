@@ -136,8 +136,8 @@ struct alignas(64) Context : GraphicsObject {
     std::array<Shader*,3> shaders{}; // PS, VS, GS.
     InputLayout* input_layout = nullptr;
     std::array<Sampler*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> pixel_samplers{};
-    std::array<BufferView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> pixel_resources{};
-    std::array<std::array<Buffer*,D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>,2> constants{}; // PS, VS.
+    std::array<std::array<BufferView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,6> shader_resources{}; // VS, HS, DS, GS, PS, CS.
+    std::array<std::array<Buffer*,D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>,4> constants{}; // PS, VS, GS, CS.
     std::array<Buffer*,D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers{};
     std::array<UINT,D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_strides{},vertex_offsets{};
     Buffer* index_buffer = nullptr;
@@ -358,6 +358,15 @@ void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
 template <unsigned K, unsigned Slot>
 std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std::uintptr_t c = 0, std::uintptr_t d = 0) {
     if (auto handler = trap_handler.load()) return handler(kind_names[K], Slot);
+    if constexpr (K == kind_context && Slot == 209) {
+        std::fprintf(stderr,"xone-era: resource batch caller %p begin 0x%llX end 0x%llX\n",_ReturnAddress(),
+            static_cast<unsigned long long>(a),static_cast<unsigned long long>(b));
+        std::array<UINT32,64> words{}; SIZE_T read=0;
+        const SIZE_T bytes=b>a ? (std::min)(SIZE_T(b-a),sizeof words) : 0;
+        if(bytes && ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(a),words.data(),bytes,&read) && read==bytes)
+            for(SIZE_T i=0;i<bytes/4;++i) std::fprintf(stderr,"xone-era: resource batch DWORD %llu = 0x%08X\n",
+                static_cast<unsigned long long>(i),words[i]);
+    }
     if (stop_on_missing_service()) {
         // Keep the first fatal GPU diagnostic intact when worker threads hit
         // missing methods together. The reporting thread terminates this process.
@@ -2642,7 +2651,7 @@ void clear_context_bindings(Context* self) {
     for (auto*& shader:self->shaders) { if (shader) shader_release(shader); shader=nullptr; }
     if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr;
     for (auto*& sampler:self->pixel_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
-    for (auto*& view:self->pixel_resources) { if (view) view_release(view); view=nullptr; }
+    for (auto& stage:self->shader_resources) for (auto*& view:stage) { if (view) view_release(view); view=nullptr; }
     for (auto& stage:self->constants) for (auto*& buffer:stage) { if (buffer) buffer_release(buffer); buffer=nullptr; }
     for (auto*& buffer:self->vertex_buffers) { if (buffer) buffer_release(buffer); buffer=nullptr; }
     if (self->index_buffer) buffer_release(self->index_buffer); self->index_buffer=nullptr;
@@ -2667,8 +2676,66 @@ void STDMETHODCALLTYPE context_pixel_resources(Context* self,BufferView* const* 
     // count minus one occupies the header above bit 18.
     const UINT address=packet&0xffff, count=(packet>>19)+1;
     if(address<0x6b40 || ((address-0x6b40)&31) || ((packet>>16)&7)!=7 || start!=((address-0x6b40)>>5) ||
-        !bind_range(self->pixel_resources,start,count,input,[&](BufferView* v){return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;},view_release))
+        !bind_range(self->shader_resources[4],start,count,input,[&](BufferView* v){return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;},view_release))
         default_trap("ID3D11DeviceContextX",10);
+}
+template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_resources(Context* self,UINT start,UINT count,BufferView* const* input) {
+    auto& resources=self->shader_resources[Stage];
+    if(!bind_range(resources,start,count,input,[&](BufferView* v){
+        return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;
+    },view_release)) default_trap("ID3D11DeviceContextX",Slot);
+}
+HRESULT bind_fast_resources(Context* self,const void* begin,const void* end) {
+    auto cursor=reinterpret_cast<std::uintptr_t>(begin);
+    const auto limit=reinterpret_cast<std::uintptr_t>(end);
+    if(cursor>limit || (cursor&3) || (limit&3)) return E_INVALIDARG;
+    auto next=self->shader_resources[4];
+    auto next_samplers=self->pixel_samplers;
+    // 11295 SetFastResources: DWORD header followed by count 16-byte entries.
+    while(cursor<limit) {
+        UINT header=0; SIZE_T read=0;
+        if(limit-cursor<4 || !ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(cursor),&header,4,&read) || read!=4)
+            return E_INVALIDARG;
+        cursor+=4;
+        const UINT count=header&255,start=(header>>8)&255;
+        if(!count) continue;
+        // Signed PS SRV/sampler objects, without placement/offset metadata.
+        const UINT kind=(header>>28)&7;
+        if((header&0xffff0000)!=0x80040000 && (header&0xffff0000)!=0xa0040000) return DXGI_ERROR_UNSUPPORTED;
+        const auto slots=kind==0 ? next.size() : next_samplers.size();
+        if(start>=slots || count>slots-start || count>(limit-cursor)/16) return E_INVALIDARG;
+        for(UINT i=0;i<count;++i,cursor+=16) {
+            UINT64 entry[2]{};
+            if(!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(cursor),entry,sizeof entry,&read) || read!=sizeof entry)
+                return E_INVALIDARG;
+            if(entry[1]) return DXGI_ERROR_UNSUPPORTED;
+            GraphicsObject* object_pointer=nullptr;
+            if(entry[0]) {
+                const auto object=entry[0];
+                struct Prefix { const void* table; UINT refs,flags; Device* device; void* private_data; GraphicsObject* resource; UINT type,reserved; } prefix{};
+                static_assert(sizeof prefix==offsetof(BufferView,descriptor));
+                if(!ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<void*>(object),&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+                    prefix.table!=(kind==0 ? srv_vtable().data() : sampler_vtable().data()) || prefix.device!=self->device ||
+                    (kind==0 && prefix.type!=2)) return E_INVALIDARG;
+                object_pointer=reinterpret_cast<GraphicsObject*>(object);
+            }
+            if(kind==0) next[start+i]=static_cast<BufferView*>(object_pointer);
+            else next_samplers[start+i]=static_cast<Sampler*>(object_pointer);
+        }
+    }
+    // Validate the whole batch before publishing any binding or ownership change.
+    return bind_range(self->shader_resources[4],0,UINT(next.size()),next.data(),[&](BufferView* v){
+        return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;
+    },view_release) && bind_range(self->pixel_samplers,0,UINT(next_samplers.size()),next_samplers.data(),[&](Sampler* s){
+        return s->vtable==sampler_vtable().data() && s->device==self->device;
+    },sampler_release) ? S_OK : E_INVALIDARG;
+}
+void STDMETHODCALLTYPE context_fast_resources(Context* self,const void* begin,const void* end) {
+    const HRESULT hr=bind_fast_resources(self,begin,end);
+    if(FAILED(hr)) {
+        std::fprintf(stderr,"xone-era: SetFastResources refused 0x%08lX\n",hr);
+        (void)trap_slot<kind_context,209>(self,reinterpret_cast<std::uintptr_t>(begin),reinterpret_cast<std::uintptr_t>(end));
+    }
 }
 template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_constants(Context* self,UINT start,UINT count,Buffer* const* input) {
     if(!bind_range(self->constants[Stage],start,count,input,[&](Buffer* b){return b->vtable==buffer_vtable().data() && b->device==self->device &&
@@ -2698,6 +2765,13 @@ void STDMETHODCALLTYPE context_vertices(Context* self,UINT start,UINT count,Buff
         (b->desc.standard.BindFlags&D3D11_BIND_VERTEX_BUFFER);},buffer_release)) {default_trap("ID3D11DeviceContextX",20);return;}
     std::copy_n(next_strides.begin(),count,self->vertex_strides.begin()+start);
     std::copy_n(next_offsets.begin(),count,self->vertex_offsets.begin()+start);
+}
+void STDMETHODCALLTYPE legacy_context_vertices(Context* self,UINT start,UINT count,Buffer* const* input,const UINT* strides,const UINT* offsets) {
+    // 11295 180010580: a null array clears all 32 slots without reading strides/offsets.
+    if(!input) {
+        std::array<UINT,D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> zero{};
+        context_vertices(self,0,UINT(zero.size()),nullptr,zero.data(),zero.data());
+    } else context_vertices(self,start,count,input,strides,offsets);
 }
 void STDMETHODCALLTYPE context_indices(Context* self,UINT format,Buffer* buffer,UINT offset) {
     // Xbox hardware index formats 0/1 represent 16/32 bits (title 140214850).
@@ -2962,7 +3036,7 @@ HRESULT execute_indexed(Context* self,UINT64 packed,INT base) {
                 const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset,bytes};
                 self->device->d3d12->CreateConstantBufferView(&desc,handle);
             } else if(table.kind==1) {
-                auto* view=self->pixel_resources[i];if(!view || !view->heap) return DXGI_ERROR_UNSUPPORTED;
+                auto* view=self->shader_resources[4][i];if(!view || !view->heap) return DXGI_ERROR_UNSUPPORTED;
                 if(view->resource->vtable==texture_vtable().data()) {
                     auto* texture=static_cast<Texture*>(view->resource);
                     if(texture->desc.standard.SampleDesc.Count!=1 || !use(texture->gpu,true,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return DXGI_ERROR_UNSUPPORTED;
@@ -3226,6 +3300,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
     static const auto table = [] {
         auto t = context_vtable();
         for(UINT slot : {9u,10u,11u,12u,13u,14u,18u,19u,20u,21u,25u}) t[slot]=traps<kind_context>()[slot];
+        t[8] = reinterpret_cast<const void*>(&context_constants<1,8>); // 11295 180010b90, VS constant buffers.
         t[34] = reinterpret_cast<const void*>(&trap_slot<kind_context,34>);
         t[33] = reinterpret_cast<const void*>(&context_set_render_targets); // Original 11295 180014fc0.
         t[89] = reinterpret_cast<const void*>(&context_get_render_targets); // Original 11295 18000c9f0 -> 180007cb0.
@@ -3240,7 +3315,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[37] = reinterpret_cast<const void*>(&trap_slot<kind_context,37>);
         t[36] = reinterpret_cast<const void*>(&context_set_depth_state); // 11295 18000af30 -> 180039bc0.
         t[35] = reinterpret_cast<const void*>(&context_set_blend); // Original 11295 18000aeb0.
-        t[17] = reinterpret_cast<const void*>(&trap_slot<kind_context,17>);
+        t[17] = reinterpret_cast<const void*>(&context_constants<0,17>); // 11295 180010f70, PS constant buffers.
         t[15] = reinterpret_cast<const void*>(&context_map_buffer); // Original 18000ff10, not desktop slot 14.
         t[16] = reinterpret_cast<const void*>(&context_unmap_buffer); // Original 1800104f0.
         t[24] = reinterpret_cast<const void*>(&context_unbind_geometry_shader);
@@ -3251,6 +3326,13 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[113] = reinterpret_cast<const void*>(&context_get_flags);
         t[110] = reinterpret_cast<const void*>(&context_clear_state);
         t[196] = reinterpret_cast<const void*>(&context_automatic_gpu_flush);
+        t[209] = reinterpret_cast<const void*>(&context_fast_resources); // 11295 180019f00.
+        t[25] = reinterpret_cast<const void*>(&context_resources<0,25>); // 11295 180010860 -> 18001f6a0.
+        t[9] = reinterpret_cast<const void*>(&context_resources<4,9>); // 11295 180010840 -> 18001f2c0.
+        t[67] = reinterpret_cast<const void*>(&context_resources<5,67>); // 11295 1800108e0 -> 180020640.
+        t[23] = reinterpret_cast<const void*>(&context_constants<2,23>); // 11295 180011350, GS constant buffers.
+        t[71] = reinterpret_cast<const void*>(&context_constants<3,71>); // 11295 180011ef0, CS constant buffers.
+        t[19] = reinterpret_cast<const void*>(&legacy_context_vertices); // 11295 180010580 -> 18001ee50.
         return t;
     }();
     return table;

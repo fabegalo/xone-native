@@ -882,6 +882,61 @@ int main(int argc, char** argv) {
                 check(create_raw_srv(device,buffer,&raw,nullptr)==S_FALSE,"raw SRV validation does not acquire ownership");
                 check(create_raw_srv(device,buffer,&raw,&raw_view)==S_OK && raw_view,"raw SRV binds the actual ESRAM buffer");
                 if (raw_view) {
+                    using FastResources=void(STDMETHODCALLTYPE*)(void*,const void*,const void*);
+                    const auto fast=reinterpret_cast<FastResources>(vt(context)[209]);
+                    std::array<UINT32,5> packet{0x80040001};
+                    const auto view_address=reinterpret_cast<std::uintptr_t>(raw_view);
+                    std::memcpy(packet.data()+1,&view_address,sizeof view_address);
+                    fast(context,packet.data(),packet.data()+packet.size());
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,"SetFastResources retains the signed packet SRV object");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    fast(context,packet.data(),packet.data()+packet.size());
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,"fast SRV rebinding balances ownership");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    static unsigned rejections=0; rejections=0;
+                    set_d3d11x_trap_handler([](const char* name,unsigned slot)->std::uintptr_t {
+                        if(std::strcmp(name,"ID3D11DeviceContextX")==0 && slot==209) ++rejections;
+                        return 0;
+                    });
+                    fast(context,packet.data(),packet.data()+4);
+                    auto invalid=packet; invalid[3]=1;
+                    fast(context,invalid.data(),invalid.data()+invalid.size());
+                    invalid=packet; invalid[0]=0x80047f02;
+                    fast(context,invalid.data(),invalid.data()+invalid.size());
+                    invalid=packet; invalid[1]=1;invalid[2]=0;
+                    fast(context,invalid.data(),invalid.data()+invalid.size());
+                    std::array<UINT32,10> partial{0x80040001,0,0,0,0,0x80000001,0,0,0,0};
+                    fast(context,partial.data(),partial.data()+partial.size());
+                    set_d3d11x_trap_handler(nullptr);
+                    check(rejections==5 && reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,
+                          "truncated, metadata, range, pointer and unsupported-tail failures preserve prior fast bindings transactionally");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    fast(context,packet.data(),packet.data());
+                    packet[0]=0x80000000;
+                    fast(context,packet.data(),packet.data()+1);
+                    packet[0]=0x80040001;packet[1]=packet[2]=0;
+                    fast(context,packet.data(),packet.data()+packet.size());
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==2,"fast null SRD unbind and empty packets preserve exact ownership");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    using BindResources=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                    const auto bind_vertex=reinterpret_cast<BindResources>(vt(context)[25]);
+                    const auto bind_pixel=reinterpret_cast<BindResources>(vt(context)[9]);
+                    const auto bind_compute=reinterpret_cast<BindResources>(vt(context)[67]);
+                    void* views[]{raw_view};
+                    bind_vertex(context,127,1,views);bind_vertex(context,127,1,views);
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,"legacy VS SRV last-slot binding and rebind retain the same view");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    bind_vertex(context,127,1,nullptr);bind_vertex(context,128,0,nullptr);
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==2,"legacy VS SRV unbind releases its retained view");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    bind_vertex(context,0,1,views);
+                    bind_pixel(context,0,1,views);
+                    bind_compute(context,0,1,views);bind_compute(context,0,1,views);
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==5,"VS, PS and CS SRV bindings own independent references and balance rebinds");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==2,"ClearState releases VS SRVs with the other common bindings");
+                    reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
                     struct { D3D11_SHADER_RESOURCE_VIEW_DESC desc{}; UINT guard=0xaabbccdd; } queried;
                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(raw_view)[9])(raw_view,&queried.desc);
                     check(!std::memcmp(&queried.desc,&raw,sizeof raw) && queried.guard==0xaabbccdd,
@@ -1954,6 +2009,15 @@ int main(int argc, char** argv) {
                     check(factory(device, &desc, &initial, &buffer) == S_OK && buffer, "shared native vertex buffer created");
                     if (buffer) {
                         check(refs(buffer) == 1 && refs(device) == 1, "buffer owns internal device dependency");
+                        using BindVertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
+                        const auto bind_vertices=reinterpret_cast<BindVertices>(vt(context)[19]);
+                        const UINT stride=12,offset=4;void* buffers[]{buffer};
+                        bind_vertices(context,31,1,buffers,&stride,&offset);bind_vertices(context,31,1,buffers,&stride,&offset);
+                        check(refs(buffer)==2,"legacy vertex binding retains the last slot and balances rebinds");
+                        bind_vertices(context,0,1,buffers,&stride,&offset);
+                        check(refs(buffer)==3,"independent vertex slots retain independent references");
+                        bind_vertices(context,31,1,nullptr,nullptr,nullptr);
+                        check(refs(buffer)==1,"11295 null vertex array clears all slots without reading stride or offset pointers");
                         void* allocation = nullptr;
                         std::memcpy(&allocation, static_cast<char*>(buffer) + 48, sizeof allocation);
                         check(allocation && !std::memcmp(allocation, vertices.data(), sizeof vertices), "initial data reaches actual title allocation");
@@ -1996,6 +2060,35 @@ int main(int argc, char** argv) {
                     check(factory(device, &desc, &initial, &buffer) == E_INVALIDARG && !buffer, "constant buffer size must be a multiple of sixteen");
                     desc.standard.ByteWidth = 64;
                     check(factory(device, &desc, &initial, &buffer) == S_OK && buffer, "shared constant buffer created");
+                    if (buffer) {
+                        using BindConstants = void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                        const auto bind = reinterpret_cast<BindConstants>(vt(context)[8]);
+                        void* buffers[]{buffer};
+                        bind(context,13,1,buffers);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==3,"legacy VS constant binding retains the last valid slot");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                        bind(context,13,1,buffers);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==3,"legacy VS constant rebinding balances ownership");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                        bind(context,13,1,nullptr);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==2,"legacy VS constant unbind releases its retained buffer");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                        bind(context,14,0,nullptr);
+                        const auto bind_pixel = reinterpret_cast<BindConstants>(vt(context)[17]);
+                        const auto bind_geometry = reinterpret_cast<BindConstants>(vt(context)[23]);
+                        const auto bind_compute = reinterpret_cast<BindConstants>(vt(context)[71]);
+                        bind(context,0,1,buffers); bind_pixel(context,0,1,buffers);
+                        bind_geometry(context,13,1,buffers);bind_geometry(context,13,1,buffers);
+                        bind_compute(context,0,1,buffers);bind_compute(context,0,1,buffers);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==6,"VS, PS, GS and CS constants retain independent references and balance rebinds");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                        bind(context,0,1,nullptr);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==5,"VS unbind preserves PS, GS and CS constant ownership");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(reinterpret_cast<Count>(vt(buffer)[1])(buffer)==2,"legacy ClearState releases PS, GS and CS constants");
+                        reinterpret_cast<Count>(vt(buffer)[2])(buffer);
+                    }
                     if (buffer) {
                         std::array<UINT32, 4> srd{};
                         std::memcpy(srd.data(), static_cast<char*>(buffer) + 32, sizeof srd);
@@ -2325,6 +2418,17 @@ int main(int argc, char** argv) {
                         check(factory(device, &desc, &duplicate) == S_OK && duplicate == sampler && refs(sampler) == 2,
                               "identical sampler shares live state and descriptor slot");
                         if (duplicate) reinterpret_cast<Count>(vt(duplicate)[2])(duplicate);
+                        using FastResources=void(STDMETHODCALLTYPE*)(void*,const void*,const void*);
+                        const auto fast=reinterpret_cast<FastResources>(vt(context)[209]);
+                        std::array<UINT32,9> batch{0xa0040e02};
+                        const auto object=reinterpret_cast<std::uintptr_t>(sampler);
+                        std::memcpy(batch.data()+1,&object,sizeof object);std::memcpy(batch.data()+5,&object,sizeof object);
+                        fast(context,batch.data(),batch.data()+batch.size());
+                        check(refs(sampler)==3,"fast PS sampler packet retains both final slots independently");
+                        fast(context,batch.data(),batch.data()+batch.size());
+                        check(refs(sampler)==3,"fast sampler packet rebind balances ownership");
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                        check(refs(sampler)==1,"ClearState releases fast sampler bindings without changing the descriptor");
                         check(reinterpret_cast<Count>(vt(sampler)[2])(sampler) == 0, "sampler descriptor slot retired");
                     }
                     desc.Filter = D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;

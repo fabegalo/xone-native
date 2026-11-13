@@ -17,7 +17,7 @@ struct TitleTextureLayout {
                     UINT subresource, UINT row_pitch, UINT slice_pitch) = nullptr;
 };
 HRESULT create_xg_texture_layout(UINT width, UINT height, UINT mips, UINT arrays, DXGI_FORMAT format,
-                                 UINT tile_mode, TitleTextureLayout& out);
+                                 UINT tile_mode, TitleTextureLayout& out, UINT bind_flags = 0, UINT samples = 1);
 HRESULT create_xg_texture3d_layout(UINT width, UINT height, UINT depth, UINT mips, DXGI_FORMAT format,
                                   UINT bind_flags, TitleTextureLayout& out, UINT tile_mode = ~UINT{0});
 // A pin keeps the single CPU allocation alive while its buffer is used by GPU.

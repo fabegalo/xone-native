@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/era_loader.h"
 #include "../src/era_memory.h"
+#include "../src/era_display.h"
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
 #include <d3d11.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <vector>
 #include <filesystem>
+#include <cmath>
 
 using Microsoft::WRL::ComPtr;
 using namespace xboxone::era;
@@ -38,6 +40,15 @@ HRESULT linear_texture_copy(void* opaque, bool into_tiled, void* linear, void* c
         auto* a = static_cast<unsigned char*>(canonical) + offset + row * row_bytes;
         auto* b = static_cast<unsigned char*>(linear) + row * pitch;
         std::memcpy(into_tiled ? a : b, into_tiled ? b : a, row_bytes);
+    }
+    return S_OK;
+}
+HRESULT linear_sample_copy(void*, bool into, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice) {
+    if (!linear || !canonical || subresource || pitch < 512 || UINT64(pitch) * 16 > slice) return E_INVALIDARG;
+    for (UINT y = 0; y < 16; ++y) {
+        auto* a = static_cast<unsigned char*>(canonical) + y * 512;
+        auto* b = static_cast<unsigned char*>(linear) + y * pitch;
+        std::memcpy(into ? a : b, into ? b : a, 512);
     }
     return S_OK;
 }
@@ -467,6 +478,7 @@ int main(int argc, char** argv) {
         const auto aligned = (reinterpret_cast<std::uintptr_t>(storage) + 16 + layout.alignment - 1) & ~(layout.alignment - 1);
         auto* canonical = reinterpret_cast<unsigned char*>(aligned);
         const UINT mips = d.MipLevels;
+        const UINT mutation_mip = mips > 1 ? 1 : 0;
         std::vector<std::vector<unsigned char>> expected(mips);
         for (UINT mip = 0; mip < mips; ++mip) {
             const UINT columns = ((std::max)(1u, static_cast<UINT>(d.Width) >> mip) + block - 1) / block;
@@ -489,13 +501,14 @@ int main(int argc, char** argv) {
         if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
         check(begin_title_gpu_buffer(texture, list.Get(), D3D12_RESOURCE_STATE_COPY_DEST) == E_INVALIDARG,
               "texture cannot bypass its layout conversion through the buffer path");
-        hr = begin_title_gpu_texture(texture, list.Get(), D3D12_RESOURCE_STATE_COPY_DEST);
+        const bool render_target = (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+        hr = begin_title_gpu_texture(texture, list.Get(), render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST);
         if (FAILED(hr)) return false;
         check(begin_title_gpu_buffer(alias, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
               "buffer alias cannot race a native texture using the same canonical bytes");
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT mutation{};
         UINT rows = 0; UINT64 row_bytes = 0, total = 0;
-        device->GetCopyableFootprints(&d, 1, 1, 0, &mutation, &rows, &row_bytes, &total);
+        device->GetCopyableFootprints(&d, mutation_mip, 1, 0, &mutation, &rows, &row_bytes, &total);
         void* data = nullptr;
         if (FAILED(upload->Map(0, nullptr, &data))) return false;
         check(UINT64(mutation.Footprint.RowPitch) * rows * mutation.Footprint.Depth <= upload->GetDesc().Width,
@@ -506,9 +519,20 @@ int main(int argc, char** argv) {
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = upload.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; source.PlacedFootprint = mutation;
         D3D12_TEXTURE_COPY_LOCATION destination{};
-        destination.pResource = texture.resource; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; destination.SubresourceIndex = 1;
-        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr); // Independent GPU mutation, not an upload/readback echo.
-        std::fill(expected[1].begin(), expected[1].end(), 0xa7);
+        destination.pResource = texture.resource; destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; destination.SubresourceIndex = mutation_mip;
+        ComPtr<ID3D12DescriptorHeap> render_heap;
+        if (render_target) {
+            const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+            if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&render_heap)))) return false;
+            D3D12_RENDER_TARGET_VIEW_DESC view{};
+            view.Format = d.Format; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D; view.Texture2D.MipSlice = mutation_mip;
+            device->CreateRenderTargetView(texture.resource, &view, render_heap->GetCPUDescriptorHandleForHeapStart());
+            constexpr UINT packed = 0xa7a7a7a7;
+            const float color[]{float(packed & 1023) / 1023, float((packed >> 10) & 1023) / 1023,
+                float((packed >> 20) & 1023) / 1023, float(packed >> 30) / 3};
+            list->ClearRenderTargetView(render_heap->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
+        } else list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        std::fill(expected[mutation_mip].begin(), expected[mutation_mip].end(), 0xa7);
         if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
         queue->ExecuteCommandLists(1, lists);
         check(complete_title_gpu_resource(texture, fence.Get(), signal) == E_PENDING,
@@ -586,6 +610,189 @@ int main(int argc, char** argv) {
             D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS, layout);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 4, 11, nullptr),
               "original XG volume preserves every depth slice through independent GPU writes and canonical reuse");
+        hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R10G10B10A2_UNORM, UINT_MAX, layout,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 4, 13, nullptr),
+              "expanded render-target preserves real GPU clear bytes, canonical guards and CPU reuse");
+        hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R8_UINT, UINT_MAX, layout, D3D11_BIND_SHADER_RESOURCE);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 1, 15, nullptr),
+              "typed R8 metadata preserves canonical bytes through independent GPU mutation");
+    }
+    const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal) -> bool {
+        auto* storage = static_cast<unsigned char*>(allocate(layout.bytes + layout.alignment + 32, attributes));
+        if (!storage) return false;
+        std::memset(storage, 0x5a, layout.bytes + layout.alignment + 32);
+        auto* canonical = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(storage) + 16 + layout.alignment - 1) & ~(layout.alignment - 1));
+        std::vector<UINT32> expected(32 * 16 * 4), actual(expected.size());
+        for (UINT i = 0; i < expected.size(); ++i) {
+            const UINT sample = i % 4;
+            expected[i] = ((15 + sample) << 6) | (((16 + sample) << 6) << 11) | (((14 + sample) << 5) << 22);
+        }
+        if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, 512, 8192))) return false;
+        TitleGpuResource texture;
+        HRESULT hr = acquire_title_gpu_texture(canonical, layout, device.Get(), texture);
+        check(SUCCEEDED(hr), "four-sample resource acquires a real native MSAA texture");
+        if (FAILED(hr)) return false;
+        check(texture.resource->GetDesc().SampleDesc.Count == 4, "MSAA storage retains all four hardware samples");
+        ComPtr<ID3D12DescriptorHeap> targets;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&targets)))) return false;
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R11G11B10_FLOAT; view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DMS;
+        device->CreateRenderTargetView(texture.resource, &view, targets->GetCPUDescriptorHandleForHeapStart());
+        for (UINT iteration = 0; iteration < 3; ++iteration) {
+            if (iteration == 2) {
+                void* cpu = nullptr;
+                if (FAILED(map_title_gpu_resource(texture, &cpu))) return false;
+                for (UINT i = 0; i < expected.size(); ++i) expected[i] ^= (i % 4 + 1) << 1; // Distinct finite mantissas in each sample.
+                hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, 512, 8192);
+                if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
+            }
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
+            hr = begin_title_gpu_texture(texture, list.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
+            check(SUCCEEDED(hr), "sample upload uses per-sample GPU shading without resolve");
+            if (FAILED(hr)) return false;
+            if (iteration == 1) {
+                const float color[]{.5f, 1, 2, 1};
+                list->ClearRenderTargetView(targets->GetCPUDescriptorHandleForHeapStart(), color, 0, nullptr);
+                std::fill(expected.begin(), expected.end(), (14u << 6) | ((15u << 6) << 11) | ((16u << 5) << 22));
+            }
+            if (FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
+            queue->ExecuteCommandLists(1, lists);
+            check(complete_title_gpu_resource(texture, fence.Get(), signal + iteration) == E_PENDING,
+                  "MSAA CPU writeback waits for the real GPU fence");
+            HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!ready) return false;
+            hr = queue->Signal(fence.Get(), signal + iteration);
+            if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(signal + iteration, ready);
+            const bool completed = SUCCEEDED(hr) && WaitForSingleObject(ready, 3000) == WAIT_OBJECT_0;
+            CloseHandle(ready); if (!completed || FAILED(complete_title_gpu_resource(texture, fence.Get(), signal + iteration))) return false;
+            hr = layout.copy(layout.context.get(), false, actual.data(), canonical, 0, 512, 8192);
+            check(SUCCEEDED(hr) && actual == expected, iteration == 1 ? "independent native MSAA clear updates every canonical sample" :
+                "all four distinct MSAA samples survive GPU upload/readback and CPU reuse");
+            for (UINT i = 0; i < 16; ++i)
+                check(canonical[int(i) - 16] == 0x5a && canonical[layout.bytes + i] == 0x5a, "MSAA coherence preserves neighboring bytes");
+        }
+        if (FAILED(release_title_gpu_resource(texture, fence.Get(), signal + 2))) return false;
+        release(storage, attributes);
+        return true;
+    };
+    TitleTextureLayout sample_layout;
+    sample_layout.bytes = 8192; sample_layout.alignment = 16;
+    sample_layout.context = std::make_shared<int>(0); sample_layout.copy = &linear_sample_copy;
+    sample_layout.resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    sample_layout.resource_desc.Width = 32; sample_layout.resource_desc.Height = 16;
+    sample_layout.resource_desc.DepthOrArraySize = sample_layout.resource_desc.MipLevels = 1;
+    sample_layout.resource_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT; sample_layout.resource_desc.SampleDesc.Count = 4;
+    sample_layout.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    check(sample_fixture(sample_layout, 20), "owned four-sample texture completes GPU coherence");
+    if (original_xg) {
+        hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, sample_layout,
+            D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, 4);
+        check(SUCCEEDED(hr) && sample_fixture(std::move(sample_layout), 30), "original XG MSAA layout completes per-sample GPU coherence");
+    }
+    // Independent pixel oracle: source samples include both transfer breakpoints,
+    // out-of-range RGB, distinct rows, and all four two-bit alpha values.
+    const float values[]{0, .003f, .01f, .040449f, .04045f, .040451f, .1f, .1428f,
+        .1429f, .2f, .5f, .75f, 1, -.1f, 1.1f, .9f};
+    std::array<std::array<float, 4>, 32> pixels{};
+    for (UINT i = 0; i < pixels.size(); ++i)
+        pixels[i] = {values[(i + (i / 16) * 7) % 16], values[(i + 3) % 16], values[(i + 7) % 16], float(i % 4) / 3};
+    D3D12_RESOURCE_DESC image{};
+    image.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; image.Width = 16; image.Height = 2;
+    image.DepthOrArraySize = image.MipLevels = 1; image.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; image.SampleDesc.Count = 1;
+    D3D12_HEAP_PROPERTIES image_heap{}; image_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    ComPtr<ID3D12Resource> source_image;
+    hr = device->CreateCommittedResource(&image_heap, D3D12_HEAP_FLAG_NONE, &image,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&source_image));
+    check(SUCCEEDED(hr), "display source texture created");
+    if (FAILED(hr)) return 1;
+    ComPtr<ID3D12DescriptorHeap> source_descriptors, targets;
+    const D3D12_DESCRIPTOR_HEAP_DESC source_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const D3D12_DESCRIPTOR_HEAP_DESC target_desc{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    hr = device->CreateDescriptorHeap(&source_desc, IID_PPV_ARGS(&source_descriptors));
+    if (SUCCEEDED(hr)) hr = device->CreateDescriptorHeap(&target_desc, IID_PPV_ARGS(&targets));
+    if (FAILED(hr)) return 1;
+    D3D12_SHADER_RESOURCE_VIEW_DESC source_view{};
+    source_view.Format = image.Format; source_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    source_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; source_view.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(source_image.Get(), &source_view, source_descriptors->GetCPUDescriptorHandleForHeapStart());
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT source_footprint{};
+    device->GetCopyableFootprints(&image, 0, 1, 0, &source_footprint, nullptr, nullptr, nullptr);
+    UINT64 display_signal = 100;
+    for (const auto output_format : {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM}) {
+        DisplayTransfer transfer;
+        hr = transfer.initialize(device.Get(), output_format);
+        check(SUCCEEDED(hr), "display transfer compiles into a native graphics pipeline");
+        if (FAILED(hr)) return 1;
+        auto output_desc = image; output_desc.Format = output_format; output_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        ComPtr<ID3D12Resource> output;
+        hr = device->CreateCommittedResource(&image_heap, D3D12_HEAP_FLAG_NONE, &output_desc,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&output));
+        if (FAILED(hr)) return 1;
+        device->CreateRenderTargetView(output.Get(), nullptr, targets->GetCPUDescriptorHandleForHeapStart());
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT output_footprint{};
+        device->GetCopyableFootprints(&output_desc, 0, 1, 0, &output_footprint, nullptr, nullptr, nullptr);
+        for (bool convert : {false, true}) {
+            if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return 1;
+            void* data = nullptr;
+            if (FAILED(upload->Map(0, nullptr, &data))) return 1;
+            for (UINT y = 0; y < 2; ++y)
+                std::memcpy(static_cast<char*>(data) + source_footprint.Offset + y * source_footprint.Footprint.RowPitch,
+                    pixels.data() + y * 16, 16 * sizeof pixels[0]);
+            upload->Unmap(0, nullptr);
+            D3D12_TEXTURE_COPY_LOCATION from{}, to{};
+            from.pResource = upload.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; from.PlacedFootprint = source_footprint;
+            to.pResource = source_image.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            barrier(list.Get(), source_image.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            hr = transfer.record(list.Get(), source_descriptors.Get(), source_descriptors->GetGPUDescriptorHandleForHeapStart(),
+                targets->GetCPUDescriptorHandleForHeapStart(), 16, 2, convert);
+            if (FAILED(hr)) return 1;
+            barrier(list.Get(), output.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            from = {}; from.pResource = output.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to = {}; to.pResource = readback.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; to.PlacedFootprint = output_footprint;
+            list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+            barrier(list.Get(), source_image.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+            barrier(list.Get(), output.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (FAILED(list->Close())) return 1;
+            queue->ExecuteCommandLists(1, lists);
+            const auto signal = display_signal++;
+            HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!event) return 1;
+            hr = queue->Signal(fence.Get(), signal);
+            if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(signal, event);
+            const bool completed = SUCCEEDED(hr) && WaitForSingleObject(event, 3000) == WAIT_OBJECT_0;
+            CloseHandle(event); if (!completed) return 1;
+            if (FAILED(readback->Map(0, nullptr, &data))) return 1;
+            bool matches = true;
+            for (UINT i = 0; i < pixels.size(); ++i) {
+                const auto* pixel = static_cast<const unsigned char*>(data) + output_footprint.Offset + (i / 16) * output_footprint.Footprint.RowPitch;
+                UINT32 packed = 0;
+                if (output_format == DXGI_FORMAT_R10G10B10A2_UNORM) std::memcpy(&packed, pixel + (i % 16) * 4, 4);
+                for (UINT c = 0; c < 4; ++c) {
+                    double expected = pixels[i][c];
+                    if (c != 3) {
+                        expected = (std::clamp)(expected, 0., 1.);
+                        if (convert) {
+                            const double linear = expected <= .04045 ? expected / 12.92 : std::pow((expected + .055) / 1.055, 2.4);
+                            expected = linear < .018 ? 4.5 * linear : 1.099 * std::pow(linear, .45) - .099;
+                        }
+                    }
+                    if (output_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+                        const UINT mask = c == 3 ? 3 : 1023;
+                        const UINT actual = (packed >> (c * 10)) & mask;
+                        matches = matches && std::abs(double(actual) - std::round(expected * mask)) <= (c == 3 ? 0 : 1);
+                    } else {
+                        float actual = 0; std::memcpy(&actual, pixel + (i % 16) * 16 + c * 4, 4);
+                        matches = matches && std::abs(actual - expected) < .00001;
+                    }
+                }
+            }
+            readback->Unmap(0, nullptr);
+            check(matches, convert ? "Xbox 0x200000 transfer preserves BT.709 pixels, alpha and orientation" :
+                "negative control preserves RGB without the Xbox transfer");
+        }
     }
     return failures ? 1 : 0;
 }

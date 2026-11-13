@@ -8,7 +8,7 @@ endif()
 
 add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJECT_SOURCE_DIR}/src/era_kernelx.cpp
             ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
+            ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_display.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_deployment.cpp
             ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp)

@@ -13,6 +13,7 @@
 #include "xboxone_native/era_loader.h"
 #include "era_winrt_classes.h"
 #include "era_memory.h"
+#include "era_display.h"
 #include "file_path.h"
 #include "sha256.h"
 
@@ -206,6 +207,7 @@ struct alignas(16) Texture : GraphicsObject {
     LegacyTexture2DDesc desc{};
     LegacyTexture3DDesc volume_desc{};
     bool volume = false;
+    UINT creation_misc_flags = 0;
     UINT64 allocation_attributes = 0; // Zero for borrowed placement storage.
     void* canonical = nullptr; // Borrowed placement memory; the registry pins its backing.
     std::array<UINT32, 8> descriptor{};
@@ -223,6 +225,8 @@ struct alignas(16) BufferView : GraphicsObject {
     void* allocation_start = nullptr;
     D3D11_UNORDERED_ACCESS_VIEW_DESC desc{};
     D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{}; // Same native view prefix, type 2.
+    D3D11_RENDER_TARGET_VIEW_DESC rtv_desc{}; // Type 0 has no public SRD payload.
+    Texture* metadata_texture = nullptr; // Derived FMASK for the real expanded sample topology.
     Buffer* counter_buffer = nullptr;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
     D3D12_CPU_DESCRIPTOR_HANDLE host{};
@@ -243,6 +247,10 @@ struct DxgiObject : GraphicsObject {
     void* private_data = nullptr;
     Device* device = nullptr; // Owns one device reference.
     IUnknown* host = nullptr; // Owned host DXGI object, if any (swapchain).
+    std::unique_ptr<DisplayTransfer> display;
+    DXGI_SWAP_CHAIN_DESC1 requested_desc{}; // Includes consumed Xbox display flags.
+    std::array<Texture*, 16> backbuffers{}; // Owned logical surfaces; host buffers are presentation targets.
+    std::mutex swapchain_mutex;
 };
 
 std::atomic<D3D11XTrapHandler> trap_handler{nullptr};
@@ -263,8 +271,8 @@ std::atomic_flag diagnostic_gpu_stop = ATOMIC_FLAG_INIT;
     __fastfail(FAST_FAIL_FATAL_APP_EXIT); // Never continue with a fabricated result.
 }
 
-enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv, kind_texture };
-constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView", "ID3D11Texture2D"};
+enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv, kind_texture, kind_rtv };
+constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView", "ID3D11Texture2D", "ID3D11RenderTargetView"};
 
 void diagnose_shader(std::uintptr_t address, SIZE_T bytes) {
     if (!address || bytes < 32 || bytes > (16u << 20)) return;
@@ -312,7 +320,7 @@ std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std:
         std::fprintf(stderr, "xone-era: raw graphics integer args 0x%llX 0x%llX 0x%llX 0x%llX\n",
                      static_cast<unsigned long long>(a), static_cast<unsigned long long>(b), static_cast<unsigned long long>(c),
                      static_cast<unsigned long long>(d));
-        if constexpr (K == kind_device && Slot == 64) {
+        if constexpr (K == kind_device && (Slot == 5 || Slot == 64)) {
             std::array<UINT32, 13> desc{}; // 18002b460/18002d720 read the original 52-byte texture descriptor.
             SIZE_T read = 0;
             if (a && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), desc.data(), sizeof desc, &read) && read == sizeof desc)
@@ -336,6 +344,13 @@ std::uintptr_t trap_slot(void*, std::uintptr_t a = 0, std::uintptr_t b = 0, std:
             if (a && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(a), &desc, sizeof desc, &read) && read == sizeof desc)
                 std::fprintf(stderr, "xone-era: texture3D %ux%ux%u mips %u format %u usage %u bind 0x%X cpu 0x%X misc 0x%X\n",
                     desc.Width, desc.Height, desc.Depth, desc.MipLevels, desc.Format, desc.Usage, desc.BindFlags, desc.CPUAccessFlags, desc.MiscFlags);
+        }
+        if constexpr (K == kind_swapchain && Slot == 10) {
+            GUID iid{}; SIZE_T read = 0;
+            if (b && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(b), &iid, sizeof iid, &read) && read == sizeof iid) {
+                wchar_t value[40]{}; StringFromGUID2(iid, value, 40);
+                std::fprintf(stderr, "xone-era: swapchain GetBuffer index %llu IID %ls\n", static_cast<unsigned long long>(a), value);
+            }
         }
         if constexpr (K == kind_device && Slot == 8) {
             std::array<UINT32, 5> desc{};
@@ -1034,6 +1049,9 @@ HRESULT STDMETHODCALLTYPE device_create_raster_state(Device* self, const D3D11_R
 // The native graphics allocator (1800c3930/1800c53f4) marks internal
 // allocations with system ID 0x80. App ID 3 can prepend a guest heap header.
 constexpr UINT64 buffer_graphics_attributes = 0x64804000;
+// 180031570/180051fc0 suppress an auxiliary decompression bit for this
+// creation flag; expanded samples need no such step. 180053f20 consumes it.
+constexpr UINT legacy_expanded_auxiliary = 0x40000;
 using AllocateBufferMemory = void* (WINAPI*)(SIZE_T, UINT64);
 using FreeBufferMemory = void (WINAPI*)(void*, UINT64);
 Buffer::~Buffer() {
@@ -1181,6 +1199,60 @@ const std::array<const void*, vtable_slots>& texture_vtable() {
     }();
     return table;
 }
+HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const TitleTextureLayout& layout, void* base, void** out) {
+    if (!out) return S_FALSE;
+    try {
+        auto texture = std::make_unique<Texture>();
+        texture->vtable = texture_vtable().data(); texture->flags = 1; texture->refcount = 0;
+        texture->device = self; texture->desc = desc; texture->desc.standard.MipLevels = layout.resource_desc.MipLevels;
+        texture->creation_misc_flags = desc.standard.MiscFlags;
+        texture->desc.standard.MiscFlags &= ~legacy_expanded_auxiliary;
+        HRESULT hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&texture->creation_fence));
+        if (FAILED(hr)) return hr;
+        texture->canonical = base;
+        if (!base) {
+            const auto allocate = reinterpret_cast<AllocateBufferMemory>(resolve_kernelx({"kernelx.dll", "XMemAlloc", 0}));
+            if (!allocate) return E_NOINTERFACE;
+            texture->allocation_attributes = (buffer_graphics_attributes & ~(31ull << 24)) |
+                (UINT64(std::countr_zero(layout.alignment)) << 24);
+            texture->canonical = allocate(layout.bytes, texture->allocation_attributes);
+            if (!texture->canonical) return E_OUTOFMEMORY;
+        }
+        if (reinterpret_cast<std::uintptr_t>(texture->canonical) % layout.alignment ||
+            reinterpret_cast<std::uintptr_t>(texture->canonical) > 0xffffffffffull) return DXGI_ERROR_UNSUPPORTED;
+        texture->descriptor = layout.guest_descriptor;
+        texture->descriptor[0] = static_cast<UINT32>(reinterpret_cast<std::uintptr_t>(texture->canonical) >> 8);
+        hr = acquire_title_gpu_texture(texture->canonical, layout, self->d3d12, texture->gpu);
+        if (FAILED(hr)) return hr;
+        retain_device(self); *out = texture.release();
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+HRESULT STDMETHODCALLTYPE device_create_texture2d(Device* self, const LegacyTexture2DDesc* input,
+        const D3D11_SUBRESOURCE_DATA* initial, void** out) {
+    if (out) *out = nullptr;
+    LegacyTexture2DDesc desc{}; SIZE_T read = 0;
+    if (!input || !ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc) return E_INVALIDARG;
+    const auto unsupported = [&]() -> HRESULT {
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 5>(self,
+            reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(initial), reinterpret_cast<std::uintptr_t>(out)));
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    const auto& d = desc.standard;
+    if (!d.Width || !d.Height || !d.ArraySize) return E_INVALIDARG;
+    const bool multisample = d.SampleDesc.Count > 1;
+    if (!d.SampleDesc.Count || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1))) return E_INVALIDARG;
+    if (!self->legacy || initial || desc.extension[0] || desc.extension[1] || d.Usage != D3D11_USAGE_DEFAULT ||
+        d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~legacy_expanded_auxiliary) || !d.BindFlags ||
+        ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & D3D11_BIND_RENDER_TARGET))) ||
+        (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & D3D11_BIND_RENDER_TARGET) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
+        (d.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS))) return unsupported();
+    TitleTextureLayout layout;
+    HRESULT hr = create_xg_texture_layout(d.Width, d.Height, d.MipLevels, d.ArraySize, d.Format, UINT_MAX, layout, d.BindFlags, d.SampleDesc.Count);
+    if (hr == DXGI_ERROR_UNSUPPORTED || hr == E_UNEXPECTED) return unsupported();
+    if (FAILED(hr)) return hr;
+    return make_texture2d(self, desc, layout, nullptr, out);
+}
 HRESULT STDMETHODCALLTYPE device_create_placement_texture2d(Device* self, const LegacyTexture2DDesc* input,
         UINT tile_mode, UINT flags, void* base, void** out) {
     if (out) *out = nullptr;
@@ -1202,15 +1274,7 @@ HRESULT STDMETHODCALLTYPE device_create_placement_texture2d(Device* self, const 
         HRESULT hr = create_xg_texture_layout(d.Width, d.Height, d.MipLevels, d.ArraySize, d.Format, tile_mode, layout);
         if (hr == DXGI_ERROR_UNSUPPORTED || hr == E_UNEXPECTED) return unsupported();
         if (FAILED(hr)) return hr;
-        if (!out) return S_FALSE;
-        auto texture = std::make_unique<Texture>();
-        texture->vtable = texture_vtable().data(); texture->flags = 1; texture->refcount = 0;
-        texture->device = self; texture->desc = desc; texture->desc.standard.MipLevels = layout.resource_desc.MipLevels;
-        texture->canonical = base; texture->descriptor = layout.guest_descriptor;
-        texture->descriptor[0] = static_cast<UINT32>(reinterpret_cast<std::uintptr_t>(base) >> 8); // Native 1800536d0 texture binding.
-        hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&texture->creation_fence));
-        if (FAILED(hr)) return hr;
-        hr = acquire_title_gpu_texture(base, layout, self->d3d12, texture->gpu);
+        hr = make_texture2d(self, desc, layout, base, out);
         if (FAILED(hr)) {
             if (stop_on_missing_service()) {
                 std::fprintf(stderr, "xone-era: placement texture canonical binding failed 0x%08lX; span %zu alignment %zu\n", hr, layout.bytes, layout.alignment);
@@ -1218,8 +1282,7 @@ HRESULT STDMETHODCALLTYPE device_create_placement_texture2d(Device* self, const 
             }
             return hr;
         }
-        retain_device(self); *out = texture.release();
-        return S_OK;
+        return hr;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
@@ -1288,10 +1351,14 @@ HRESULT STDMETHODCALLTYPE device_create_placement_texture3d(Device* self, const 
 }
 
 BufferView::~BufferView() {
+    if (metadata_texture) texture_release(metadata_texture);
     if (counter_buffer) buffer_release(counter_buffer);
     if (resource) reinterpret_cast<ULONG (STDMETHODCALLTYPE*)(GraphicsObject*)>(resource->vtable[2])(resource);
 }
 HRESULT STDMETHODCALLTYPE view_query(BufferView* self, REFIID iid, void** out) {
+    if (self->view_type == 0)
+        return query(self, iid, out, {iid_unknown, iid_graphics_unknown, iid_device_child,
+            __uuidof(ID3D11View), __uuidof(ID3D11RenderTargetView)});
     if (self->view_type == 2)
         return query(self, iid, out, {iid_unknown, iid_graphics_unknown, iid_device_child,
             __uuidof(ID3D11View), __uuidof(ID3D11ShaderResourceView)});
@@ -1315,6 +1382,61 @@ void STDMETHODCALLTYPE view_get_resource(BufferView* self, void** out) {
 }
 void STDMETHODCALLTYPE uav_get_desc(BufferView* self, D3D11_UNORDERED_ACCESS_VIEW_DESC* out) { if (out) *out = self->desc; }
 void STDMETHODCALLTYPE srv_get_desc(BufferView* self, D3D11_SHADER_RESOURCE_VIEW_DESC* out) { if (out) *out = self->srv_desc; }
+void STDMETHODCALLTYPE rtv_get_desc(BufferView* self, D3D11_RENDER_TARGET_VIEW_DESC* out) { if (out) *out = self->rtv_desc; }
+const std::array<const void*, vtable_slots>& rtv_vtable() {
+    static const auto table = [] {
+        auto t = traps<kind_rtv>();
+        t[0] = reinterpret_cast<const void*>(&view_query);
+        t[1] = reinterpret_cast<const void*>(&view_add_ref);
+        t[2] = reinterpret_cast<const void*>(&view_release);
+        t[3] = reinterpret_cast<const void*>(&view_get_device);
+        t[8] = reinterpret_cast<const void*>(&view_get_resource);
+        t[9] = reinterpret_cast<const void*>(&rtv_get_desc);
+        return t;
+    }();
+    return table;
+}
+HRESULT STDMETHODCALLTYPE device_create_rtv(Device* self, GraphicsObject* resource, const D3D11_RENDER_TARGET_VIEW_DESC* input, void** out) {
+    if (out) *out = nullptr;
+    if (!resource || resource->vtable != texture_vtable().data()) return E_INVALIDARG;
+    auto* texture = static_cast<Texture*>(resource);
+    if (texture->device != self) return E_INVALIDARG;
+    const auto unsupported = [&]() -> HRESULT {
+        if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 9>(self,
+            reinterpret_cast<std::uintptr_t>(resource), reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(out)));
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    const auto& d = texture->desc.standard;
+    if (texture->volume || d.ArraySize != 1 || !(d.BindFlags & D3D11_BIND_RENDER_TARGET)) return unsupported();
+    const bool multisample = d.SampleDesc.Count > 1;
+    const auto dimension = multisample ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
+    D3D11_RENDER_TARGET_VIEW_DESC desc{}; SIZE_T read = 0;
+    if (input && (!ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc)) return E_INVALIDARG;
+    if (!input) { desc.Format = d.Format; desc.ViewDimension = dimension; }
+    if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = d.Format;
+    if (desc.Format != d.Format || desc.ViewDimension != dimension) return unsupported();
+    if (!multisample && desc.Texture2D.MipSlice >= d.MipLevels) return E_INVALIDARG;
+    if (!out) return S_FALSE;
+    try {
+        auto view = std::make_unique<BufferView>();
+        view->vtable = rtv_vtable().data(); view->flags = 1; view->refcount = 0;
+        view->device = self; view->view_type = 0;
+        view->rtv_desc.Format = desc.Format; view->rtv_desc.ViewDimension = desc.ViewDimension;
+        if (!multisample) view->rtv_desc.Texture2D = desc.Texture2D;
+        const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        const HRESULT hr = self->d3d12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view->heap));
+        if (FAILED(hr)) return hr;
+        view->host = view->heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_RENDER_TARGET_VIEW_DESC native{};
+        native.Format = desc.Format;
+        native.ViewDimension = multisample ? D3D12_RTV_DIMENSION_TEXTURE2DMS : D3D12_RTV_DIMENSION_TEXTURE2D;
+        if (!multisample) native.Texture2D.MipSlice = desc.Texture2D.MipSlice;
+        self->d3d12->CreateRenderTargetView(texture->gpu.resource, &native, view->host);
+        texture_add_ref(texture); view->resource = texture;
+        retain_device(self); *out = view.release();
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
 const std::array<const void*, vtable_slots>& srv_vtable() {
     static const auto table = [] {
         auto t = traps<kind_srv>();
@@ -1464,37 +1586,97 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
         auto* texture = static_cast<Texture*>(resource);
         if (texture->device != self) return E_INVALIDARG;
         const auto unsupported = [&]() -> HRESULT {
-            if (stop_on_missing_service()) return static_cast<HRESULT>(trap_slot<kind_device, 7>(self,
-                reinterpret_cast<std::uintptr_t>(resource), reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(out)));
+            if (stop_on_missing_service()) {
+                std::fprintf(stderr, "xone-era: SRV source %s %ux%u format %u mips %u samples %u\n", texture->volume ? "3D" : "2D",
+                    texture->volume ? texture->volume_desc.standard.Width : texture->desc.standard.Width,
+                    texture->volume ? texture->volume_desc.standard.Height : texture->desc.standard.Height,
+                    texture->volume ? texture->volume_desc.standard.Format : texture->desc.standard.Format,
+                    texture->volume ? texture->volume_desc.standard.MipLevels : texture->desc.standard.MipLevels,
+                    texture->volume ? 1 : texture->desc.standard.SampleDesc.Count);
+                return static_cast<HRESULT>(trap_slot<kind_device, 7>(self,
+                    reinterpret_cast<std::uintptr_t>(resource), reinterpret_cast<std::uintptr_t>(input), reinterpret_cast<std::uintptr_t>(out)));
+            }
             return DXGI_ERROR_UNSUPPORTED;
         };
         const auto format = texture->volume ? texture->volume_desc.standard.Format : texture->desc.standard.Format;
         const UINT mips = texture->volume ? texture->volume_desc.standard.MipLevels : texture->desc.standard.MipLevels;
         const UINT binds = texture->volume ? texture->volume_desc.standard.BindFlags : texture->desc.standard.BindFlags;
-        const auto dimension = texture->volume ? D3D11_SRV_DIMENSION_TEXTURE3D : D3D11_SRV_DIMENSION_TEXTURE2D;
+        const bool multisample = !texture->volume && texture->desc.standard.SampleDesc.Count > 1;
+        const auto dimension = texture->volume ? D3D11_SRV_DIMENSION_TEXTURE3D :
+            multisample ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
         if (!(binds & D3D11_BIND_SHADER_RESOURCE) || (!texture->volume && texture->desc.standard.ArraySize != 1) ||
             format == DXGI_FORMAT_BC7_TYPELESS) return unsupported();
         D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
         SIZE_T read = 0;
         if (input && (!ReadProcessMemory(GetCurrentProcess(), input, &desc, sizeof desc, &read) || read != sizeof desc)) return E_INVALIDARG;
-        if (!input) { desc.Format = format; desc.ViewDimension = dimension; desc.Texture2D.MipLevels = mips; }
+        if (!input) { desc.Format = format; desc.ViewDimension = dimension; if (!multisample) desc.Texture2D.MipLevels = mips; }
         if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = format;
+        if (multisample && desc.Format == DXGI_FORMAT_R8_UINT && desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+            const auto& d = texture->desc.standard;
+            if (d.SampleDesc.Count > 4 || d.SampleDesc.Quality || desc.Texture2D.MostDetailedMip ||
+                (desc.Texture2D.MipLevels != 1 && desc.Texture2D.MipLevels != UINT_MAX)) return unsupported();
+            if (!out) return S_FALSE;
+            try {
+                LegacyTexture2DDesc meta{};
+                meta.standard = {d.Width, d.Height, 1, 1, DXGI_FORMAT_R8_UINT, {1, 0}, D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+                TitleTextureLayout layout;
+                HRESULT hr = create_xg_texture_layout(d.Width, d.Height, 1, 1, meta.standard.Format, UINT_MAX, layout, meta.standard.BindFlags);
+                if (FAILED(hr)) return hr;
+                void* object = nullptr;
+                hr = make_texture2d(self, meta, layout, nullptr, &object);
+                if (FAILED(hr)) return hr;
+                std::unique_ptr<Texture, decltype(&texture_release)> metadata(static_cast<Texture*>(object), &texture_release);
+                // Every fragment exists independently in our expanded MSAA resource.
+                // FMASK therefore maps sample i to fragment i; quality/EQAA cases above are explicit.
+                const UINT bits = std::bit_width(d.SampleDesc.Count - 1);
+                UINT identity = 0;
+                for (UINT sample = 0; sample < d.SampleDesc.Count; ++sample) identity |= sample << (bits * sample);
+                std::vector<unsigned char> linear(SIZE_T(d.Width) * d.Height, static_cast<unsigned char>(identity));
+                void* canonical = nullptr;
+                hr = map_title_gpu_resource(metadata->gpu, &canonical);
+                if (FAILED(hr)) return hr;
+                hr = layout.copy(layout.context.get(), true, linear.data(), canonical, 0, d.Width, d.Width * d.Height);
+                const HRESULT unmapped = unmap_title_gpu_resource(metadata->gpu);
+                if (FAILED(hr)) return hr;
+                if (FAILED(unmapped)) return unmapped;
+                auto view = std::make_unique<BufferView>();
+                view->vtable = srv_vtable().data(); view->flags = 1; view->refcount = 0;
+                view->device = self; view->view_type = 2;
+                view->srv_desc.Format = desc.Format; view->srv_desc.ViewDimension = desc.ViewDimension; view->srv_desc.Texture2D.MipLevels = 1;
+                view->descriptor = metadata->descriptor; view->allocation_start = metadata->canonical;
+                const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+                hr = self->d3d12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view->heap));
+                if (FAILED(hr)) return hr;
+                view->host = view->heap->GetCPUDescriptorHandleForHeapStart();
+                D3D12_SHADER_RESOURCE_VIEW_DESC native{};
+                native.Format = DXGI_FORMAT_R8_UINT; native.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                native.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; native.Texture2D.MipLevels = 1;
+                self->d3d12->CreateShaderResourceView(metadata->gpu.resource, &native, view->host);
+                view->metadata_texture = metadata.release();
+                texture_add_ref(texture); view->resource = texture;
+                retain_device(self); *out = view.release();
+                return S_OK;
+            } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        }
         if (desc.ViewDimension != dimension || desc.Format != format) return unsupported();
         // Texture2D/Texture3D share the same two-UINT mip range in this ABI.
-        if (desc.Texture2D.MostDetailedMip >= mips) return E_INVALIDARG;
-        if (desc.Texture2D.MipLevels == UINT_MAX) desc.Texture2D.MipLevels = mips - desc.Texture2D.MostDetailedMip;
-        if (!desc.Texture2D.MipLevels || desc.Texture2D.MipLevels > mips - desc.Texture2D.MostDetailedMip) return E_INVALIDARG;
-        if (desc.Texture2D.MostDetailedMip || desc.Texture2D.MipLevels != mips) return unsupported();
+        if (!multisample) {
+            if (desc.Texture2D.MostDetailedMip >= mips) return E_INVALIDARG;
+            if (desc.Texture2D.MipLevels == UINT_MAX) desc.Texture2D.MipLevels = mips - desc.Texture2D.MostDetailedMip;
+            if (!desc.Texture2D.MipLevels || desc.Texture2D.MipLevels > mips - desc.Texture2D.MostDetailedMip) return E_INVALIDARG;
+            if (desc.Texture2D.MostDetailedMip || desc.Texture2D.MipLevels != mips) return unsupported();
+        }
         if (!out) return S_FALSE;
         try {
             auto view = std::make_unique<BufferView>();
             view->vtable = srv_vtable().data(); view->flags = 1; view->refcount = 0;
             view->view_type = 2; view->device = self;
             view->srv_desc.Format = desc.Format; view->srv_desc.ViewDimension = desc.ViewDimension;
-            view->srv_desc.Texture2D = desc.Texture2D;
+            if (!multisample) view->srv_desc.Texture2D = desc.Texture2D;
             view->allocation_start = texture->canonical; view->descriptor = texture->descriptor;
             // 18009b0c0: base/last mip in word 3; first/last array slice in word 5.
-            view->descriptor[3] = (view->descriptor[3] & ~0xff000u) | ((mips - 1) << 16);
+            if (multisample) view->descriptor[3] &= ~0xf000u; // Preserve native log2(samples) at bits 16..19.
+            else view->descriptor[3] = (view->descriptor[3] & ~0xff000u) | ((mips - 1) << 16);
             if (!texture->volume) view->descriptor[5] &= ~0x3ffffffu;
             const D3D12_DESCRIPTOR_HEAP_DESC heap{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
             const HRESULT hr = self->d3d12->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&view->heap));
@@ -1502,10 +1684,11 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
             view->host = view->heap->GetCPUDescriptorHandleForHeapStart();
             D3D12_SHADER_RESOURCE_VIEW_DESC native{};
             native.Format = format;
-            native.ViewDimension = texture->volume ? D3D12_SRV_DIMENSION_TEXTURE3D : D3D12_SRV_DIMENSION_TEXTURE2D;
+            native.ViewDimension = texture->volume ? D3D12_SRV_DIMENSION_TEXTURE3D :
+                multisample ? D3D12_SRV_DIMENSION_TEXTURE2DMS : D3D12_SRV_DIMENSION_TEXTURE2D;
             native.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             if (texture->volume) native.Texture3D.MipLevels = mips;
-            else native.Texture2D.MipLevels = mips;
+            else if (!multisample) native.Texture2D.MipLevels = mips;
             self->d3d12->CreateShaderResourceView(texture->gpu.resource, &native, view->host);
             texture_add_ref(texture); view->resource = texture;
             retain_device(self); *out = view.release();
@@ -1668,6 +1851,7 @@ ULONG STDMETHODCALLTYPE dxgi_add_ref(DxgiObject* self) { return add_ref(self); }
 ULONG STDMETHODCALLTYPE dxgi_release(DxgiObject* self) {
     const ULONG left = InterlockedDecrement(counter(self));
     if (left == 0) {
+        for (auto* texture : self->backbuffers) if (texture) texture_release(texture);
         if (self->host) self->host->Release();
         release_device(self->device);
         delete self;
@@ -1741,6 +1925,33 @@ const std::array<const void*, vtable_slots>& swapchain_vtable();
 HRESULT STDMETHODCALLTYPE swapchain_query(DxgiObject* self, REFIID riid, void** out) {
     return query(self, riid, out, {iid_unknown, iid_graphics_unknown, iid_dxgi_object, iid_dxgi_swapchain1});
 }
+HRESULT STDMETHODCALLTYPE swapchain_get_buffer(DxgiObject* self, UINT index, REFIID iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    if (!self->host || index >= self->requested_desc.BufferCount || index >= self->backbuffers.size()) return DXGI_ERROR_INVALID_CALL;
+    std::lock_guard lock(self->swapchain_mutex);
+    auto*& texture = self->backbuffers[index];
+    if (!texture) {
+        Microsoft::WRL::ComPtr<ID3D12Resource> native;
+        HRESULT hr = static_cast<IDXGISwapChain1*>(self->host)->GetBuffer(index, IID_PPV_ARGS(&native));
+        if (FAILED(hr)) return hr;
+        const auto d = native->GetDesc();
+        if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Width > 16384 || d.Height > 16384 ||
+            d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1) return DXGI_ERROR_UNSUPPORTED;
+        LegacyTexture2DDesc desc{};
+        desc.standard = {UINT(d.Width), d.Height, 1, 1, self->requested_desc.Format, {1, 0}, D3D11_USAGE_DEFAULT,
+            D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        TitleTextureLayout layout;
+        hr = create_xg_texture_layout(desc.standard.Width, desc.standard.Height, 1, 1, desc.standard.Format,
+            UINT_MAX, layout, desc.standard.BindFlags);
+        if (FAILED(hr)) return hr;
+        void* object = nullptr;
+        hr = make_texture2d(self->device, desc, layout, nullptr, &object);
+        if (FAILED(hr)) return hr;
+        texture = static_cast<Texture*>(object);
+    }
+    return texture_query(texture, iid, out);
+}
 
 // The swapchain presents straight onto the CoreWindow's HWND through a D3D12
 // flip-model swapchain on the device queue (maintainer decision: no Presenter copy).
@@ -1762,11 +1973,9 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
                  desc->BufferCount, static_cast<int>(desc->SwapEffect), static_cast<int>(desc->Scaling),
                  static_cast<int>(desc->AlphaMode), desc->BufferUsage, desc->Flags, desc->SampleDesc.Count);
     if (device != self->device || restrict_output) return DXGI_ERROR_INVALID_CALL; // Not observed on the title path.
-    if (self->device->legacy && (desc->Flags & 0x200000)) {
-        // The supplied reference selects display shaders from this Xbox bit.
-        // Passing it to desktop DXGI fails; masking it would lose that contract.
+    if (self->device->legacy && (desc->Flags & 0x100000)) {
         if (stop_on_missing_service()) {
-            std::fputs("xone-era: Xbox swapchain display flag 0x200000 requires presentation translation\n", stderr);
+            std::fputs("xone-era: Xbox swapchain display flag 0x100000 remains unsupported\n", stderr);
             return static_cast<HRESULT>(trap_slot<kind_factory, 17>(self,
                 reinterpret_cast<std::uintptr_t>(device), reinterpret_cast<std::uintptr_t>(window), reinterpret_cast<std::uintptr_t>(desc)));
         }
@@ -1774,7 +1983,15 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
     }
     HWND hwnd = core_window_hwnd(window);
     if (!hwnd) return DXGI_ERROR_INVALID_CALL;
+    std::unique_ptr<DisplayTransfer> display;
+    if (self->device->legacy && (desc->Flags & 0x200000)) {
+        display.reset(new (std::nothrow) DisplayTransfer);
+        if (!display) return E_OUTOFMEMORY;
+        const HRESULT hr = display->initialize(self->device->d3d12, strip_srgb(desc->Format));
+        if (FAILED(hr)) return hr;
+    }
     DXGI_SWAP_CHAIN_DESC1 host = *desc;
+    if (display) host.Flags &= ~0x200000u; // Consumed by the retained GPU transfer, not forwarded to desktop DXGI.
     host.Format = strip_srgb(desc->Format); // Flip-model buffers cannot be sRGB; views keep the title's format.
     if (host.BufferCount < 2) host.BufferCount = 2;
     if (host.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD) host.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
@@ -1793,6 +2010,10 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
     hr = new_dxgi(swapchain_vtable().data(), self->device, out);
     if (FAILED(hr)) { chain->Release(); return hr; }
     static_cast<DxgiObject*>(*out)->host = chain;
+    static_cast<DxgiObject*>(*out)->display = std::move(display);
+    static_cast<DxgiObject*>(*out)->requested_desc = *desc;
+    if (self->device->legacy && (desc->Flags & 0x200000))
+        std::fputs("xone-era: Xbox swapchain 0x200000 prepared with native sRGB-to-BT.709 transfer\n", stderr);
     return S_OK;
 }
 
@@ -1862,6 +2083,7 @@ const void* const* legacy_dxgi_vtable(const void* const* modern) {
         t[0] = reinterpret_cast<const void*>(&swapchain_query);
         t[1] = reinterpret_cast<const void*>(&dxgi_add_ref);
         t[2] = reinterpret_cast<const void*>(&dxgi_release);
+        t[10] = reinterpret_cast<const void*>(&swapchain_get_buffer);
         return t;
     }();
     if (modern == dxgi_device_vtable().data()) return device.data();
@@ -1943,11 +2165,13 @@ const std::array<const void*, vtable_slots>& legacy_device_vtable() {
         t[1] = reinterpret_cast<const void*>(&device_add_ref);
         t[2] = reinterpret_cast<const void*>(&device_release);
         t[3] = reinterpret_cast<const void*>(&device_create_buffer);
+        t[5] = reinterpret_cast<const void*>(&device_create_texture2d);
         t[6] = reinterpret_cast<const void*>(&device_create_texture3d);
         t[7] = reinterpret_cast<const void*>(&device_create_srv);
         t[64] = reinterpret_cast<const void*>(&device_create_placement_texture2d);
         t[65] = reinterpret_cast<const void*>(&device_create_placement_texture3d);
         t[8] = reinterpret_cast<const void*>(&device_create_uav);
+        t[9] = reinterpret_cast<const void*>(&device_create_rtv);
         t[12] = reinterpret_cast<const void*>(&device_create_shader<1>);
         t[13] = reinterpret_cast<const void*>(&device_create_shader<2>);
         t[11] = reinterpret_cast<const void*>(&device_create_input_layout);
@@ -2288,7 +2512,8 @@ namespace {
 struct XgTextureContext {
     std::shared_ptr<Image> module;
     void* computer = nullptr;
-    UINT width = 0, height = 0, mips = 0, arrays = 0, block = 0, bytes_per_block = 0;
+    UINT width = 0, height = 0, mips = 0, arrays = 0, block = 0, bytes_per_block = 0, samples = 1;
+    SIZE_T bytes = 0;
     ~XgTextureContext() {
         if (computer) reinterpret_cast<ULONG (*)(void*)>((*static_cast<void***>(computer))[1])(computer);
     }
@@ -2299,9 +2524,23 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
     if (!context || !linear || !tiled || subresource >= context->mips * context->arrays) return E_INVALIDARG;
     const UINT mip = subresource % context->mips;
     const UINT width = (std::max)(1u, context->width >> mip), height = (std::max)(1u, context->height >> mip);
-    const UINT row_bytes = ((width + context->block - 1) / context->block) * context->bytes_per_block;
+    const UINT row_bytes = ((width + context->block - 1) / context->block) * context->bytes_per_block * context->samples;
     const UINT rows = (height + context->block - 1) / context->block;
     if (row_pitch < row_bytes || UINT64(row_pitch) * rows > slice_pitch) return E_INVALIDARG;
+    if (context->samples > 1) {
+        // Original CopyInto/FromSubresource at 2b40/2fa0 hardcodes sample 0.
+        // Slot 4 (2a70) accepts the sample index and returns its exact byte offset.
+        using Address = UINT64 (*)(void*, UINT, UINT, UINT64, UINT, UINT, UINT);
+        const auto address = reinterpret_cast<Address>((*static_cast<void***>(context->computer))[4]);
+        for (UINT y = 0; y < height; ++y) for (UINT x = 0; x < width; ++x) for (UINT sample = 0; sample < context->samples; ++sample) {
+            const UINT64 offset = address(context->computer, 0, mip, x, y, subresource / context->mips, sample);
+            if (offset > context->bytes || context->bytes - offset < context->bytes_per_block) return E_INVALIDARG;
+            auto* a = static_cast<unsigned char*>(linear) + SIZE_T(y) * row_pitch + (SIZE_T(x) * context->samples + sample) * context->bytes_per_block;
+            auto* b = static_cast<unsigned char*>(tiled) + offset;
+            std::memcpy(into_tiled ? b : a, into_tiled ? a : b, context->bytes_per_block);
+        }
+        return S_OK;
+    }
     // Slots 5/6 at 180002b40/180002fa0: tiled destination / linear destination.
     using Copy = HRESULT (*)(void*, void*, UINT, UINT, const void*, UINT, UINT);
     const auto functions = *static_cast<void***>(context->computer);
@@ -2312,7 +2551,7 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
 }
 
 static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth, UINT mips, UINT arrays, DXGI_FORMAT format,
-                                             UINT tile_mode, UINT bind_flags, TitleTextureLayout& out) {
+                                             UINT tile_mode, UINT bind_flags, UINT samples, TitleTextureLayout& out) {
     out = {};
     const auto module = xg_module.load();
     if (!module || !xg_initialized) return E_UNEXPECTED;
@@ -2321,16 +2560,30 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
     const UINT levels = std::bit_width((std::max)((std::max)(width, height), depth));
     if (!mips) mips = levels;
     if (mips > levels || mips > 15) return E_INVALIDARG;
+    if (!samples || samples > 8 || (samples & (samples - 1)) || (samples > 1 && (mips != 1 || depth))) return E_INVALIDARG;
     const bool bc7 = format == DXGI_FORMAT_BC7_TYPELESS || format == DXGI_FORMAT_BC7_UNORM || format == DXGI_FORMAT_BC7_UNORM_SRGB;
     if ((!bc7 && format != DXGI_FORMAT_R8G8B8A8_UNORM && format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-         format != DXGI_FORMAT_R10G10B10A2_UNORM) || (depth && bc7)) return DXGI_ERROR_UNSUPPORTED;
+         format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT) ||
+        ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
+    if (samples > 1 && format == DXGI_FORMAT_R8_UINT) return DXGI_ERROR_UNSUPPORTED;
     try {
         auto context = std::make_shared<XgTextureContext>();
         context->module = module; context->width = width; context->height = height;
         context->mips = mips; context->arrays = arrays; context->block = bc7 ? 4 : 1; context->bytes_per_block = bc7 ? 16 : 4;
+        if (format == DXGI_FORMAT_R8_UINT) context->bytes_per_block = 1;
+        context->samples = samples;
         // 180052210 constructs the 60-byte XG descriptor independently of the
         // 52-byte public texture descriptor. Single-sample, default SRV storage.
-        std::array<UINT, 15> desc{width, height, mips, arrays, static_cast<UINT>(format), 1, 0, 0, 0, 0, 0, 0, 0, tile_mode, 0};
+        if (!depth && tile_mode == UINT_MAX) {
+            using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
+            const auto optimal = reinterpret_cast<Optimal>(module->find_export("XGComputeOptimalTileMode"));
+            if (!optimal) return E_NOINTERFACE;
+            tile_mode = optimal(3, format, width, height, 1, samples, bind_flags, 0);
+            if (tile_mode == UINT_MAX) return DXGI_ERROR_UNSUPPORTED;
+        }
+        // Approved expanded canonical image: host render-target capabilities
+        // remain below; Xbox auxiliary compression planes are not fabricated.
+        std::array<UINT, 15> desc{width, height, mips, arrays, static_cast<UINT>(format), samples, 0, 0, 0, 0, 0, 0, 0, tile_mode, 0};
         if (depth) {
             // Original 180052210: 52-byte volume descriptor; tile mode at +44.
             using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
@@ -2363,11 +2616,13 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
             return DXGI_ERROR_UNSUPPORTED;
         }
         out.bytes = static_cast<SIZE_T>(bytes); out.alignment = static_cast<SIZE_T>(alignment);
+        context->bytes = out.bytes;
         out.resource_desc.Dimension = depth ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         out.resource_desc.Width = width; out.resource_desc.Height = height;
         out.resource_desc.DepthOrArraySize = static_cast<UINT16>(depth ? depth : arrays); out.resource_desc.MipLevels = static_cast<UINT16>(mips);
-        out.resource_desc.Format = format; out.resource_desc.SampleDesc.Count = 1;
+        out.resource_desc.Format = format; out.resource_desc.SampleDesc.Count = samples;
         if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) out.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (bind_flags & D3D11_BIND_RENDER_TARGET) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         std::memcpy(out.guest_descriptor.data(), static_cast<unsigned char*>(context->computer) + 0x10, sizeof out.guest_descriptor);
         out.context = std::move(context); out.copy = &copy_xg_texture;
         return S_OK;
@@ -2375,14 +2630,15 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
 }
 
 HRESULT create_xg_texture_layout(UINT width, UINT height, UINT mips, UINT arrays, DXGI_FORMAT format,
-                                 UINT tile_mode, TitleTextureLayout& out) {
-    return create_xg_texture_layout_impl(width, height, 0, mips, arrays, format, tile_mode, 0, out);
+                                 UINT tile_mode, TitleTextureLayout& out, UINT bind_flags, UINT samples) {
+    if (bind_flags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET)) return DXGI_ERROR_UNSUPPORTED;
+    return create_xg_texture_layout_impl(width, height, 0, mips, arrays, format, tile_mode, bind_flags, samples, out);
 }
 HRESULT create_xg_texture3d_layout(UINT width, UINT height, UINT depth, UINT mips, DXGI_FORMAT format,
                                   UINT bind_flags, TitleTextureLayout& out, UINT tile_mode) {
     if (!depth) return E_INVALIDARG;
     if (bind_flags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
-    return create_xg_texture_layout_impl(width, height, depth, mips, 1, format, tile_mode, bind_flags, out);
+    return create_xg_texture_layout_impl(width, height, depth, mips, 1, format, tile_mode, bind_flags, 1, out);
 }
 
 void* resolve_d3d11x(const ImportRequest& request) {

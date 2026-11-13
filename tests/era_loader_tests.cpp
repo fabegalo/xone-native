@@ -73,13 +73,28 @@ std::vector<std::uint8_t> read(const char* path) {
 
 int main(int argc, char** argv) {
     using namespace xboxone::era;
-    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics")) {
+    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa")) {
         const bool graphics = std::string(argv[1]) == "--xg-graphics";
         set_stop_on_missing_activation(true);
         HRESULT hr = bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
         if (SUCCEEDED(hr)) hr = bind_xg_module(std::filesystem::path(argv[3]).wstring());
         if (SUCCEEDED(hr)) hr = initialize_xg_module();
         TitleTextureLayout layout;
+        if (std::string(argv[1]) == "--xg-msaa") {
+            if (SUCCEEDED(hr)) hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, layout,
+                D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 4);
+            std::cout << "original XG MSAA4 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
+            if (FAILED(hr)) return 1;
+            std::vector<unsigned char> tiled(layout.bytes + 32, 0x5a), input(32 * 16 * 4 * 4), output(input.size(), 0);
+            for (UINT i = 0; i < input.size(); ++i) input[i] = static_cast<unsigned char>(i * 13 + i / 4 + 7);
+            hr = layout.copy(layout.context.get(), true, input.data(), tiled.data() + 16, 0, 512, 8192);
+            if (SUCCEEDED(hr)) hr = layout.copy(layout.context.get(), false, output.data(), tiled.data() + 16, 0, 512, 8192);
+            std::cout << "original XG MSAA4 copy hr=0x" << std::hex << hr << std::dec << " equal=" << (input == output) << '\n';
+            check(SUCCEEDED(hr) && input == output, "MSAA CPU layout preserves four independent samples without resolve");
+            check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
+                std::all_of(tiled.end() - 16, tiled.end(), [](auto x) { return x == 0x5a; }), "MSAA copies preserve canonical guards");
+            return failures ? 1 : 0;
+        }
         if (SUCCEEDED(hr)) hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
         std::cout << "original XG BC7 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
         if (FAILED(hr)) return 1;
@@ -228,6 +243,94 @@ int main(int argc, char** argv) {
                     "placement volume retirement preserves all borrowed bytes and ownership");
                 free_memory(storage, attributes);
             }
+            for (bool multisample : {false, true}) {
+                Desc target{};
+                target.standard = {32, 16, 1, 1, DXGI_FORMAT_R10G10B10A2_UNORM, {1, 0}, D3D11_USAGE_DEFAULT,
+                    D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 0, 0};
+                if (multisample) {
+                    target.standard.SampleDesc.Count = 4; target.standard.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+                    target.standard.MiscFlags = 0x40000;
+                }
+                using CreateTarget = HRESULT (STDMETHODCALLTYPE*)(void*, const Desc*, const D3D11_SUBRESOURCE_DATA*, void**);
+                const auto create_target = reinterpret_cast<CreateTarget>(vt(device)[5]);
+                texture = nullptr;
+                check(create_target(device, &target, nullptr, &texture) == S_OK && texture,
+                      "default render-target owns the approved expanded coherent image");
+                if (texture) {
+                    using GetTextureDesc = void (STDMETHODCALLTYPE*)(void*, Desc*);
+                    Desc actual{};
+                    reinterpret_cast<GetTextureDesc>(vt(texture)[12])(texture, &actual);
+                    check(actual.standard.SampleDesc.Count == target.standard.SampleDesc.Count && !actual.standard.MiscFlags,
+                          "GetDesc preserves four samples and consumes the native auxiliary creation hint");
+                    if (multisample) {
+                        using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
+                        void* srv = nullptr;
+                        check(reinterpret_cast<CreateSrv>(vt(device)[7])(device, texture, nullptr, &srv) == S_OK && srv,
+                              "MSAA SRV owns a real multisample native descriptor");
+                        if (srv) {
+                            D3D11_SHADER_RESOURCE_VIEW_DESC desc{};
+                            using GetSrvDesc = void (STDMETHODCALLTYPE*)(void*, D3D11_SHADER_RESOURCE_VIEW_DESC*);
+                            reinterpret_cast<GetSrvDesc>(vt(srv)[9])(srv, &desc);
+                            UINT32 word = 0; std::memcpy(&word, static_cast<char*>(srv) + 60, 4);
+                            check(desc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DMS && desc.Format == target.standard.Format &&
+                                ((word >> 16) & 15) == 2, "MSAA SRD retains log2(samples) instead of treating it as the last mip");
+                            reinterpret_cast<Count>(vt(srv)[2])(srv);
+                        }
+                        D3D11_SHADER_RESOURCE_VIEW_DESC mask_desc{};
+                        mask_desc.Format = DXGI_FORMAT_R8_UINT; mask_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; mask_desc.Texture2D.MipLevels = 1;
+                        srv = nullptr;
+                        check(reinterpret_cast<CreateSrv>(vt(device)[7])(device, texture, &mask_desc, &srv) == S_OK && srv,
+                              "FMASK view derives real expanded fragment topology from the MSAA resource");
+                        if (srv) {
+                            using GetResource = void (STDMETHODCALLTYPE*)(void*, void**);
+                            void* owner = nullptr;
+                            reinterpret_cast<GetResource>(vt(srv)[8])(srv, &owner);
+                            check(owner == texture, "FMASK GetResource retains the original multisample texture");
+                            if (owner) reinterpret_cast<Count>(vt(owner)[2])(owner);
+                            void* canonical = nullptr;
+                            std::memcpy(&canonical, static_cast<char*>(srv) + 80, sizeof canonical);
+                            TitleTextureLayout mask_layout;
+                            HRESULT mask_hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R8_UINT, UINT_MAX, mask_layout, D3D11_BIND_SHADER_RESOURCE);
+                            std::array<unsigned char, 32 * 16> values{};
+                            if (SUCCEEDED(mask_hr)) mask_hr = mask_layout.copy(mask_layout.context.get(), false, values.data(), canonical, 0, 32, 512);
+                            UINT identity = 0;
+                            for (UINT sample = 0; sample < actual.standard.SampleDesc.Count; ++sample) identity |= sample << (2 * sample);
+                            check(SUCCEEDED(mask_hr) && std::all_of(values.begin(), values.end(), [identity](auto x) { return x == identity; }),
+                                  "FMASK bytes map each of the four backed samples to its actual independent fragment");
+                            reinterpret_cast<Count>(vt(srv)[2])(srv);
+                        }
+                    }
+                    using CreateRtv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_RENDER_TARGET_VIEW_DESC*, void**);
+                    const auto create_rtv = reinterpret_cast<CreateRtv>(vt(device)[9]);
+                    void* view = nullptr;
+                    D3D11_RENDER_TARGET_VIEW_DESC invalid{};
+                    invalid.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D; invalid.Texture2D.MipSlice = 1;
+                    check(create_rtv(device, texture, &invalid, &view) == (multisample ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG) && !view,
+                          "render-target view rejects a missing mip or incompatible sample dimension");
+                    check(create_rtv(device, texture, nullptr, nullptr) == S_FALSE,
+                          "default render-target view validates without acquiring references");
+                    check(create_rtv(device, texture, nullptr, &view) == S_OK && view,
+                          "native slot nine creates a real render-target descriptor");
+                    if (view) {
+                        struct { D3D11_RENDER_TARGET_VIEW_DESC desc{}; UINT guard = 0xaabbccdd; } result;
+                        using GetDesc = void (STDMETHODCALLTYPE*)(void*, D3D11_RENDER_TARGET_VIEW_DESC*);
+                        reinterpret_cast<GetDesc>(vt(view)[9])(view, &result.desc);
+                        check(result.desc.Format == target.standard.Format && result.desc.ViewDimension ==
+                            (multisample ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D) &&
+                            !result.desc.Texture2D.MipSlice && result.guard == 0xaabbccdd, "RTV GetDesc preserves its twenty-byte ABI");
+                        UINT type = 99; void* retained = nullptr;
+                        std::memcpy(&type, static_cast<char*>(view) + 40, 4);
+                        using GetResource = void (STDMETHODCALLTYPE*)(void*, void**);
+                        reinterpret_cast<GetResource>(vt(view)[8])(view, &retained);
+                        check(type == 0 && retained == texture, "RTV public type and retained resource match the original ABI");
+                        if (retained) reinterpret_cast<Count>(vt(retained)[2])(retained);
+                        check(reinterpret_cast<Count>(vt(texture)[2])(texture) == 1, "RTV retains owned texture after caller release");
+                        texture = nullptr;
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                    }
+                    if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+                }
+                }
             reinterpret_cast<Count>(vt(context)[2])(context);
             reinterpret_cast<Count>(vt(device)[2])(device);
             std::cout << "original XG graphics metadata " << (failures ? "FAILED" : "passed") << '\n';
@@ -1331,9 +1434,12 @@ int main(int argc, char** argv) {
                             check(create_chain(factory, device, nullptr, nullptr, nullptr, &chain) == DXGI_ERROR_INVALID_CALL,
                                   "legacy factory slot seventeen validates the native swapchain ABI");
                             DXGI_SWAP_CHAIN_DESC1 desc{};
-                            desc.Flags = 0x200000;
+                            desc.Flags = 0x100000;
                             check(create_chain(factory, device, nullptr, &desc, nullptr, &chain) == DXGI_ERROR_UNSUPPORTED && !chain,
-                                  "Xbox display conversion cannot be silently removed from the desktop descriptor");
+                                  "unimplemented Xbox display flags cannot be silently removed from the desktop descriptor");
+                            desc.Flags = 0x200000;
+                            check(create_chain(factory, device, nullptr, &desc, nullptr, &chain) == DXGI_ERROR_INVALID_CALL && !chain,
+                                  "translated display profile still requires a real owned CoreWindow");
                             reinterpret_cast<Count>(vt(factory)[2])(factory);
                         }
                         reinterpret_cast<Count>(vt(adapter)[2])(adapter);

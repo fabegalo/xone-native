@@ -255,6 +255,7 @@ struct DxgiObject : GraphicsObject {
 
 std::atomic<D3D11XTrapHandler> trap_handler{nullptr};
 std::atomic<bool> legacy_abi_bound{false};
+std::atomic<bool> modern_display_abi_bound{false};
 std::atomic<std::shared_ptr<Image>> xg_module;
 std::atomic<bool> xg_initialized{false};
 std::mutex xg_module_mutex;
@@ -1972,8 +1973,11 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
                  "usage 0x%X flags 0x%X samples %u\n", desc->Width, desc->Height, static_cast<int>(desc->Format),
                  desc->BufferCount, static_cast<int>(desc->SwapEffect), static_cast<int>(desc->Scaling),
                  static_cast<int>(desc->AlphaMode), desc->BufferUsage, desc->Flags, desc->SampleDesc.Count);
-    if (device != self->device || restrict_output) return DXGI_ERROR_INVALID_CALL; // Not observed on the title path.
-    if (self->device->legacy && (desc->Flags & 0x100000)) {
+    if (device != self->device || restrict_output) {
+        if (stop_on_missing_service()) std::fprintf(stderr,"xone-era: swapchain binding refused device %p expected %p restrict %p\n",device,self->device,restrict_output);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+    if ((self->device->legacy || modern_display_abi_bound) && (desc->Flags & 0x100000)) {
         if (stop_on_missing_service()) {
             std::fputs("xone-era: Xbox swapchain display flag 0x100000 remains unsupported\n", stderr);
             return static_cast<HRESULT>(trap_slot<kind_factory, 17>(self,
@@ -1982,9 +1986,12 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
         return DXGI_ERROR_UNSUPPORTED;
     }
     HWND hwnd = core_window_hwnd(window);
-    if (!hwnd) return DXGI_ERROR_INVALID_CALL;
+    if (!hwnd) {
+        if (stop_on_missing_service()) std::fprintf(stderr,"xone-era: swapchain window identity refused %p\n",window);
+        return DXGI_ERROR_INVALID_CALL;
+    }
     std::unique_ptr<DisplayTransfer> display;
-    if (self->device->legacy && (desc->Flags & 0x200000)) {
+    if ((self->device->legacy || modern_display_abi_bound) && (desc->Flags & 0x200000)) {
         display.reset(new (std::nothrow) DisplayTransfer);
         if (!display) return E_OUTOFMEMORY;
         const HRESULT hr = display->initialize(self->device->d3d12, strip_srgb(desc->Format));
@@ -2012,7 +2019,8 @@ HRESULT STDMETHODCALLTYPE factory_create_for_core_window(DxgiObject* self, void*
     static_cast<DxgiObject*>(*out)->host = chain;
     static_cast<DxgiObject*>(*out)->display = std::move(display);
     static_cast<DxgiObject*>(*out)->requested_desc = *desc;
-    if (self->device->legacy && (desc->Flags & 0x200000))
+    if (stop_on_missing_service()) std::fprintf(stderr,"xone-era: native swapchain created %p\n",*out);
+    if (static_cast<DxgiObject*>(*out)->display)
         std::fputs("xone-era: Xbox swapchain 0x200000 prepared with native sRGB-to-BT.709 transfer\n", stderr);
     return S_OK;
 }
@@ -2431,6 +2439,7 @@ void set_d3d11x_trap_handler(D3D11XTrapHandler handler) { trap_handler.store(han
 
 HRESULT bind_d3d11x_abi(const std::wstring& original_combase) {
     legacy_abi_bound = false;
+    modern_display_abi_bound = false;
     DWORD ignored = 0;
     const auto path = detail::file_path(std::filesystem::path(original_combase));
     const DWORD bytes = GetFileVersionInfoSizeW(path.c_str(), &ignored);
@@ -2444,6 +2453,27 @@ HRESULT bind_d3d11x_abi(const std::wstring& original_combase) {
         if (!VerQueryValueW(info.data(), L"\\", reinterpret_cast<void**>(&version), &size) ||
             !version || size < sizeof(*version) || version->dwSignature != VS_FFI_SIGNATURE)
             return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        if (version->dwFileVersionMS == MAKELONG(0,10) && version->dwFileVersionLS == MAKELONG(5104,16299)) {
+            // The display flag is independent of the modern object's prefix;
+            // other original module/texture ABIs remain deliberately unbound.
+            Microsoft::WRL::Wrappers::FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+            if (!file.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+            LARGE_INTEGER length{};
+            if (!GetFileSizeEx(file.Get(),&length)) return HRESULT_FROM_WIN32(GetLastError());
+            if (length.QuadPart != 896000) return HRESULT_FROM_WIN32(ERROR_CRC);
+            detail::Sha256 hash;
+            std::array<std::uint8_t,16384> block{};
+            DWORD read = 0;
+            do {
+                if (!ReadFile(file.Get(),block.data(),static_cast<DWORD>(block.size()),&read,nullptr)) return HRESULT_FROM_WIN32(GetLastError());
+                hash.update(std::span<const std::uint8_t>(block.data(),read));
+            } while (read);
+            if (hash.finish() != "c22ac3a822ff2a421a995949ff36ee84a922f74f2998d084556e9d92b48cf3e5")
+                return HRESULT_FROM_WIN32(ERROR_CRC);
+            modern_display_abi_bound = true;
+            return S_OK;
+        }
         if (version->dwFileVersionMS != MAKELONG(2, 6) || version->dwFileVersionLS != MAKELONG(0, 11295))
             return DXGI_ERROR_UNSUPPORTED;
         legacy_abi_bound = true;

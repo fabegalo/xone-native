@@ -313,7 +313,11 @@ HRESULT query(WinrtObject*, REFIID iid, void** out) {
 
 } // namespace
 
-HWND core_window_hwnd(const void* object) { return object == &core_window() ? window : nullptr; }
+HWND core_window_hwnd(const void* object) {
+    // Reference 14004c5c0 accepts NULL for the runtime's current local window.
+    if (!object && GetCurrentThreadId() == window_thread) return window;
+    return object == &core_window() ? window : nullptr;
+}
 
 static HRESULT window_factory_query(WinrtObject*, REFIID iid, void** out) { return core_window_factory(iid,out); }
 static HRESULT STDMETHODCALLTYPE current_window(WinrtObject*, IInspectable** out) {

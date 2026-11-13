@@ -777,7 +777,7 @@ int main(int argc, char** argv) {
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT source_footprint{};
     device->GetCopyableFootprints(&image, 0, 1, 0, &source_footprint, nullptr, nullptr, nullptr);
     UINT64 display_signal = 100;
-    for (const auto output_format : {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM}) {
+    for (const auto output_format : {DXGI_FORMAT_R32G32B32A32_FLOAT, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM}) {
         DisplayTransfer transfer;
         hr = transfer.initialize(device.Get(), output_format);
         check(SUCCEEDED(hr), "display transfer compiles into a native graphics pipeline");
@@ -840,6 +840,10 @@ int main(int argc, char** argv) {
                         const UINT mask = c == 3 ? 3 : 1023;
                         const UINT actual = (packed >> (c * 10)) & mask;
                         matches = matches && std::abs(double(actual) - std::round(expected * mask)) <= (c == 3 ? 0 : 1);
+                    } else if (output_format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+                        const UINT channel = c == 0 ? 2 : c == 2 ? 0 : c;
+                        const UINT actual = pixel[(i % 16) * 4 + channel];
+                        matches = matches && std::abs(double(actual) - std::round(expected * 255)) <= (c == 3 ? 0 : 1);
                     } else {
                         float actual = 0; std::memcpy(&actual, pixel + (i % 16) * 16 + c * 4, 4);
                         matches = matches && std::abs(actual - expected) < .00001;

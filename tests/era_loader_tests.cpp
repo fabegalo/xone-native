@@ -1571,6 +1571,22 @@ int main(int argc, char** argv) {
         }
         check(FAILED(bind_d3d11x_abi(L"xone-absent-graphics-version.dll")) &&
               !resolve_title_import({"d3d11_x.dll", "D3D11XCreateDeviceX", 0}), "failed rebinding clears old ABI");
+        auto untrusted = read(argv[1]);
+        const std::array<std::uint8_t,4> version_signature{0xbd,0x04,0xef,0xfe};
+        auto info = std::search(untrusted.begin(),untrusted.end(),version_signature.begin(),version_signature.end());
+        check(info != untrusted.end() && untrusted.end() - info >= 16, "own fixture contains fixed version metadata");
+        if (info != untrusted.end() && untrusted.end() - info >= 16 && untrusted.size() < 896000) {
+            const DWORD ms = MAKELONG(0,10), ls = MAKELONG(5104,16299);
+            std::memcpy(&*(info+8),&ms,4); std::memcpy(&*(info+12),&ls,4);
+            untrusted.resize(896000);
+            wchar_t temp[MAX_PATH]; GetTempPathW(MAX_PATH,temp);
+            const auto path = std::filesystem::path(temp) / (L"xone-era-graphics-identity-" + std::to_wstring(GetCurrentProcessId()) + L".dll");
+            { std::ofstream file(path,std::ios::binary); file.write(reinterpret_cast<const char*>(untrusted.data()),untrusted.size()); }
+            check(bind_d3d11x_abi(path.wstring()) == HRESULT_FROM_WIN32(ERROR_CRC) &&
+                !resolve_title_import({"d3d11_x.dll","D3D11XCreateDeviceX",0}),
+                "matching modern version and size cannot enable an unverified module hash or the old ABI");
+            check(DeleteFileW(path.c_str()), "own graphics identity negative control is removed");
+        }
     }
 
     {
@@ -1860,6 +1876,8 @@ int main(int argc, char** argv) {
                     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(view, &handler, &token);
                 }
                 virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
+                    check(core_window_hwnd(nullptr) && core_window_hwnd(nullptr) == core_window_hwnd(window),
+                        "Xbox null-window swapchain binding selects the same owned local window");
                     constexpr GUID iid_window_static{0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};
                     IInspectable* statics = nullptr;
                     check(core_window_factory(iid_window_static,reinterpret_cast<void**>(&statics)) == S_OK && statics,
@@ -1872,6 +1890,7 @@ int main(int argc, char** argv) {
                             "GetForCurrentThread returns the exact SetWindow identity");
                         if (current) current->Release();
                         std::thread foreign([&] {
+                            check(!core_window_hwnd(nullptr), "null-window binding never selects another thread's window");
                             IInspectable* other = reinterpret_cast<IInspectable*>(1);
                             check(get(statics,&other) == S_OK && !other, "foreign thread has no runtime CoreWindow");
                         });

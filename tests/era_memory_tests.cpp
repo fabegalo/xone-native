@@ -87,10 +87,69 @@ int main(int argc, char** argv) {
     const auto allocate = reinterpret_cast<Allocate>(resolve_kernelx({"kernelx.dll", "XMemAllocDefault", 0}));
     const auto release = reinterpret_cast<Release>(resolve_kernelx({"kernelx.dll", "XMemFreeDefault", 0}));
     if (!allocate || !release) return 1;
+    struct MemoryStatus {
+        DWORD length = 64, reserved = 0;
+        UINT64 total = 0, available = 0, legacy_used = 0, legacy_peak = 0, legacy_available = 0, used = 0, title_available = 0;
+    };
+    static_assert(sizeof(MemoryStatus) == 64);
+    const auto memory_status = reinterpret_cast<BOOL (WINAPI*)(MemoryStatus*)>(resolve_kernelx({"kernelx.dll", "TitleMemoryStatus", 0}));
+    if (!memory_status) return 1;
+    const auto status = [&] {
+        MemoryStatus result;
+        check(memory_status(&result) && GetLastError() == ERROR_SUCCESS, "64-byte title memory status succeeds");
+        MEMORYSTATUSEX host{}; host.dwLength = sizeof host;
+        check(GlobalMemoryStatusEx(&host) && result.total == (std::min)(UINT64{0x140000000}, host.ullTotalPhys) &&
+            result.available <= result.total - result.used && result.available == result.title_available &&
+            !result.reserved && !result.legacy_used && !result.legacy_peak && !result.legacy_available,
+            "old ABI exposes bounded budget and usage with inactive legacy fields");
+        return result;
+    };
+    MemoryStatus bad_length; bad_length.length = 80;
+    check(!memory_status(nullptr) && GetLastError() == ERROR_INVALID_PARAMETER &&
+        !memory_status(&bad_length) && GetLastError() == ERROR_INVALID_PARAMETER && bad_length.length == 80,
+        "null and modern memory status ABI rejected without output");
+    const UINT64 initial_used = status().used;
+    const auto va = reinterpret_cast<decltype(&VirtualAlloc)>(resolve_kernelx({"kernelx.dll", "VirtualAlloc", 0}));
+    const auto vf = reinterpret_cast<decltype(&VirtualFree)>(resolve_kernelx({"kernelx.dll", "VirtualFree", 0}));
+    auto* cpu = static_cast<unsigned char*>(va(nullptr, 65536, MEM_RESERVE, PAGE_READWRITE));
+    if (!cpu) return 1;
+    check(status().used == initial_used, "virtual reservation costs no physical budget");
+    check(va(cpu + 1, 4096, MEM_COMMIT, PAGE_READWRITE) == cpu && status().used == initial_used + 8192,
+        "unaligned CPU commit accounts actual pages");
+    cpu[0] = 0x42;
+    check(va(cpu, 12288, MEM_COMMIT, PAGE_READWRITE) == cpu && cpu[0] == 0x42 && status().used == initial_used + 12288,
+        "overlapping CPU recommit counts new pages only and preserves bytes");
+    check(!va(cpu, 4096, MEM_COMMIT, 0xffffffff) && status().used == initial_used + 12288 && cpu[0] == 0x42,
+        "host commit failure preserves budget and existing bytes");
+    check(vf(cpu + 1, 4096, MEM_DECOMMIT) && status().used == initial_used + 4096,
+        "partial CPU decommit subtracts rounded committed pages");
+    check(vf(cpu, 8192, MEM_DECOMMIT) && status().used == initial_used + 4096,
+        "repeated decommit cannot subtract twice");
+    check(va(cpu, 4096, MEM_COMMIT, PAGE_READWRITE) == cpu && !cpu[0] && status().used == initial_used + 8192,
+        "CPU recommit restores zeroed pages and budget");
+    check(vf(cpu, 0, MEM_DECOMMIT) && status().used == initial_used && vf(cpu, 0, MEM_RELEASE),
+        "zero-size decommit and release restore physical budget");
+    auto* combined = va(nullptr, 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    check(combined && status().used == initial_used + 4096 && vf(combined, 0, MEM_RELEASE) && status().used == initial_used,
+        "combined CPU reserve/commit/release accounts page rounding");
+    constexpr SIZE_T over_budget = 0x140010000ull;
+    check(!allocate(over_budget, 0) && GetLastError() == ERROR_NOT_ENOUGH_MEMORY && status().used == initial_used,
+        "XMem rejects over-budget commitments transactionally");
+    check(!va(nullptr, over_budget, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) &&
+        GetLastError() == ERROR_NOT_ENOUGH_MEMORY && status().used == initial_used,
+        "ordinary VirtualAlloc rejects over-budget commitment before host allocation");
+    auto* huge = va(nullptr, over_budget, 0x30002000, PAGE_READWRITE);
+    if (!huge) return 1;
+    check(status().used == initial_used && !va(huge, over_budget, 0x30001000, 0x10004) &&
+        GetLastError() == ERROR_NOT_ENOUGH_MEMORY && status().used == initial_used && vf(huge, 0, MEM_RELEASE),
+        "graphics reservation exceeds budget but physical commit is refused transactionally");
     constexpr ULONGLONG attributes = 0x64034000;
     auto* memory = static_cast<unsigned char*>(allocate(0x129003, attributes));
     check(memory != nullptr, "observed XMem attributes allocate real CPU backing");
     if (!memory) return 1;
+    check(status().used == initial_used + 0x130000, "XMem charges its actual 64-KiB backing");
+    check(!allocate(SIZE_T(status().total - status().used + 1), 0) && GetLastError() == ERROR_NOT_ENOUGH_MEMORY &&
+        status().used == initial_used + 0x130000, "remaining title budget includes existing CPU/GPU commitments");
     check((reinterpret_cast<std::uintptr_t>(memory) & 65535) == 0 &&
               reinterpret_cast<std::uintptr_t>(memory) >= 0x100000000ull &&
               reinterpret_cast<std::uintptr_t>(memory) < 0x10000000000ull, "graphics alignment and virtual range");
@@ -173,12 +232,14 @@ int main(int argc, char** argv) {
     MEMORY_BASIC_INFORMATION info{};
     VirtualQuery(memory, &info, sizeof info);
     check(info.State == MEM_COMMIT, "free defers while GPU pin exists");
+    check(status().used == initial_used + 0x130000, "retiring allocation remains charged until last pin");
     check(FAILED(acquire_title_gpu_buffer(memory, 1, device.Get(), second)), "retiring allocation cannot be rebound");
     check(release_title_gpu_resource(pin, fence.Get(), 2) == E_PENDING, "deferred free waits for the fence");
     check(SUCCEEDED(fence->Signal(2)), "fixture completion signaled");
     check(release_title_gpu_resource(pin, fence.Get(), 2) == S_OK, "deferred free completes after fence");
     VirtualQuery(memory, &info, sizeof info);
     check(info.State == MEM_FREE, "final pin releases CPU and GPU backing");
+    check(status().used == initial_used, "completed free returns the physical budget");
 
     const auto virtual_allocate = reinterpret_cast<decltype(&VirtualAlloc)>(resolve_kernelx({"kernelx.dll", "VirtualAlloc", 0}));
     const auto virtual_free = reinterpret_cast<decltype(&VirtualFree)>(resolve_kernelx({"kernelx.dll", "VirtualFree", 0}));
@@ -194,6 +255,7 @@ int main(int argc, char** argv) {
     auto* esram_memory = static_cast<unsigned char*>(dynamic_reservation);
     const UINT first_pages[]{3, 5};
     check(map_title_esram(1, esram_memory, 2, first_pages) == S_OK, "ESRAM pages map into an owned graphics reservation");
+    check(status().used == initial_used + (32u << 20), "ESRAM pool charges its committed backing once");
     VirtualQuery(esram_memory, &info, sizeof info);
     if (info.State != MEM_COMMIT) return 1;
     esram_memory[0] = 0x33; esram_memory[65536] = 0x55;
@@ -205,6 +267,7 @@ int main(int argc, char** argv) {
     if (info.State != MEM_COMMIT) return 1;
     alias_memory[0] = 0x44;
     check(esram_memory[0] == 0x44, "CPU writes are shared immediately across ESRAM aliases");
+    check(status().used == initial_used + (32u << 20), "ESRAM alias adds no physical commitment");
     const UINT invalid_page = 512;
     check(map_title_esram(0, esram_memory, 1, first_pages) == E_INVALIDARG &&
         map_title_esram(1, esram_memory, 1, &invalid_page) == E_INVALIDARG && esram_memory[0] == 0x44,
@@ -214,6 +277,7 @@ int main(int argc, char** argv) {
     esram_memory[65536] = 0x66;
     check(esram_memory[0] == 0x66 && alias_memory[0] == 0x44, "repeated physical pages alias while distinct pages stay independent");
     check(map_title_esram(1, esram_memory, 2, nullptr) == S_OK, "ESRAM unmapping restores owned placeholders");
+    check(status().used == initial_used + (32u << 20), "unmapped retained ESRAM still owns physical backing");
     VirtualQuery(esram_memory, &info, sizeof info);
     check(info.State == MEM_RESERVE && alias_memory[0] == 0x44, "unmapping one alias preserves physical bytes and other mappings");
     std::array<UINT, 512> all_pages{};
@@ -251,6 +315,7 @@ int main(int argc, char** argv) {
           "observed graphics commitment preserves fixed address");
     VirtualQuery(chunk, &info, sizeof info);
     check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE, "committed span has real CPU backing");
+    check(status().used == initial_used + (32u << 20) + 65536, "DDR subcommit is charged separately from ESRAM aliases");
     if (info.State != MEM_COMMIT) { virtual_free(reservation, 0, MEM_RELEASE); return 1; }
     std::memset(chunk, 0x41, 64);
     check(!virtual_allocate(chunk, 131072, 0x30001000, 0x10004) && GetLastError() == ERROR_INVALID_ADDRESS && chunk[0] == 0x41,
@@ -293,12 +358,14 @@ int main(int argc, char** argv) {
           static_cast<unsigned char*>(mapped)[63] == 0x41, "GPU reads original subcommit bytes");
     if (SUCCEEDED(hr)) readback->Unmap(0, nullptr);
     check(virtual_free(chunk, 65536, MEM_DECOMMIT), "completed GPU span decommits");
+    check(status().used == initial_used + (32u << 20) + 65536, "DDR decommit returns only its physical commitment");
     VirtualQuery(chunk, &info, sizeof info);
     check(info.State == MEM_RESERVE, "decommit preserves parent reservation");
     check(virtual_allocate(chunk, 65536, 0x30001000, 0x10004) == chunk && chunk[0] == 0,
           "recommit resets released page contents");
     check(neighbor[0] == 0x5B, "recommit leaves the other backing intact");
     check(virtual_free(reservation, 0, MEM_RELEASE), "graphics reservation and committed backing released");
+    check(status().used == initial_used + (32u << 20), "DDR release leaves only the retained ESRAM pool charged");
     {
         auto* storage = static_cast<UINT32*>(allocate(65536, attributes));
         if (!storage) return 1;

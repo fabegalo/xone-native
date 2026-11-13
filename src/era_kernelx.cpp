@@ -97,6 +97,7 @@ struct GpuBacking {
     GpuWindows windows; // Canonical range; independent native aliases share ownership gates.
 };
 struct TitleRegion : GpuBacking {
+    SIZE_T physical_bytes = 0;
     bool graphics;
     bool xmem = false;
     ULONGLONG attributes = 0;
@@ -110,6 +111,61 @@ struct EsramPool {
     Microsoft::WRL::Wrappers::FileHandle mapping;
     std::array<PhysicalGate, 512> pages{};
 } esram;
+constexpr UINT64 title_budget = 0x140000000ull;
+UINT64 title_committed = 0; // Guarded by memory_mutex, including retiring allocations.
+
+bool memory_capacity(UINT64 extra, UINT64* total = nullptr, UINT64* available = nullptr) {
+    MEMORYSTATUSEX host{};
+    host.dwLength = sizeof host;
+    if (!GlobalMemoryStatusEx(&host)) return false;
+    const auto limit = (std::min)(title_budget, host.ullTotalPhys);
+    const auto remaining = title_committed < limit ? limit - title_committed : 0;
+    const auto free = (std::min)(remaining, (std::min)(host.ullAvailPhys, host.ullAvailPageFile));
+    if (total) *total = limit;
+    if (available) *available = free;
+    if (extra > free) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return false; }
+    return true;
+}
+
+// Query only owned ordinary virtual ranges; the OS tracks partial commits/recommits.
+bool committed_in_range(std::uintptr_t start, SIZE_T bytes, SIZE_T& committed) {
+    committed = 0;
+    const auto end = start + bytes;
+    for (auto cursor = start; cursor < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof info)) return false;
+        const auto next = (std::min)(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
+        if (next <= cursor) { SetLastError(ERROR_INVALID_ADDRESS); return false; }
+        if (info.State == MEM_COMMIT) committed += next - cursor;
+        cursor = next;
+    }
+    return true;
+}
+
+struct TitleMemoryStatus {
+    DWORD length, reserved;
+    UINT64 total, available, legacy_used, legacy_peak, legacy_available, used, title_available;
+};
+static_assert(sizeof(TitleMemoryStatus) == 64 && offsetof(TitleMemoryStatus, used) == 48);
+BOOL WINAPI era_TitleMemoryStatus(TitleMemoryStatus* status) {
+    DWORD length = 0;
+    SIZE_T read = 0;
+    if (!status || !ReadProcessMemory(GetCurrentProcess(), status, &length, sizeof length, &read) ||
+        read != sizeof length || length != sizeof(TitleMemoryStatus)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return FALSE;
+    }
+    std::lock_guard lock(memory_mutex);
+    TitleMemoryStatus result{};
+    result.length = sizeof result;
+    if (!memory_capacity(0, &result.total, &result.available)) return FALSE;
+    result.used = title_committed;
+    result.title_available = result.available;
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), status, &result, sizeof result, &written) || written != sizeof result)
+        return FALSE;
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
 void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes);
 void WINAPI era_XMemFreeDefault(void* address, ULONGLONG attributes);
 using XAlloc = void* (WINAPI*)(SIZE_T, ULONGLONG);
@@ -142,6 +198,7 @@ bool destroy_region(std::map<std::uintptr_t, TitleRegion>::iterator region) {
     region->second.device.Reset();
     region->second.commits.clear();
     if (!VirtualFree(reinterpret_cast<void*>(region->first), 0, MEM_RELEASE)) return false;
+    title_committed -= region->second.physical_bytes;
     title_regions.erase(region);
     return true;
 }
@@ -171,10 +228,12 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
     const HMODULE host = GetModuleHandleW(L"kernelbase.dll");
     const auto allocate = reinterpret_cast<Allocate>(host ? GetProcAddress(host, "VirtualAlloc2") : nullptr);
     if (!allocate) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
+    std::lock_guard lock(memory_mutex);
+    if (!memory_capacity(bytes)) return nullptr;
     void* result = allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1);
     if (!result) return nullptr;
-    std::lock_guard lock(memory_mutex);
     TitleRegion region{bytes, type != 0};
+    region.physical_bytes = bytes;
     region.xmem = true;
     region.attributes = attributes;
     try {
@@ -183,6 +242,7 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
         VirtualFree(result, 0, MEM_RELEASE);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr;
     }
+    title_committed += bytes;
     return result;
 }
 
@@ -285,6 +345,8 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
         size = (size + 65535) & ~SIZE_T{65535};
     }
     std::lock_guard lock(memory_mutex);
+    TitleRegion* ordinary = nullptr;
+    SIZE_T extra = 0;
     if (address && !(type & MEM_RESERVE)) {
         const auto at = reinterpret_cast<std::uintptr_t>(address);
         auto region = title_regions.upper_bound(at);
@@ -307,6 +369,7 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
                 (next != commits.begin() && std::prev(next)->second.size > at - std::prev(next)->first)) {
                 SetLastError(ERROR_INVALID_ADDRESS); return nullptr;
             }
+            if (!memory_capacity(size)) return nullptr;
             try {
                 auto [entry, inserted] = commits.emplace(at, GpuBacking{size});
                 if (!inserted) { SetLastError(ERROR_INVALID_ADDRESS); return nullptr; }
@@ -332,12 +395,26 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
                 void* result = map(entry->second.mapping.Get(), GetCurrentProcess(), address, 0, size,
                                    MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
                 if (!result) return fail();
+                region->second.physical_bytes += size;
+                title_committed += size;
                 return result;
             } catch (const std::bad_alloc&) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
         }
         if (region->second.graphics || graphics_commit) {
             memory_error(address, size, type, protection, ERROR_NOT_SUPPORTED); return nullptr;
         }
+        if (region->second.graphics || region->second.xmem) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
+        ordinary = &region->second;
+    }
+    if (!graphics_reserve && !graphics_commit && (type & MEM_COMMIT)) {
+        const auto at = reinterpret_cast<std::uintptr_t>(address);
+        const SIZE_T prefix = at & 4095;
+        if (size > SIZE_MAX - prefix - 4095) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+        const SIZE_T bytes = (size + prefix + 4095) & ~SIZE_T{4095};
+        SIZE_T already = 0;
+        if (ordinary && !committed_in_range(at - prefix, bytes, already)) return nullptr;
+        extra = bytes - already;
+        if (extra && !memory_capacity(extra)) return nullptr;
     }
     void* result = nullptr;
     if (graphics_reserve) {
@@ -361,11 +438,17 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
             VirtualFree(result, 0, MEM_RELEASE); SetLastError(error); return nullptr;
         }
         try {
-            title_regions.emplace(reinterpret_cast<std::uintptr_t>(info.AllocationBase), TitleRegion{info.RegionSize, graphics});
+            auto [entry, inserted] = title_regions.emplace(reinterpret_cast<std::uintptr_t>(info.AllocationBase), TitleRegion{info.RegionSize, graphics});
+            if (!inserted) { SetLastError(ERROR_INVALID_ADDRESS); return nullptr; }
+            entry->second.physical_bytes = extra;
         } catch (const std::bad_alloc&) {
             VirtualFree(result, 0, MEM_RELEASE);
             SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr;
         }
+    }
+    if (result) {
+        if (ordinary) ordinary->physical_bytes += extra;
+        title_committed += extra;
     }
     return result;
 }
@@ -390,6 +473,10 @@ BOOL WINAPI era_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
             if (commit == commits.end() || commit->second.size != size) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
             if (commit->second.gpu_pins) { SetLastError(ERROR_BUSY); return FALSE; }
             if (!unmap_graphics_backing(at, commit->second)) return FALSE;
+            if (commit->second.esram_page == UINT_MAX) {
+                region->second.physical_bytes -= commit->second.size;
+                title_committed -= commit->second.size;
+            }
             commits.erase(commit);
             return TRUE;
         }
@@ -398,11 +485,27 @@ BOOL WINAPI era_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
         while (!commits.empty()) {
             auto commit = commits.begin();
             if (!unmap_graphics_backing(commit->first, commit->second)) return FALSE;
+            if (commit->second.esram_page == UINT_MAX) {
+                region->second.physical_bytes -= commit->second.size;
+                title_committed -= commit->second.size;
+            }
             commits.erase(commit);
         }
     }
     if (type == MEM_RELEASE && region->second.graphics && !coalesce_placeholder(address, region->second.size)) return FALSE;
+    SIZE_T released = region->second.physical_bytes;
+    if (type == MEM_DECOMMIT) {
+        if (region->second.graphics) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+        if (!size && offset) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        const auto start = at & ~std::uintptr_t{4095};
+        const auto bytes = size ? ((size + (at - start) + 4095) & ~SIZE_T{4095}) : region->second.size;
+        if (!committed_in_range(start, bytes, released)) return FALSE;
+    }
     const BOOL ok = VirtualFree(address, size, type);
+    if (ok) {
+        title_committed -= released;
+        region->second.physical_bytes -= released;
+    }
     if (ok && type == MEM_RELEASE) title_regions.erase(region);
     return ok;
 }
@@ -623,9 +726,12 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
         const auto map = host_map3(); const auto unmap = host_unmap2();
         if (!map || !unmap) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         if (page_list && !esram.mapping.IsValid()) {
+            if (!memory_capacity(esram_bytes)) return E_OUTOFMEMORY;
             const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(esram_bytes), nullptr);
             if (!handle) return HRESULT_FROM_WIN32(GetLastError());
             esram.mapping.Attach(handle);
+            // The entire retained pool is committed once; virtual aliases cost nothing.
+            title_committed += esram_bytes;
         }
         DWORD failure = 0;
         for (auto& change : changes) {
@@ -1367,6 +1473,7 @@ void* resolve_kernelx(const ImportRequest& request) {
     if (!same_library(request.library, "kernelx.dll") || request.name.empty()) return nullptr;
     if (request.name == "GetModuleHandleW") return reinterpret_cast<void*>(&era_GetModuleHandleW);
     if (request.name == "VirtualAlloc") return reinterpret_cast<void*>(&era_VirtualAlloc);
+    if (request.name == "TitleMemoryStatus") return reinterpret_cast<void*>(&era_TitleMemoryStatus);
     if (request.name == "VirtualFree") return reinterpret_cast<void*>(&era_VirtualFree);
     if (request.name == "XMemSetAllocationHooks") return reinterpret_cast<void*>(&era_XMemSetAllocationHooks);
     if (request.name == "XMemAlloc") return reinterpret_cast<void*>(&era_XMemAlloc);

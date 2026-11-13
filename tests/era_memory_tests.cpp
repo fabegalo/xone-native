@@ -702,6 +702,10 @@ int main(int argc, char** argv) {
         hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R8_UINT, UINT_MAX, layout, D3D11_BIND_SHADER_RESOURCE);
         check(SUCCEEDED(hr) && texture_fixture(std::move(layout), 1, 1, 15, nullptr),
               "typed R8 metadata preserves canonical bytes through independent GPU mutation");
+        hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R32_TYPELESS,UINT_MAX,layout,
+            D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE);
+        check(SUCCEEDED(hr) && texture_fixture(std::move(layout),1,4,17,nullptr),
+            "original single-sample depth preserves bits, expanded HTILE, GPU clears and canonical reuse");
     }
     const auto sample_fixture = [&](TitleTextureLayout layout, UINT64 signal, void* reserved = nullptr) -> bool {
         const bool depth_stencil=layout.resource_desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS;

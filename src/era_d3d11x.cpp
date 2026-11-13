@@ -238,6 +238,7 @@ struct alignas(16) Texture : GraphicsObject {
     UINT creation_misc_flags = 0;
     UINT64 allocation_attributes = 0; // Zero for borrowed placement storage.
     void* canonical = nullptr; // Borrowed placement memory; the registry pins its backing.
+    void* esram_reservation = nullptr; // Owned virtual alias of the single physical ESRAM pool.
     std::array<UINT32, 8> descriptor{};
     TitleGpuResource gpu;
     TitleTextureLayout layout;
@@ -1218,6 +1219,11 @@ Texture::~Texture() {
         if (!release) default_trap("texture memory service", 2);
         release(canonical, allocation_attributes);
     }
+    if (esram_reservation) {
+        using Release = BOOL(WINAPI*)(void*,SIZE_T,DWORD);
+        const auto release=reinterpret_cast<Release>(resolve_kernelx({"kernelx.dll","VirtualFree",0}));
+        if (!release || !release(esram_reservation,0,MEM_RELEASE)) default_trap("texture ESRAM alias retirement",2);
+    }
 }
 HRESULT STDMETHODCALLTYPE texture_query(Texture* self, REFIID iid, void** out) {
     return query(self, iid, out, {iid_unknown, iid_graphics_unknown, iid_device_child, iid_resource,
@@ -1254,7 +1260,8 @@ const std::array<const void*, vtable_slots>& texture_vtable() {
     }();
     return table;
 }
-HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const TitleTextureLayout& layout, void* base, void** out) {
+HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const TitleTextureLayout& layout, void* base, void** out,
+                       UINT esram_offset = UINT_MAX) {
     if (!out) return S_FALSE;
     try {
         auto texture = std::make_unique<Texture>();
@@ -1266,7 +1273,25 @@ HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const Titl
         HRESULT hr = self->d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&texture->creation_fence));
         if (FAILED(hr)) return hr;
         texture->canonical = base;
-        if (!base) {
+        if (esram_offset!=UINT_MAX) {
+            // ESRAM-only storage owns a virtual view, never another physical
+            // allocation. It remains stable if the title remaps its own alias.
+            using Reserve = void*(WINAPI*)(void*,SIZE_T,DWORD,DWORD);
+            const auto reserve=reinterpret_cast<Reserve>(resolve_kernelx({"kernelx.dll","VirtualAlloc",0}));
+            if (!reserve) return E_NOINTERFACE;
+            constexpr UINT page_bytes=65536;
+            const UINT inside=esram_offset%page_bytes;
+            const SIZE_T pages=(layout.bytes+inside+page_bytes-1)/page_bytes;
+            if (!pages || pages>512 || esram_offset/page_bytes+pages>512) return E_INVALIDARG;
+            texture->esram_reservation=reserve(nullptr,pages*page_bytes,0x30002000,PAGE_READWRITE);
+            if (!texture->esram_reservation) return HRESULT_FROM_WIN32(GetLastError());
+            std::vector<UINT> physical(pages);
+            for (UINT page=0;page<pages;++page) physical[page]=esram_offset/page_bytes+page;
+            hr=map_title_esram(1,texture->esram_reservation,UINT(pages),physical.data());
+            if (FAILED(hr)) return hr;
+            texture->canonical=static_cast<unsigned char*>(texture->esram_reservation)+inside;
+        }
+        if (!base && esram_offset==UINT_MAX) {
             const auto allocate = reinterpret_cast<AllocateBufferMemory>(resolve_kernelx({"kernelx.dll", "XMemAlloc", 0}));
             if (!allocate) return E_NOINTERFACE;
             texture->allocation_attributes = (buffer_graphics_attributes & ~(31ull << 24)) |
@@ -1276,10 +1301,10 @@ HRESULT make_texture2d(Device* self, const LegacyTexture2DDesc& desc, const Titl
         }
         if (reinterpret_cast<std::uintptr_t>(texture->canonical) % layout.alignment ||
             reinterpret_cast<std::uintptr_t>(texture->canonical) > 0xffffffffffull) return DXGI_ERROR_UNSUPPORTED;
-        texture->descriptor = layout.guest_descriptor;
-        texture->descriptor[0] += static_cast<UINT32>(reinterpret_cast<std::uintptr_t>(texture->canonical) >> 8);
         hr = acquire_title_gpu_texture(texture->canonical, layout, self->d3d12, texture->gpu);
         if (FAILED(hr)) return hr;
+        texture->descriptor = layout.guest_descriptor;
+        texture->descriptor[0] += static_cast<UINT32>(reinterpret_cast<std::uintptr_t>(texture->canonical) >> 8);
         retain_device(self); *out = texture.release();
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
@@ -1297,20 +1322,29 @@ HRESULT STDMETHODCALLTYPE device_create_texture2d(Device* self, const LegacyText
     const auto& d = desc.standard;
     if (!d.Width || !d.Height || !d.ArraySize) return E_INVALIDARG;
     const bool multisample = d.SampleDesc.Count > 1;
+    const bool esram_request=self->legacy && (d.MiscFlags&0x20000);
     const bool dynamic = !self->legacy && d.Usage == D3D11_USAGE_DYNAMIC &&
         (d.Format == DXGI_FORMAT_B5G6R5_UNORM || d.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
     if (!d.SampleDesc.Count || d.SampleDesc.Count > 8 || (d.SampleDesc.Count & (d.SampleDesc.Count - 1))) return E_INVALIDARG;
-    if ((!self->legacy && !modern_display_abi_bound) || initial || desc.extension[0] || desc.extension[1] || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
+    if ((!self->legacy && !modern_display_abi_bound) || initial || (!esram_request && (desc.extension[0] || desc.extension[1])) || (!dynamic && d.Usage != D3D11_USAGE_DEFAULT) ||
         (dynamic && (d.MipLevels != 1 || d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.BindFlags != D3D11_BIND_SHADER_RESOURCE || d.MiscFlags)) ||
-        d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~legacy_expanded_auxiliary) || !d.BindFlags ||
+        d.SampleDesc.Quality || d.CPUAccessFlags || (d.MiscFlags & ~(legacy_expanded_auxiliary | (esram_request ? 0x20000u : 0u))) || !d.BindFlags ||
         ((d.MiscFlags & legacy_expanded_auxiliary) && (!multisample || !(d.BindFlags & D3D11_BIND_RENDER_TARGET))) ||
         (multisample && (d.ArraySize != 1 || d.MipLevels != 1 || !(d.BindFlags & D3D11_BIND_RENDER_TARGET) || (d.BindFlags & D3D11_BIND_UNORDERED_ACCESS))) ||
-        ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) && d.Format != DXGI_FORMAT_D32_FLOAT) ||
+        ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) && d.Format != DXGI_FORMAT_D32_FLOAT &&
+            !(self->legacy && d.Format==DXGI_FORMAT_R32_TYPELESS && d.SampleDesc.Count==1)) ||
         (d.BindFlags & ~(D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_DEPTH_STENCIL))) return unsupported();
     TitleTextureLayout layout;
     HRESULT hr = create_xg_texture_layout(d.Width, d.Height, d.MipLevels, d.ArraySize, d.Format, UINT_MAX, layout, d.BindFlags, d.SampleDesc.Count);
     if (hr == DXGI_ERROR_UNSUPPORTED || hr == E_UNEXPECTED) return unsupported();
     if (FAILED(hr)) return hr;
+    if (esram_request) {
+        const UINT offset=desc.extension[0], requested=desc.extension[1];
+        if (offset>=(32u<<20) || offset%layout.alignment) return E_INVALIDARG;
+        const SIZE_T available=(std::min)(SIZE_T((32u<<20)-offset),requested ? SIZE_T(requested) : SIZE_T(32u<<20));
+        if (layout.bytes>available) return unsupported(); // A partial DDR tail needs coherent backing before acceptance.
+        return make_texture2d(self,desc,layout,nullptr,out,offset);
+    }
     return make_texture2d(self, desc, layout, nullptr, out);
 }
 HRESULT STDMETHODCALLTYPE device_create_placement_texture2d(Device* self, const LegacyTexture2DDesc* input,
@@ -1459,11 +1493,12 @@ HRESULT STDMETHODCALLTYPE device_create_dsv(Device* self, GraphicsObject* resour
     if (texture->device != self) return E_INVALIDARG;
     const auto& d = texture->desc.standard;
     const bool depth_stencil=d.Format==DXGI_FORMAT_R32G8X24_TYPELESS && d.SampleDesc.Count==4;
-    if (texture->volume || (!depth_stencil && (d.Format != DXGI_FORMAT_D32_FLOAT || d.SampleDesc.Count != 1)) || d.ArraySize != 1 ||
+    const bool typeless_depth=d.Format==DXGI_FORMAT_R32_TYPELESS && d.SampleDesc.Count==1;
+    if (texture->volume || (!depth_stencil && !typeless_depth && (d.Format != DXGI_FORMAT_D32_FLOAT || d.SampleDesc.Count != 1)) || d.ArraySize != 1 ||
         !(d.BindFlags & D3D11_BIND_DEPTH_STENCIL)) return DXGI_ERROR_UNSUPPORTED;
     D3D11_DEPTH_STENCIL_VIEW_DESC desc{}; SIZE_T read = 0;
     if (input && (!ReadProcessMemory(GetCurrentProcess(),input,&desc,sizeof desc,&read) || read != sizeof desc)) return E_INVALIDARG;
-    const auto format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : d.Format;
+    const auto format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : typeless_depth ? DXGI_FORMAT_D32_FLOAT : d.Format;
     const auto dimension=depth_stencil ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
     if (!input) { desc.Format = format; desc.ViewDimension = dimension; }
     if (desc.Format == DXGI_FORMAT_UNKNOWN) desc.Format = format;
@@ -1765,9 +1800,11 @@ HRESULT STDMETHODCALLTYPE device_create_srv(Device* self, GraphicsObject* resour
                 return S_OK;
             } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
         }
-        const bool depth_plane = format==DXGI_FORMAT_R32G8X24_TYPELESS && multisample &&
-            (desc.Format==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || desc.Format==DXGI_FORMAT_X32_TYPELESS_G8X24_UINT);
+        const bool depth_plane = (format==DXGI_FORMAT_R32G8X24_TYPELESS && multisample &&
+            (desc.Format==DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS || desc.Format==DXGI_FORMAT_X32_TYPELESS_G8X24_UINT)) ||
+            (format==DXGI_FORMAT_R32_TYPELESS && !multisample && desc.Format==DXGI_FORMAT_R32_FLOAT);
         const bool stencil_plane=depth_plane && desc.Format==DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+        if ((format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS) && !depth_plane) return unsupported();
         if (desc.ViewDimension != dimension || (!depth_plane && desc.Format != format)) return unsupported();
         // Texture2D/Texture3D share the same two-UINT mip range in this ABI.
         if (!multisample) {
@@ -3242,13 +3279,14 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
         // Original typed R32/R8 computers have the same physical sample order,
         // while the combined depth computer publishes no shader SRD.
         using Address = UINT64 (*)(void*,UINT,UINT,UINT64,UINT,UINT,UINT);
+        const UINT32 expanded=context->stencil.bytes ? 0xfffff3ffu : 0xfffc000fu;
         auto* metadata = static_cast<unsigned char*>(tiled) + context->htile.offset;
         if (!into_tiled) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
             UINT32 word; std::memcpy(&word,metadata+at,4);
-            if (word!=0xfffff3ffu) return DXGI_ERROR_UNSUPPORTED;
+            if (word!=expanded) return DXGI_ERROR_UNSUPPORTED;
         }
         // Validate every offset before touching the destination.
-        for (UINT pass=0;pass<2;++pass) for (UINT plane=1;plane<3;++plane) {
+        for (UINT pass=0;pass<2;++pass) for (UINT plane=1;plane<(context->stencil.bytes ? 3u : 2u);++plane) {
             const auto& bounds = plane==1 ? context->depth : context->stencil;
             const UINT element = plane==1 ? 4 : 1;
             auto* typed = context->typed_computers[plane-1];
@@ -3259,14 +3297,13 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
                     return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
                 const UINT64 at=bounds.offset+relative;
                 if (!pass) continue;
-                auto* a = static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+(SIZE_T(x)*context->samples+sample)*8+(plane==1 ? 0 : 4);
+                auto* a = static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+(SIZE_T(x)*context->samples+sample)*context->bytes_per_block+(plane==1 ? 0 : 4);
                 auto* b = static_cast<unsigned char*>(tiled)+at;
                 std::memcpy(into_tiled ? b : a,into_tiled ? a : b,element);
                 if (!into_tiled && plane==2) std::memset(a+1,0,3);
             }
         }
         if (into_tiled) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
-            const UINT32 expanded=0xfffff3ffu;
             std::memcpy(metadata+at,&expanded,4);
         }
         return S_OK;
@@ -3310,7 +3347,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
          format != DXGI_FORMAT_R10G10B10A2_UNORM && format != DXGI_FORMAT_R11G11B10_FLOAT && format != DXGI_FORMAT_R8_UINT &&
          format != DXGI_FORMAT_B8G8R8A8_UNORM && format != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB && format != DXGI_FORMAT_R32_FLOAT &&
          format != DXGI_FORMAT_B5G6R5_UNORM &&
-         format != DXGI_FORMAT_R32G8X24_TYPELESS) ||
+         format != DXGI_FORMAT_R32G8X24_TYPELESS && format!=DXGI_FORMAT_R32_TYPELESS) ||
         ((depth || samples > 1) && bc7)) return DXGI_ERROR_UNSUPPORTED;
     if (samples > 1 && format == DXGI_FORMAT_R8_UINT) return DXGI_ERROR_UNSUPPORTED;
     if (format == DXGI_FORMAT_B5G6R5_UNORM && (!xg_modern || samples != 1)) return DXGI_ERROR_UNSUPPORTED;
@@ -3327,10 +3364,22 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         // 180052210 constructs the 60-byte XG descriptor independently of the
         // 52-byte public texture descriptor. Single-sample, default SRV storage.
         if (!depth && tile_mode == UINT_MAX) {
-            using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
-            const auto optimal = reinterpret_cast<Optimal>(module->find_export("XGComputeOptimalTileMode"));
-            if (!optimal) return E_NOINTERFACE;
-            tile_mode = optimal(3, format, width, height, 1, samples, bind_flags, 0);
+            if (format==DXGI_FORMAT_R32_TYPELESS || format==DXGI_FORMAT_R32G8X24_TYPELESS) {
+                if (context->modern) return DXGI_ERROR_UNSUPPORTED;
+                // 11295 180001350 consumes scalar argument 5 and writes modes
+                // through arguments 7/8. Other scalar arguments are unused.
+                using OptimalDepth=void(*)(UINT,UINT,UINT,UINT,UINT,UINT,UINT*,UINT*);
+                const auto optimal=reinterpret_cast<OptimalDepth>(module->find_export("XGComputeOptimalDepthStencilTileModes"));
+                if (!optimal) return E_NOINTERFACE;
+                UINT stencil_mode=UINT_MAX;
+                optimal(0,0,0,0,samples,0,&tile_mode,&stencil_mode);
+                if (tile_mode>=32 || (format==DXGI_FORMAT_R32G8X24_TYPELESS && tile_mode!=stencil_mode)) return DXGI_ERROR_UNSUPPORTED;
+            } else {
+                using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
+                const auto optimal = reinterpret_cast<Optimal>(module->find_export("XGComputeOptimalTileMode"));
+                if (!optimal) return E_NOINTERFACE;
+                tile_mode = optimal(3, format, width, height, 1, samples, bind_flags, 0);
+            }
             if (tile_mode == UINT_MAX) return DXGI_ERROR_UNSUPPORTED;
         }
         // Approved expanded canonical image: host render-target capabilities
@@ -3338,7 +3387,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         std::array<UINT, 15> desc{width, height, mips, arrays, static_cast<UINT>(format), samples, 0, 0, 0, 0, 0, 0, 0, tile_mode, 0};
         // Original 180052210 carries the depth bind into XG. Omitting it yields
         // E_INVALIDARG and conceals the real three-plane depth/stencil contract.
-        if (format == DXGI_FORMAT_R32G8X24_TYPELESS) desc[8] = D3D11_BIND_DEPTH_STENCIL;
+        if (format == DXGI_FORMAT_R32G8X24_TYPELESS || format==DXGI_FORMAT_R32_TYPELESS) desc[8] = D3D11_BIND_DEPTH_STENCIL;
         if (depth) {
             // Original 180052210: 52-byte volume descriptor; tile mode at +44.
             using Optimal = UINT (*)(UINT, DXGI_FORMAT, UINT, UINT, UINT, UINT, UINT, UINT);
@@ -3369,15 +3418,18 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         std::memcpy(&mip_count, layout + 16, 4); std::memcpy(&plane_count, layout + 20, 4);
         const bool depth_stencil = !context->modern && format==DXGI_FORMAT_R32G8X24_TYPELESS &&
             samples==4 && arrays==1 && mips==1 && plane_count==3;
+        const bool depth_only = !context->modern && format==DXGI_FORMAT_R32_TYPELESS &&
+            samples==1 && arrays==1 && mips==1 && plane_count==2;
+        const bool depth_planes=depth_stencil || depth_only;
         if (!bytes || bytes > (1ull << 30) || !alignment || alignment > (1u << 21) || (alignment & (alignment - 1)) ||
-            mip_count != mips || (plane_count != 1 && !depth_stencil)) {
+            mip_count != mips || (plane_count != 1 && !depth_planes)) {
             if (stop_on_missing_service()) std::fprintf(stderr, "xone-era: unsupported XG layout header size %llu alignment %llu mips %u planes %u\n",
                 static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(alignment), mip_count, plane_count);
             return DXGI_ERROR_UNSUPPORTED;
         }
         std::array<std::array<UINT32,8>,2> typed_descriptors{};
-        if (depth_stencil) {
-            for (UINT plane=0;plane<3;++plane) {
+        if (depth_planes) {
+            for (UINT plane=0;plane<plane_count;++plane) {
                 const auto* record=layout+24+plane*0x460;
                 UINT usage=0,element=0; UINT64 size=0,offset=0;
                 std::memcpy(&usage,record,4); std::memcpy(&size,record+8,8);
@@ -3388,8 +3440,8 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
                 target={offset,size};
             }
             if (context->htile.offset+context->htile.bytes>context->depth.offset ||
-                context->depth.offset+context->depth.bytes>context->stencil.offset) return DXGI_ERROR_UNSUPPORTED;
-            for (UINT plane=0;plane<2;++plane) {
+                (depth_stencil && context->depth.offset+context->depth.bytes>context->stencil.offset)) return DXGI_ERROR_UNSUPPORTED;
+            for (UINT plane=0;plane<plane_count-1;++plane) {
                 auto typed_desc=desc;
                 typed_desc[4]=plane==0 ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8_UINT; typed_desc[8]=0;
                 auto*& typed=context->typed_computers[plane];
@@ -3408,7 +3460,8 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
                     !std::all_of(typed_layout.begin()+0xd40,typed_layout.end(),[](auto x){return x==0x5a;})) return DXGI_ERROR_UNSUPPORTED;
                 auto& descriptor=typed_descriptors[plane];
                 std::memcpy(descriptor.data(),static_cast<unsigned char*>(typed)+0x10,sizeof descriptor);
-                if (((descriptor[3]>>28)!=14 && (descriptor[3]>>28)!=15) || ((descriptor[3]>>16)&15)!=2)
+                const UINT type=descriptor[3]>>28;
+                if ((samples>1 ? (type!=14 && type!=15) : (type!=9 && type!=13)) || ((descriptor[3]>>16)&15)!=UINT(std::countr_zero(samples)))
                     return DXGI_ERROR_UNSUPPORTED;
                 descriptor[0]+=static_cast<UINT32>(physical.offset>>8);
             }
@@ -3422,7 +3475,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) out.resource_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         if (bind_flags & D3D11_BIND_RENDER_TARGET) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         if (bind_flags & D3D11_BIND_DEPTH_STENCIL) out.resource_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-        if (depth_stencil) {
+        if (depth_planes) {
             out.guest_descriptor=typed_descriptors[0]; out.stencil_descriptor=typed_descriptors[1];
         } else std::memcpy(out.guest_descriptor.data(), static_cast<unsigned char*>(context->computer) + 0x10, sizeof out.guest_descriptor);
         out.context = std::move(context); out.copy = &copy_xg_texture;

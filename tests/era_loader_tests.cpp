@@ -42,6 +42,13 @@ using GraphicsFree = void (WINAPI*)(void*, ULONGLONG);
 GraphicsAllocate graphics_default_allocate = nullptr;
 GraphicsFree graphics_default_free = nullptr;
 unsigned graphics_hook_allocations = 0, graphics_hook_frees = 0, graphics_hook_wrong_allocator = 0;
+unsigned esram_cpu_allocations = 0, esram_ddr_allocations = 0;
+void* WINAPI esram_allocate_hook(SIZE_T size, ULONGLONG attributes) {
+    if ((attributes>>29)&15) ++esram_ddr_allocations;
+    else ++esram_cpu_allocations;
+    return graphics_default_allocate(size,attributes);
+}
+void WINAPI esram_free_hook(void* pointer, ULONGLONG attributes) { graphics_default_free(pointer,attributes); }
 bool graphics_force_header = false;
 void* WINAPI graphics_allocate_hook(SIZE_T size, ULONGLONG attributes) {
     ++graphics_hook_allocations;
@@ -541,6 +548,64 @@ int main(int argc, char** argv) {
                 }
                 reinterpret_cast<ULONG(*)(void*)>(table[1])(computer);
             }
+            hr=create_xg_texture_layout(1920,1080,1,1,DXGI_FORMAT_R11G11B10_FLOAT,UINT_MAX,layout,
+                D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS);
+            std::cout << "original FH2 ESRAM color layout hr=0x" << std::hex << hr << std::dec
+                      << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
+            check(SUCCEEDED(hr),"observed ESRAM color descriptor has an original XG expanded layout");
+            using OptimalDepth=void(*)(UINT,UINT,UINT,UINT,UINT,UINT,UINT*,UINT*);
+            const auto depth_modes=reinterpret_cast<OptimalDepth>(resolve_xg_module({"xg_x.dll","XGComputeOptimalDepthStencilTileModes",0}));
+            check(depth_modes!=nullptr,"original XG exposes its separate depth/stencil tile selector");
+            if (!depth_modes) return 1;
+            for (const UINT samples:{1u,2u,4u,8u}) {
+                struct { UINT depth=UINT_MAX,stencil=UINT_MAX; UINT64 guard=0x1122334455667788ull; } result;
+                depth_modes(0,0,0,0,samples,0,&result.depth,&result.stencil);
+                const UINT expected=samples==1 ? 0 : samples==8 ? 2 : 1;
+                check(result.depth==expected && result.stencil==expected && result.guard==0x1122334455667788ull,
+                    "original depth tile modes preserve scalar argument positions and output bounds");
+            }
+            depth_modes(0,0,0,0,1,0,nullptr,nullptr);
+            for (const auto dimensions:{std::array<UINT,2>{32,16},std::array<UINT,2>{1920,1080}}) {
+                std::array<UINT,15> descriptor{dimensions[0],dimensions[1],1,1,39,1,0,0,0x40,0,0,0,0,0,0};
+                void* computer=nullptr;
+                hr=create_computer(descriptor.data(),&computer);
+                check(SUCCEEDED(hr) && computer,"original XG constructs the observed R32 depth descriptor");
+                if (!computer) continue;
+                auto** table=*static_cast<void***>(computer);
+                std::array<unsigned char,0xd40> raw{};
+                hr=reinterpret_cast<HRESULT(*)(void*,void*)>(table[2])(computer,raw.data());
+                UINT64 bytes=0; UINT planes=0;
+                std::memcpy(&bytes,raw.data(),8);std::memcpy(&planes,raw.data()+20,4);
+                std::cout << "original R32 depth " << dimensions[0] << 'x' << dimensions[1] << " bytes=" << bytes << " planes=" << planes << '\n';
+                check(SUCCEEDED(hr) && planes==2,"R32 depth has separate HTILE and physical depth planes");
+                hr=create_xg_texture_layout(dimensions[0],dimensions[1],1,1,DXGI_FORMAT_R32_TYPELESS,UINT_MAX,layout,
+                    D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE);
+                check(SUCCEEDED(hr) && layout.bytes==bytes,"R32 adapter preserves the exact original physical depth allocation");
+                if (SUCCEEDED(hr) && dimensions[0]==32) {
+                    std::vector<UINT32> expected(32*16),actual(expected.size());
+                    for (UINT i=0;i<expected.size();++i) expected[i]=i*0x102037u;
+                    std::vector<unsigned char> physical(layout.bytes+32,0x5a);
+                    hr=layout.copy(layout.context.get(),true,expected.data(),physical.data()+16,0,128,2048);
+                    using Address=UINT64(*)(void*,UINT,UINT,UINT64,UINT,UINT,UINT);
+                    const auto address=reinterpret_cast<Address>(table[4]);
+                    bool exact=SUCCEEDED(hr);
+                    for (UINT y=0;y<16;++y) for (UINT x=0;x<32;++x) {
+                        const auto at=address(computer,1,0,x,y,0,0);
+                        if (at>bytes || bytes-at<4) { exact=false;continue; }
+                        UINT32 actual_bits=0;std::memcpy(&actual_bits,physical.data()+16+at,4);
+                        if (actual_bits!=expected[y*32+x]) exact=false;
+                    }
+                    check(exact,"R32 adapter matches the independent original depth computer at every pixel address");
+                    if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,128,2048);
+                    check(SUCCEEDED(hr) && actual==expected,"single-sample R32 depth preserves every physical bit through expanded HTILE");
+                    physical[16]^=1; const auto before=actual;
+                    check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,128,2048)==DXGI_ERROR_UNSUPPORTED && actual==before,
+                        "single-sample depth refuses unknown HTILE without publishing partial pixels");
+                    check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
+                        std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"R32 depth conversion preserves canonical guards");
+                }
+                reinterpret_cast<ULONG(*)(void*)>(table[1])(computer);
+            }
             return failures ? 1 : 0;
         }
         if (SUCCEEDED(hr)) hr = create_xg_texture_layout(64, 64, 7, 1, DXGI_FORMAT_BC7_UNORM_SRGB, 14, layout);
@@ -689,6 +754,78 @@ int main(int argc, char** argv) {
             check(std::all_of(depth_storage,depth_storage+98304+8192+32,[](auto x){return x==0x5a;}),
                 "depth placement and view retirement preserve every borrowed physical byte");
             free_memory(depth_storage,attributes);
+            using Reserve=void*(WINAPI*)(void*,SIZE_T,DWORD,DWORD);
+            using ReleaseVirtual=BOOL(WINAPI*)(void*,SIZE_T,DWORD);
+            const auto reserve=reinterpret_cast<Reserve>(resolve_kernelx({"kernelx.dll","VirtualAlloc",0}));
+            const auto release_virtual=reinterpret_cast<ReleaseVirtual>(resolve_kernelx({"kernelx.dll","VirtualFree",0}));
+            auto* esram_mirror=static_cast<unsigned char*>(reserve(nullptr,65536,0x30002000,PAGE_READWRITE));
+            for (const auto format:{DXGI_FORMAT_R11G11B10_FLOAT,DXGI_FORMAT_R32_TYPELESS}) {
+                const bool depth=format==DXGI_FORMAT_R32_TYPELESS;
+                UINT physical_page=depth ? 64 : 48;
+                if (!esram_mirror || FAILED(map_title_esram(1,esram_mirror,1,&physical_page))) return 1;
+                std::memset(esram_mirror,0x35,65536);
+                Desc esram_desc{};
+                esram_desc.standard={32,16,1,1,format,{1,0},D3D11_USAGE_DEFAULT,
+                    UINT(D3D11_BIND_SHADER_RESOURCE|(depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS)),0,0x20000};
+                esram_desc.extension[0]=physical_page*65536+8192; esram_desc.extension[1]=depth ? 0 : 8192;
+                const UINT original_page=physical_page, mirror_offset=depth ? 24576 : 8192;
+                using CreateOwned=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                const auto create_owned=reinterpret_cast<CreateOwned>(vt(device)[5]);
+                using SetAllocationHooks=void(WINAPI*)(GraphicsAllocate,GraphicsFree);
+                const auto set_allocation_hooks=reinterpret_cast<SetAllocationHooks>(resolve_kernelx({"kernelx.dll","XMemSetAllocationHooks",0}));
+                graphics_default_allocate=allocate; graphics_default_free=free_memory;
+                esram_cpu_allocations=esram_ddr_allocations=0;
+                set_allocation_hooks(esram_allocate_hook,esram_free_hook);
+                texture=nullptr;
+                auto invalid_esram=esram_desc; invalid_esram.extension[1]=1;
+                check(create_owned(device,&invalid_esram,nullptr,&texture)==DXGI_ERROR_UNSUPPORTED && !texture,
+                    "insufficient ESRAM coverage refuses a disconnected DDR substitution");
+                const HRESULT esram_created=create_owned(device,&esram_desc,nullptr,&texture);
+                check(esram_created==S_OK && texture,
+                    "unplaced ESRAM texture owns a stable virtual alias of the existing physical pool");
+                set_allocation_hooks(nullptr,nullptr);
+                check(esram_cpu_allocations && !esram_ddr_allocations,"ESRAM-only texture preserves original XG CPU hooks without allocating DDR backing");
+                unsigned char* owned_alias=nullptr;
+                if (texture) {
+                    using CreateSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                    void* view=nullptr;
+                    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+                    srv_desc.Format=depth ? DXGI_FORMAT_R32_FLOAT : format; srv_desc.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D; srv_desc.Texture2D.MipLevels=1;
+                    check(reinterpret_cast<CreateSrv>(vt(device)[7])(device,texture,&srv_desc,&view)==S_OK && view,
+                        "ESRAM texture SRV retains the same physical image");
+                    if (view) {
+                        UINT32 base=0;std::memcpy(&base,static_cast<char*>(view)+48,4);
+                        owned_alias=reinterpret_cast<unsigned char*>(UINT64(base)<<8);
+                        check(owned_alias!=esram_mirror+mirror_offset && owned_alias[0]==0x35,"texture has an independent virtual view of the requested ESRAM byte");
+                        owned_alias[0]=0x62;
+                        check(esram_mirror[mirror_offset]==0x62,"ESRAM texture writes reach the title's real physical alias");
+                        physical_page=original_page+1;
+                        check(map_title_esram(1,esram_mirror,1,&physical_page)==S_OK,"title can remap its independent alias while the texture retains ownership");
+                        esram_mirror[mirror_offset]=0x9a;
+                        check(owned_alias[0]==0x62,"title remapping cannot change a texture's physical ESRAM identity");
+                        physical_page=original_page;
+                        check(map_title_esram(1,esram_mirror,1,&physical_page)==S_OK && esram_mirror[mirror_offset]==0x62,
+                            "remapping back observes the original shared physical bytes");
+                        reinterpret_cast<Count>(vt(view)[2])(view);
+                    }
+                    if (depth) {
+                        using CreateDsv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_DEPTH_STENCIL_VIEW_DESC*,void**);
+                        D3D11_DEPTH_STENCIL_VIEW_DESC description{};
+                        description.Format=DXGI_FORMAT_D32_FLOAT; description.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;
+                        void* view=nullptr;
+                        check(reinterpret_cast<CreateDsv>(vt(device)[10])(device,texture,&description,&view)==S_OK && view,
+                            "typeless ESRAM depth owns a typed native D32 view of the same storage");
+                        if (view) reinterpret_cast<Count>(vt(view)[2])(view);
+                    }
+                    reinterpret_cast<Count>(vt(texture)[2])(texture);
+                }
+                MEMORY_BASIC_INFORMATION retired_alias{};
+                check(!owned_alias || (VirtualQuery(owned_alias,&retired_alias,sizeof retired_alias) && retired_alias.State==MEM_FREE),
+                    "ESRAM texture retirement releases only its owned virtual view");
+                check(esram_mirror[mirror_offset]==0x62,
+                    "texture retirement preserves the physical pool and the title's mapping");
+            }
+            check(release_virtual(esram_mirror,0,MEM_RELEASE),"ESRAM fixture releases its own title mapping");
             struct VolumeDesc { D3D11_TEXTURE3D_DESC standard; std::array<UINT, 2> extension{}; } volume_desc{};
             static_assert(sizeof(VolumeDesc) == 44);
             volume_desc.standard = {16, 16, 16, 1, DXGI_FORMAT_R10G10B10A2_UNORM, D3D11_USAGE_DEFAULT,

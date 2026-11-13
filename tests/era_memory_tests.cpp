@@ -132,6 +132,14 @@ int main(int argc, char** argv) {
     auto* combined = va(nullptr, 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     check(combined && status().used == initial_used + 4096 && vf(combined, 0, MEM_RELEASE) && status().used == initial_used,
         "combined CPU reserve/commit/release accounts page rounding");
+    auto* address_probe=static_cast<unsigned char*>(VirtualAlloc(nullptr,65536,MEM_RESERVE,PAGE_NOACCESS));
+    if(!address_probe) return 1;
+    VirtualFree(address_probe,0,MEM_RELEASE);
+    auto* fixed_cpu=va(address_probe+4096,1,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    MEMORY_BASIC_INFORMATION fixed_info{};
+    check(fixed_cpu && VirtualQuery(fixed_cpu,&fixed_info,sizeof fixed_info) && fixed_info.State==MEM_COMMIT &&
+        status().used==initial_used+fixed_info.RegionSize,"fixed unaligned combined allocation charges every page committed by the host");
+    if(fixed_cpu) check(vf(fixed_cpu,0,MEM_RELEASE) && status().used==initial_used,"fixed CPU allocation returns its full commitment");
     constexpr SIZE_T over_budget = 0x140010000ull;
     check(!allocate(over_budget, 0) && GetLastError() == ERROR_NOT_ENOUGH_MEMORY && status().used == initial_used,
         "XMem rejects over-budget commitments transactionally");

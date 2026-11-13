@@ -403,12 +403,12 @@ LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD pr
         if (region->second.graphics || graphics_commit) {
             memory_error(address, size, type, protection, ERROR_NOT_SUPPORTED); return nullptr;
         }
-        if (region->second.graphics || region->second.xmem) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
+        if (region->second.xmem) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
         ordinary = &region->second;
     }
     if (!graphics_reserve && !graphics_commit && (type & MEM_COMMIT)) {
         const auto at = reinterpret_cast<std::uintptr_t>(address);
-        const SIZE_T prefix = at & 4095;
+        const SIZE_T prefix = at & ((type & MEM_RESERVE) ? 65535 : 4095);
         if (size > SIZE_MAX - prefix - 4095) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
         const SIZE_T bytes = (size + prefix + 4095) & ~SIZE_T{4095};
         SIZE_T already = 0;

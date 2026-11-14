@@ -82,6 +82,10 @@ static_assert(offsetof(GraphicsObject, flags) == 8 && offsetof(GraphicsObject, r
 
 struct Context;
 struct RecordedCommand;
+struct DeferredBuffer {
+    Microsoft::WRL::ComPtr<IUnknown> original,version;
+    bool mapped = false;
+};
 struct DepthState;
 struct Sampler;
 struct BlendState;
@@ -106,6 +110,7 @@ struct Device : GraphicsObject {
     HANDLE retired = nullptr;
     std::mutex ownership;
     std::mutex list_execution;
+    std::atomic<UINT64> diagnostic_list_sequence{0};
     ULONG legacy_dependents = 0; // Keeps storage alive without altering the public device count.
     Context* immediate = nullptr; // Legacy context storage belongs to the device.
     std::array<std::shared_ptr<DmaEngine>, 3> dma; // The observed engine selectors are 1 and 2.
@@ -136,6 +141,9 @@ struct alignas(64) Context : GraphicsObject {
     UINT stencil_reference = 0, sample_mask = UINT_MAX;
     std::array<FLOAT,4> blend_factor{1,1,1,1};
     std::array<Shader*,3> shaders{}; // PS, VS, GS.
+    Shader* compute_shader = nullptr;
+    std::array<Sampler*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> compute_samplers{};
+    std::array<BufferView*,64> compute_uavs{}; // 11295 CS setter accepts 64 UAV slots.
     InputLayout* input_layout = nullptr;
     std::array<Sampler*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> pixel_samplers{};
     std::array<std::array<BufferView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,6> shader_resources{}; // VS, HS, DS, GS, PS, CS.
@@ -151,18 +159,27 @@ struct alignas(64) Context : GraphicsObject {
     UINT64 submission_value = 0, completed_draws = 0;
     std::vector<std::shared_ptr<RecordedCommand>> recording;
     std::vector<Microsoft::WRL::ComPtr<IUnknown>> recorded_references;
+    std::map<Buffer*,DeferredBuffer> buffer_versions;
     HRESULT recording_error = S_OK;
+    bool replaying = false;
     ~Context();
 };
 static_assert(offsetof(Context, private_data) == 24 && offsetof(Context, functions) == 0x3d0);
+template<class T,std::size_t Offset> T context_state(Context* self);
+template<class T,std::size_t Offset> void context_state(Context* self,T value);
 struct RecordedCommand {
-    enum Kind { draw, draw_indexed, clear_color, clear_depth } kind;
+    enum Kind { draw, draw_indexed, clear_color, clear_depth, dispatch, gpu_event, cache_flush, update, gpu_wait } kind;
     std::unique_ptr<Context> state;
     BufferView* view = nullptr;
     std::array<FLOAT,4> color{};
     FLOAT depth = 0;
-    UINT count = 0, first = 0;
+    UINT clear_flags = D3D11_CLEAR_DEPTH;
+    UINT8 stencil = 0;
+    UINT count = 0, first = 0; // Draw count/first/base, Dispatch x/y/z, or GPU event value.
     INT base = 0;
+    Microsoft::WRL::ComPtr<IUnknown> update_resource;
+    std::vector<std::uint8_t> update_bytes;
+    UINT update_subresource = 0, update_offset = 0, update_row_pitch = 0, update_slice_pitch = 0;
     ~RecordedCommand();
 };
 struct CommandList : GraphicsObject {
@@ -319,6 +336,8 @@ struct DxgiObject : GraphicsObject {
     UINT64 completed_present_cookie = 0;
     LONGLONG present_frequency = 0, present_tick = 0;
     UINT present_fraction = 0;
+    UINT64 diagnostic_list_sequence = 0;
+    UINT diagnostic_present_budget = 32, diagnostic_present_count = 0;
     Microsoft::WRL::Wrappers::FileHandle present_timer;
 };
 
@@ -682,7 +701,9 @@ struct ValidatedShader {
         return hr;
     }
 };
-HRESULT validate_native_compute(Device* device, const ValidatedShader& shader) {
+HRESULT validate_native_compute(Device* device, const ValidatedShader& shader,
+        Microsoft::WRL::ComPtr<ID3D12RootSignature>* root_out=nullptr,
+        Microsoft::WRL::ComPtr<ID3D12PipelineState>* pipeline_out=nullptr,std::array<UINT,4>* counts_out=nullptr) {
     std::array<UINT, 4> counts{}; // SRV, UAV, CBV, sampler register ranges.
     for (UINT i = 0; i < shader.desc.BoundResources; ++i) {
         D3D11_SHADER_INPUT_BIND_DESC binding{};
@@ -721,7 +742,13 @@ HRESULT validate_native_compute(Device* device, const ValidatedShader& shader) {
     D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature = root.Get(); pipeline.CS = {shader.code.data(), shader.code.size()};
     Microsoft::WRL::ComPtr<ID3D12PipelineState> compiled;
-    return device->d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&compiled));
+    hr=device->d3d12->CreateComputePipelineState(&pipeline, IID_PPV_ARGS(&compiled));
+    if(SUCCEEDED(hr)) {
+        if(root_out) *root_out=std::move(root);
+        if(pipeline_out) *pipeline_out=std::move(compiled);
+        if(counts_out) *counts_out=counts;
+    }
+    return hr;
 }
 template<UINT Stage>
 HRESULT STDMETHODCALLTYPE device_create_shader(Device* self, const void* bytecode, SIZE_T bytes, void* linkage, void** out) {
@@ -2483,18 +2510,18 @@ HRESULT pace_legacy_present(DxgiObject* self,UINT interval) {
     return S_OK;
 }
 void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary="presented title") {
-    if(!graphics_diagnostics.load() || !frame || frame>8) return;
+    if(!graphics_diagnostics.load() || !frame) return;
     const auto& desc=source->desc.standard;
     const bool packed10=desc.Format==DXGI_FORMAT_R10G10B10A2_UNORM || desc.Format==DXGI_FORMAT_R10G10B10A2_TYPELESS;
     const bool packed11=desc.Format==DXGI_FORMAT_R11G11B10_FLOAT;
     if((!packed10 && !packed11 && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM && desc.Format!=DXGI_FORMAT_B8G8R8A8_UNORM) ||
-        UINT64(desc.Width)*desc.Height>8u*1024*1024) return;
+        UINT64(desc.Width)*desc.Height*desc.SampleDesc.Count>8u*1024*1024) return;
     try {
-        std::vector<UINT32> pixels(SIZE_T(desc.Width)*desc.Height);
+        std::vector<UINT32> pixels(SIZE_T(desc.Width)*desc.Height*desc.SampleDesc.Count);
         void* canonical=nullptr;
         HRESULT hr=map_title_gpu_resource(source->gpu,&canonical);
         if(SUCCEEDED(hr)) {
-            hr=source->layout.copy(source->layout.context.get(),false,pixels.data(),canonical,0,desc.Width*4,UINT(pixels.size()*4));
+            hr=source->layout.copy(source->layout.context.get(),false,pixels.data(),canonical,0,desc.Width*desc.SampleDesc.Count*4,UINT(pixels.size()*4));
             const HRESULT closed=unmap_title_gpu_resource(source->gpu);
             if(SUCCEEDED(hr)) hr=closed;
         }
@@ -2503,7 +2530,7 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary
         const auto nonblack=std::count_if(pixels.begin(),pixels.end(),[&](UINT value){return (value&mask)!=0;});
         detail::Sha256 hash;
         hash.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()),pixels.size()*4));
-        std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u nonblack %llu/%llu SHA256 %s resource=%p backing=%p thread=%lu\n",boundary,desc.Width,desc.Height,desc.Format,
+        std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u sequence=%llu samples=%u nonblack %llu/%llu SHA256 %s resource=%p backing=%p thread=%lu\n",boundary,desc.Width,desc.Height,desc.Format,frame,desc.SampleDesc.Count,
             static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str(),source,source->canonical,GetCurrentThreadId());
     } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
 }
@@ -2571,7 +2598,17 @@ HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESE
     if(hr==S_OK) self->completed_present_cookie=cookie;
     if((stop_on_missing_service() || graphics_diagnostics.load()) && value<=3)
         std::fprintf(stderr,"xone-era: native frame %llu presented, host HRESULT 0x%08lX interval %u cookie 0x%llX\n",value,hr,interval,self->completed_present_cookie);
-    if(hr==S_OK) diagnose_presented_pixels(source,value);
+    if(hr==S_OK && graphics_diagnostics.load()) {
+        const auto sequence=self->device->diagnostic_list_sequence.load();
+        if(sequence!=self->diagnostic_list_sequence) {
+            self->diagnostic_list_sequence=sequence;self->diagnostic_present_budget=8;
+        }
+        // Bounded consecutive samples after nonempty replay, plus occasional later frames.
+        if(self->diagnostic_present_count<128 && (self->diagnostic_present_budget || value%30==0)) {
+            if(self->diagnostic_present_budget) --self->diagnostic_present_budget;
+            ++self->diagnostic_present_count;diagnose_presented_pixels(source,value);
+        }
+    }
     return hr;
 }
 HRESULT STDMETHODCALLTYPE swapchain_present(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input) {
@@ -2831,6 +2868,9 @@ void clear_context_bindings(Context* self,bool preserve_layout=false) {
     if (self->depth_state) depth_state_release(self->depth_state); self->depth_state=nullptr;
     if (self->blend_state) blend_state_release(self->blend_state); self->blend_state=nullptr;
     for (auto*& shader:self->shaders) { if (shader) shader_release(shader); shader=nullptr; }
+    if(self->compute_shader) shader_release(self->compute_shader);self->compute_shader=nullptr;
+    for(auto*& sampler:self->compute_samplers) {if(sampler) sampler_release(sampler);sampler=nullptr;}
+    for(auto*& view:self->compute_uavs) {if(view) view_release(view);view=nullptr;}
     if (!preserve_layout) { if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr; }
     for (auto*& sampler:self->pixel_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
     for (auto& stage:self->shader_resources) for (auto*& view:stage) { if (view) view_release(view); view=nullptr; }
@@ -2838,7 +2878,12 @@ void clear_context_bindings(Context* self,bool preserve_layout=false) {
     for (auto*& buffer:self->vertex_buffers) { if (buffer) buffer_release(buffer); buffer=nullptr; }
     if (self->index_buffer) buffer_release(self->index_buffer); self->index_buffer=nullptr;
 }
-Context::~Context() { clear_context_bindings(this); }
+Context::~Context() {
+    for(auto& [buffer,version]:buffer_versions) if(version.mapped &&
+        FAILED(unmap_title_gpu_resource(reinterpret_cast<Buffer*>(version.version.Get())->gpu)))
+        default_trap("deferred map retirement",16);
+    clear_context_bindings(this);
+}
 RecordedCommand::~RecordedCommand() { if (view) view_release(view); }
 void retain_recorded_binding(Context* self,GraphicsObject* object) {
     if(!self->deferred || !object) return;
@@ -2945,6 +2990,31 @@ void STDMETHODCALLTYPE context_input_layout(Context* self,InputLayout* layout) {
     if(self->input_layout) input_layout_release(self->input_layout);
     self->input_layout=layout;
     std::memcpy(self->inline_state.data()+0x178-32,&layout,sizeof layout);
+}
+void STDMETHODCALLTYPE context_compute_shader(Context* self,Shader* shader) {
+    if(shader && (shader->vtable!=shader_vtable().data() || shader->device!=self->device || shader->stage!=5)) {
+        default_trap("ID3D11DeviceContextX",69);return;
+    }
+    retain_recorded_binding(self,shader);
+    if(shader) add_ref(shader);
+    if(self->compute_shader) shader_release(self->compute_shader);
+    self->compute_shader=shader;
+    auto flags=context_state<UINT8,0x1f8>(self);
+    if(!(flags&1) && context_state<Shader*,0x1f0>(self)!=shader) flags|=1;
+    context_state<UINT8,0x1f8>(self,flags);
+    context_state<Shader*,0x1f0>(self,shader);
+    context_state<UINT64,0x218>(self,context_state<UINT64,0x218>(self)|0x20);
+}
+void STDMETHODCALLTYPE context_compute_samplers(Context* self,UINT start,UINT count,Sampler* const* input) {
+    if(!bind_range(self,self->compute_samplers,start,count,input,[&](Sampler* sampler) {
+        return sampler->vtable==sampler_vtable().data() && sampler->device==self->device;
+    },sampler_release)) default_trap("ID3D11DeviceContextX",70);
+}
+void STDMETHODCALLTYPE context_compute_uavs(Context* self,UINT start,UINT count,BufferView* const* input) {
+    // 11295 1800153c0 takes four arguments; there is no desktop initial-counter array.
+    if(!bind_range(self,self->compute_uavs,start,count,input,[&](BufferView* view) {
+        return view->vtable==uav_vtable().data() && view->device==self->device && view->view_type==3 && view->heap;
+    },view_release)) default_trap("ID3D11DeviceContextX",68);
 }
 void STDMETHODCALLTYPE context_vertices(Context* self,UINT start,UINT count,Buffer* const* input,const UINT* strides,const UINT* offsets) {
     decltype(self->vertex_strides) next_strides{},next_offsets{}; SIZE_T read=0;
@@ -3079,6 +3149,11 @@ std::unique_ptr<Context> capture_draw_state(Context* self) {
     const auto range=[&](auto& out,const auto& in) {
         for(SIZE_T i=0;i<out.size();++i) out[i]=retain(in[i]);
     };
+    const auto retain_buffer=[&](Buffer* buffer) {
+        const auto version=self->buffer_versions.find(buffer);
+        if(version!=self->buffer_versions.end()) buffer=reinterpret_cast<Buffer*>(version->second.version.Get());
+        return retain(buffer);
+    };
     range(state->render_targets,self->render_targets);
     state->depth_target=retain(self->depth_target);
     state->viewports=self->viewports;state->viewport_count=self->viewport_count;
@@ -3086,15 +3161,18 @@ std::unique_ptr<Context> capture_draw_state(Context* self) {
     state->blend_state=retain(self->blend_state);
     state->stencil_reference=self->stencil_reference;state->sample_mask=self->sample_mask;state->blend_factor=self->blend_factor;
     range(state->shaders,self->shaders);state->input_layout=retain(self->input_layout);
+    state->compute_shader=retain(self->compute_shader);
+    range(state->compute_samplers,self->compute_samplers);range(state->compute_uavs,self->compute_uavs);
     range(state->pixel_samplers,self->pixel_samplers);
     for(SIZE_T i=0;i<state->shader_resources.size();++i) range(state->shader_resources[i],self->shader_resources[i]);
-    for(SIZE_T i=0;i<state->constants.size();++i) range(state->constants[i],self->constants[i]);
-    range(state->vertex_buffers,self->vertex_buffers);
+    for(SIZE_T i=0;i<state->constants.size();++i) for(SIZE_T j=0;j<state->constants[i].size();++j)
+        state->constants[i][j]=retain_buffer(self->constants[i][j]);
+    for(SIZE_T i=0;i<state->vertex_buffers.size();++i) state->vertex_buffers[i]=retain_buffer(self->vertex_buffers[i]);
     state->vertex_strides=self->vertex_strides;state->vertex_offsets=self->vertex_offsets;
-    state->index_buffer=retain(self->index_buffer);state->index_format=self->index_format;state->index_offset=self->index_offset;
+    state->index_buffer=retain_buffer(self->index_buffer);state->index_format=self->index_format;state->index_offset=self->index_offset;
     return state;
 }
-HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth) {
+HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth,UINT clear_flags=D3D11_CLEAR_DEPTH,UINT8 stencil=0) {
     if (!view || view->device != self->device || !view->resource ||
         view->resource->vtable != texture_vtable().data() || !view->heap || view->view_type != (color ? 0u : 1u)) return E_INVALIDARG;
     if(self->deferred) {
@@ -3104,6 +3182,7 @@ HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth
             command->view=view;view_add_ref(view);
             if(color) std::copy_n(color,4,command->color.begin());
             command->depth=depth;
+            command->clear_flags=clear_flags;command->stencil=stencil;
             self->recording.push_back(std::move(command));
             return S_OK;
         } catch(const std::bad_alloc&) { self->recording_error=E_OUTOFMEMORY;return E_OUTOFMEMORY; }
@@ -3118,10 +3197,13 @@ HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth
             if(SUCCEEDED(hr)) hr=self->command_list->Reset(self->command_allocator.Get(),nullptr);
         }
     }
-    if(SUCCEEDED(hr)) hr=begin_title_gpu_texture(texture->gpu,self->command_list.Get(),color ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    const auto& desc=texture->desc.standard;
+    const bool all_aspects=color || view->dsv_desc.Format==DXGI_FORMAT_D32_FLOAT || (clear_flags&3)==3;
+    const bool discard=all_aspects && !texture->volume && desc.MipLevels==1 && desc.ArraySize==1;
+    if(SUCCEEDED(hr)) hr=begin_title_gpu_texture(texture->gpu,self->command_list.Get(),color ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_DEPTH_WRITE,discard);
     if(FAILED(hr)) return hr;
     if(color) self->command_list->ClearRenderTargetView(view->host,color,0,nullptr);
-    else self->command_list->ClearDepthStencilView(view->host,D3D12_CLEAR_FLAG_DEPTH,depth,0,0,nullptr);
+    else self->command_list->ClearDepthStencilView(view->host,static_cast<D3D12_CLEAR_FLAGS>(clear_flags),depth,stencil,0,nullptr);
     hr=end_title_gpu_texture(texture->gpu,self->command_list.Get());
     if(SUCCEEDED(hr)) hr=self->command_list->Close();
     if(FAILED(hr)) return hr;
@@ -3151,9 +3233,18 @@ void STDMETHODCALLTYPE context_clear_rtv(Context* self,BufferView* view,const FL
 void STDMETHODCALLTYPE context_clear_depth(Context* self,BufferView* view,UINT flags,FLOAT depth,UINT8 stencil) {
     // D32 has no stencil component. A combined clear still clears its depth;
     // the stencil argument has no storage to modify in this verified format.
-    HRESULT hr=view && view->dsv_desc.Format==DXGI_FORMAT_D32_FLOAT && !(view->dsv_desc.Flags & D3D11_DSV_READ_ONLY_DEPTH) &&
-        (flags & D3D11_CLEAR_DEPTH) && !(flags & ~(D3D11_CLEAR_DEPTH|D3D11_CLEAR_STENCIL)) && std::isfinite(depth) ? S_OK : DXGI_ERROR_UNSUPPORTED;
-    if(SUCCEEDED(hr)) hr=clear_view(self,view,nullptr,std::clamp(depth,0.f,1.f));
+    const bool has_stencil=view && view->dsv_desc.Format==DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    UINT aspects=has_stencil ? flags : flags&D3D11_CLEAR_DEPTH;
+    HRESULT hr=view && (has_stencil || view->dsv_desc.Format==DXGI_FORMAT_D32_FLOAT) && aspects && !(flags&~3u) &&
+        (!(aspects&D3D11_CLEAR_DEPTH) || (!(view->dsv_desc.Flags&D3D11_DSV_READ_ONLY_DEPTH) && std::isfinite(depth))) &&
+        (!(aspects&D3D11_CLEAR_STENCIL) || !(view->dsv_desc.Flags&D3D11_DSV_READ_ONLY_STENCIL)) ? S_OK : DXGI_ERROR_UNSUPPORTED;
+    if(SUCCEEDED(hr) && graphics_diagnostics.load() && view->resource && view->resource->vtable==texture_vtable().data()) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<16) std::fprintf(stderr,"xone-era: clear DSV caller=%p deferred=%u backing=%p format=%u samples=%u flags=0x%X depth=%g stencil=%u\n",
+            _ReturnAddress(),self->deferred,static_cast<Texture*>(view->resource)->canonical,view->dsv_desc.Format,
+            static_cast<Texture*>(view->resource)->desc.standard.SampleDesc.Count,flags,depth,stencil);
+    }
+    if(SUCCEEDED(hr)) hr=clear_view(self,view,nullptr,aspects&D3D11_CLEAR_DEPTH ? std::clamp(depth,0.f,1.f) : 0.f,aspects,stencil);
     if(FAILED(hr)) { std::fprintf(stderr,"xone-era: depth clear failed 0x%08lX flags 0x%X depth %g stencil %u\n",hr,flags,depth,stencil); default_trap("ID3D11DeviceContextX",54); }
 }
 HRESULT STDMETHODCALLTYPE context_map_modern(Context*,GraphicsObject*,UINT,D3D11_MAP,UINT,D3D11_MAPPED_SUBRESOURCE*);
@@ -3191,9 +3282,21 @@ HRESULT refresh_graphics_bindings(Context* self) {
     return S_OK;
 }
 HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) {
+    const auto failed=[&](HRESULT hr,UINT line) {
+        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw failure at era_d3d11x.cpp:%u HRESULT=0x%08lX\n",line,hr);
+        return hr;
+    };
+    const auto unsupported=[&](UINT line) {
+        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported at era_d3d11x.cpp:%u\n",line);
+        return DXGI_ERROR_UNSUPPORTED;
+    };
     const HRESULT refreshed=refresh_graphics_bindings(self);
     if(FAILED(refreshed)) return refreshed;
     if(self->deferred) {
+        const auto mapped=[&](Buffer* buffer) {const auto it=self->buffer_versions.find(buffer);return it!=self->buffer_versions.end() && it->second.mapped;};
+        if(mapped(self->index_buffer)) return DXGI_ERROR_INVALID_CALL;
+        for(auto* buffer:self->vertex_buffers) if(mapped(buffer)) return DXGI_ERROR_INVALID_CALL;
+        for(const auto& stage:self->constants) for(auto* buffer:stage) if(mapped(buffer)) return DXGI_ERROR_INVALID_CALL;
         auto command=std::make_shared<RecordedCommand>();
         command->kind=indexed ? RecordedCommand::draw_indexed : RecordedCommand::draw;
         command->state=capture_draw_state(self);command->count=count;command->first=first;command->base=base;
@@ -3204,38 +3307,57 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     const auto primitive = topology == 0x000009ffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST :
         topology == 0x00000dffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     if((indexed && !self->index_buffer) ||
-        !self->render_targets[0] || !self->viewport_count || primitive == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
-    if(self->raster_state && self->raster_state->desc.ScissorEnable) return DXGI_ERROR_UNSUPPORTED;
+        !self->render_targets[0] || !self->viewport_count || primitive == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED) return unsupported(__LINE__);
+    if(self->raster_state && self->raster_state->desc.ScissorEnable) {
+        if(graphics_diagnostics.load()) std::fputs("xone-era: draw requires unsupported scissor state\n",stderr);
+        return unsupported(__LINE__);
+    }
     const UINT index_bytes=self->index_format==DXGI_FORMAT_R16_UINT ? 2 : 4;
     if(indexed && UINT64(first)+count>(self->index_buffer->desc.standard.ByteWidth-self->index_offset)/index_bytes) return E_INVALIDARG;
     UINT counts[2][3]{}; // PS/VS: CBV, SRV, sampler.
+    std::array<std::array<std::array<bool,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,3>,2> used{};
+    struct ReflectedView {D3D_SRV_DIMENSION dimension{};D3D_RESOURCE_RETURN_TYPE type{};};
+    std::array<std::array<ReflectedView,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,2> reflected_views{};
     for(UINT stage=0;stage<2;++stage) {
         ValidatedShader shader;
         HRESULT hr=shader.load(self->shaders[stage]->code.data(),self->shaders[stage]->code.size(),stage);
-        if(FAILED(hr)) return hr;
+        if(FAILED(hr)) return failed(hr,__LINE__);
         for(UINT i=0;i<shader.desc.BoundResources;++i) {
             D3D11_SHADER_INPUT_BIND_DESC binding{};
-            hr=shader.reflection->GetResourceBindingDesc(i,&binding);if(FAILED(hr)) return hr;
+            hr=shader.reflection->GetResourceBindingDesc(i,&binding);if(FAILED(hr)) return failed(hr,__LINE__);
             UINT kind=0,limit=D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
             if(binding.Type==D3D_SIT_TEXTURE) {kind=1;limit=D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;}
             else if(binding.Type==D3D_SIT_SAMPLER) {kind=2;limit=D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;}
-            else if(binding.Type!=D3D_SIT_CBUFFER) return DXGI_ERROR_UNSUPPORTED;
-            if((stage && kind) || !binding.BindCount || binding.BindPoint>=limit || binding.BindCount>limit-binding.BindPoint) return DXGI_ERROR_UNSUPPORTED;
+            else if(binding.Type!=D3D_SIT_CBUFFER) return unsupported(__LINE__);
+            if((stage && kind==2) || !binding.BindCount || binding.BindPoint>=limit || binding.BindCount>limit-binding.BindPoint) {
+                if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported shader binding stage=%u type=%u slot=%u count=%u\n",stage,binding.Type,binding.BindPoint,binding.BindCount);
+                return unsupported(__LINE__);
+            }
             counts[stage][kind]=(std::max)(counts[stage][kind],binding.BindPoint+binding.BindCount);
+            for(UINT slot=binding.BindPoint;slot<binding.BindPoint+binding.BindCount;++slot) {
+                used[stage][kind][slot]=true;
+                if(kind==1) reflected_views[stage][slot]={binding.Dimension,binding.ReturnType};
+            }
         }
     }
-    struct Table {UINT stage,kind,count,offset;};
+    struct Table {UINT stage,kind,offset;std::vector<UINT> slots;};
     std::array<Table,6> tables{};
-    std::array<D3D12_DESCRIPTOR_RANGE,6> ranges{};
+    std::array<std::vector<D3D12_DESCRIPTOR_RANGE>,6> ranges{};
     std::array<D3D12_ROOT_PARAMETER,6> parameters{};
     UINT table_count=0,resources=0,samplers=0;
     constexpr D3D12_DESCRIPTOR_RANGE_TYPE types[]{D3D12_DESCRIPTOR_RANGE_TYPE_CBV,D3D12_DESCRIPTOR_RANGE_TYPE_SRV,D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER};
     for(UINT stage=0;stage<2;++stage) for(UINT kind=0;kind<3;++kind) if(counts[stage][kind]) {
         auto& total=kind==2 ? samplers : resources;
-        tables[table_count]={stage,kind,counts[stage][kind],total};total+=counts[stage][kind];
-        ranges[table_count]={types[kind],counts[stage][kind],0,0,0};
+        auto& table=tables[table_count];table.stage=stage;table.kind=kind;table.offset=total;
+        auto& range=ranges[table_count];
+        for(UINT slot=0;slot<counts[stage][kind];++slot) if(used[stage][kind][slot]) {
+            if(!range.empty() && range.back().BaseShaderRegister+range.back().NumDescriptors==slot) ++range.back().NumDescriptors;
+            else range.push_back({types[kind],1,slot,0,UINT(table.slots.size())});
+            table.slots.push_back(slot);
+        }
+        total+=UINT(table.slots.size());
         parameters[table_count].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        parameters[table_count].DescriptorTable={1,&ranges[table_count]};
+        parameters[table_count].DescriptorTable={UINT(range.size()),range.data()};
         parameters[table_count].ShaderVisibility=stage ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         ++table_count;
     }
@@ -3244,7 +3366,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     HRESULT hr=D3D12SerializeRootSignature(&root_desc,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,nullptr);
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
     if(SUCCEEDED(hr)) hr=self->device->d3d12->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root));
-    if(FAILED(hr)) return hr;
+    if(FAILED(hr)) return failed(hr,__LINE__);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline{};
     pipeline.pRootSignature=root.Get();
     pipeline.VS={self->shaders[1]->code.data(),self->shaders[1]->code.size()};
@@ -3278,49 +3400,75 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         uses.push_back({&gpu,texture,state});return true;
     };
     for(UINT i=0;i<self->render_targets.size();++i) if(auto* view=self->render_targets[i]) {
-        if(i!=pipeline.NumRenderTargets || view->resource->vtable!=texture_vtable().data()) return DXGI_ERROR_UNSUPPORTED;
+        if(i!=pipeline.NumRenderTargets || view->resource->vtable!=texture_vtable().data()) return unsupported(__LINE__);
         auto* texture=static_cast<Texture*>(view->resource);
-        if(texture->volume || texture->desc.standard.SampleDesc.Count!=1 || texture->desc.standard.ArraySize!=1) return DXGI_ERROR_UNSUPPORTED;
+        if(texture->volume || texture->desc.standard.SampleDesc.Count!=1 || texture->desc.standard.ArraySize!=1) return unsupported(__LINE__);
         pipeline.RTVFormats[i]=view->rtv_desc.Format;++pipeline.NumRenderTargets;
         if(!use(texture->gpu,true,D3D12_RESOURCE_STATE_RENDER_TARGET)) return DXGI_ERROR_INVALID_CALL;
     }
     if(self->depth_target) {
         auto* texture=static_cast<Texture*>(self->depth_target->resource);
-        if(texture->desc.standard.SampleDesc.Count!=1 || self->depth_target->dsv_desc.Format!=DXGI_FORMAT_D32_FLOAT || self->depth_target->dsv_desc.Flags)
-            return DXGI_ERROR_UNSUPPORTED;
+        if(texture->desc.standard.SampleDesc.Count!=1 || self->depth_target->dsv_desc.Format!=DXGI_FORMAT_D32_FLOAT || self->depth_target->dsv_desc.Flags) {
+            if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported depth samples=%u format=%u flags=0x%X\n",texture->desc.standard.SampleDesc.Count,self->depth_target->dsv_desc.Format,self->depth_target->dsv_desc.Flags);
+            return unsupported(__LINE__);
+        }
         pipeline.DSVFormat=DXGI_FORMAT_D32_FLOAT;
         if(!use(texture->gpu,true,D3D12_RESOURCE_STATE_DEPTH_WRITE)) return DXGI_ERROR_INVALID_CALL;
     }
     Microsoft::WRL::ComPtr<ID3D12PipelineState> compiled;
     // shortcut: synchronous uncached PSOs, upgrade after measured first-frame validation.
     hr=self->device->d3d12->CreateGraphicsPipelineState(&pipeline,IID_PPV_ARGS(&compiled));
-    if(FAILED(hr)) return hr;
+    if(FAILED(hr)) return failed(hr,__LINE__);
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> resource_heap,sampler_heap;
     if(resources) {const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,resources,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};hr=self->device->d3d12->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&resource_heap));}
     if(SUCCEEDED(hr) && samplers) {const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,samplers,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};hr=self->device->d3d12->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&sampler_heap));}
-    if(FAILED(hr)) return hr;
+    if(FAILED(hr)) return failed(hr,__LINE__);
     for(UINT t=0;t<table_count;++t) {
         const auto& table=tables[t];const auto type=table.kind==2 ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         const UINT step=self->device->d3d12->GetDescriptorHandleIncrementSize(type);
         auto handle=(table.kind==2 ? sampler_heap : resource_heap)->GetCPUDescriptorHandleForHeapStart();handle.ptr+=SIZE_T(table.offset)*step;
-        for(UINT i=0;i<table.count;++i,handle.ptr+=step) {
+        for(UINT at=0;at<table.slots.size();++at,handle.ptr+=step) {
+            const UINT i=table.slots[at];
             if(table.kind==0) {
-                auto* buffer=self->constants[table.stage][i];if(!buffer) return DXGI_ERROR_UNSUPPORTED;
+                auto* buffer=self->constants[table.stage][i];if(!buffer) {
+                    if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw missing CB stage=%u slot=%u\n",table.stage,i);
+                    return unsupported(__LINE__);
+                }
                 const UINT bytes=(buffer->desc.standard.ByteWidth+255)&~255u;
-                if(buffer->gpu.offset+bytes>buffer->gpu.resource->GetDesc().Width || !use(buffer->gpu,false,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
+                if(buffer->gpu.offset+bytes>buffer->gpu.resource->GetDesc().Width || !use(buffer->gpu,false,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)) return unsupported(__LINE__);
                 const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset,bytes};
                 self->device->d3d12->CreateConstantBufferView(&desc,handle);
             } else if(table.kind==1) {
-                auto* view=self->shader_resources[4][i];if(!view || !view->heap) return DXGI_ERROR_UNSUPPORTED;
+                auto* view=self->shader_resources[table.stage ? 0 : 4][i];
+                if(!view) {
+                    // Native 18001f6a0 clears null bindings. D3D12 null descriptors preserve zero reads.
+                    const auto binding=reflected_views[table.stage][i];
+                    D3D12_SHADER_RESOURCE_VIEW_DESC desc{};desc.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    if(binding.type==D3D_RETURN_TYPE_FLOAT || binding.type==D3D_RETURN_TYPE_UNORM || binding.type==D3D_RETURN_TYPE_SNORM) desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
+                    else if(binding.type==D3D_RETURN_TYPE_UINT) desc.Format=DXGI_FORMAT_R32G32B32A32_UINT;
+                    else if(binding.type==D3D_RETURN_TYPE_SINT) desc.Format=DXGI_FORMAT_R32G32B32A32_SINT;
+                    else return unsupported(__LINE__);
+                    if(binding.dimension==D3D_SRV_DIMENSION_BUFFER) {desc.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;desc.Buffer.NumElements=1;}
+                    else if(binding.dimension==D3D_SRV_DIMENSION_TEXTURE2D) {desc.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;desc.Texture2D.MipLevels=1;}
+                    else if(binding.dimension==D3D_SRV_DIMENSION_TEXTURE2DMS) desc.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    else return unsupported(__LINE__);
+                    self->device->d3d12->CreateShaderResourceView(nullptr,&desc,handle);
+                    continue;
+                }
+                if(!view->heap) return unsupported(__LINE__);
+                const auto state=table.stage ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                 if(view->resource->vtable==texture_vtable().data()) {
                     auto* texture=static_cast<Texture*>(view->resource);
-                    if(texture->desc.standard.SampleDesc.Count!=1 || !use(texture->gpu,true,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return DXGI_ERROR_UNSUPPORTED;
+                    if(!use(texture->gpu,true,state)) return DXGI_ERROR_INVALID_CALL;
                 } else if(view->resource->vtable==buffer_vtable().data()) {
-                    if(!use(static_cast<Buffer*>(view->resource)->gpu,false,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return DXGI_ERROR_UNSUPPORTED;
-                } else return DXGI_ERROR_UNSUPPORTED;
+                    if(!use(static_cast<Buffer*>(view->resource)->gpu,false,state)) return unsupported(__LINE__);
+                } else return unsupported(__LINE__);
                 self->device->d3d12->CopyDescriptorsSimple(1,handle,view->host,type);
             } else {
-                auto* sampler=self->pixel_samplers[i];if(!sampler) return DXGI_ERROR_UNSUPPORTED;
+                auto* sampler=self->pixel_samplers[i];if(!sampler) {
+                    if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw missing PS sampler slot=%u\n",i);
+                    return unsupported(__LINE__);
+                }
                 self->device->d3d12->CopyDescriptorsSimple(1,handle,sampler->host,type);
             }
         }
@@ -3350,6 +3498,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
             diagnose_shader(reinterpret_cast<std::uintptr_t>(self->shaders[stage]->code.data()),self->shaders[stage]->code.size(),true);
             for (UINT i=0;i<counts[stage][0];++i) {
                 const auto* buffer=self->constants[stage][i];
+                if(!used[stage][0][i]) continue;
                 std::array<FLOAT,16> values{};SIZE_T read=0;
                 const auto bytes=(std::min)(SIZE_T(buffer->desc.standard.ByteWidth),sizeof values);
                 if (ReadProcessMemory(GetCurrentProcess(),buffer->allocation_start,values.data(),bytes,&read) && read==bytes)
@@ -3361,7 +3510,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     }
     D3D12_INDEX_BUFFER_VIEW index{};
     if(indexed) {
-        if(!use(self->index_buffer->gpu,false,D3D12_RESOURCE_STATE_INDEX_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
+        if(!use(self->index_buffer->gpu,false,D3D12_RESOURCE_STATE_INDEX_BUFFER)) return unsupported(__LINE__);
         const auto& indices=self->index_buffer->gpu;
         index={indices.resource->GetGPUVirtualAddress()+indices.offset+self->index_offset,
             self->index_buffer->desc.standard.ByteWidth-self->index_offset,self->index_format};
@@ -3374,11 +3523,20 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         if(!self->command_list) hr=self->device->d3d12->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,self->command_allocator.Get(),compiled.Get(),IID_PPV_ARGS(&self->command_list));
         else {hr=self->command_allocator->Reset();if(SUCCEEDED(hr)) hr=self->command_list->Reset(self->command_allocator.Get(),compiled.Get());}
     }
-    if(FAILED(hr)) return hr;
+    if(FAILED(hr)) return failed(hr,__LINE__);
     for(auto& entry : uses) {
         hr=entry.texture ? begin_title_gpu_texture(*entry.gpu,self->command_list.Get(),entry.state) : begin_title_gpu_buffer(*entry.gpu,self->command_list.Get(),entry.state);
-        if(FAILED(hr)) return hr;
+        if(FAILED(hr)) {
+            if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw resource ingress failed backing=%p format=%u samples=%u state=0x%X\n",
+                static_cast<std::uint8_t*>(entry.gpu->allocation)+entry.gpu->canonical_offset,entry.gpu->resource->GetDesc().Format,entry.gpu->resource->GetDesc().SampleDesc.Count,entry.state);
+            if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw depth enabled=%u stencil=%u write=%u resource flags=0x%X %llux%u\n",
+                pipeline.DepthStencilState.DepthEnable,pipeline.DepthStencilState.StencilEnable,pipeline.DepthStencilState.DepthWriteMask,
+                entry.gpu->resource->GetDesc().Flags,entry.gpu->resource->GetDesc().Width,entry.gpu->resource->GetDesc().Height);
+            return failed(hr,__LINE__);
+        }
     }
+    // MSAA ingress records its own draw and changes the command list's pipeline state.
+    self->command_list->SetPipelineState(compiled.Get());
     self->command_list->SetGraphicsRootSignature(root.Get());
     ID3D12DescriptorHeap* heaps[2]{};UINT heap_count=0;
     if(resource_heap) heaps[heap_count++]=resource_heap.Get();if(sampler_heap) heaps[heap_count++]=sampler_heap.Get();
@@ -3405,6 +3563,137 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     else self->command_list->DrawInstanced(count,1,first,0);
     for(auto& entry : uses) {
         hr=entry.texture ? end_title_gpu_texture(*entry.gpu,self->command_list.Get()) : end_title_gpu_buffer(*entry.gpu,self->command_list.Get());
+        if(FAILED(hr)) return failed(hr,__LINE__);
+    }
+    hr=self->command_list->Close();if(FAILED(hr)) return failed(hr,__LINE__);
+    ID3D12CommandList* lists[]{self->command_list.Get()};self->device->queue->ExecuteCommandLists(1,lists);
+    const UINT64 value=++self->submission_value;
+    hr=self->device->queue->Signal(self->submission_fence.Get(),value);
+    if(SUCCEEDED(hr)) hr=self->submission_fence->SetEventOnCompletion(value,completed.Get());
+    if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    // Keep descriptors/PSO alive on every in-flight failure path.
+    if(FAILED(hr)) default_trap("graphics submission retirement",14);
+    for(auto& entry : uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return failed(hr,__LINE__);}
+    static std::atomic<UINT> replay_observations{0};
+    if (graphics_diagnostics.load() && (self->completed_draws<8 || (self->replaying && replay_observations.fetch_add(1)<8))) {
+        for (UINT i=0;i<counts[0][1];++i) {
+            const auto* view=self->shader_resources[4][i];
+            if (view && view->resource->vtable==texture_vtable().data()) {
+                auto* texture=static_cast<Texture*>(view->resource);
+                std::fprintf(stderr,"xone-era: draw PS SRV %u format=%u resource_format=%u %ux%u\n",i,view->srv_desc.Format,
+                    texture->desc.standard.Format,texture->desc.standard.Width,texture->desc.standard.Height);
+                diagnose_presented_pixels(texture,self->completed_draws+1,"draw sampled");
+            }
+        }
+        diagnose_presented_pixels(static_cast<Texture*>(self->render_targets[0]->resource),self->completed_draws+1,"draw target");
+    }
+    ++self->completed_draws;
+    if((stop_on_missing_service() || self->device->legacy) && self->completed_draws<=2)
+        std::fprintf(stderr,"xone-era: native %s draw %llu completed, %u %s, original VS/PS\n",indexed ? "indexed" : "non-indexed",
+            self->completed_draws,count,indexed ? "indices" : "vertices");
+    return S_OK;
+}
+HRESULT execute_compute(Context* self,UINT x,UINT y,UINT z) {
+    if(x>65535 || y>65535 || z>65535) return E_INVALIDARG;
+    auto* shader=context_state<Shader*,0x1f0>(self);
+    struct Prefix {const void* table;UINT refs,flags;Device* device;void* data;UINT native_flags,stage;} prefix{};
+    SIZE_T read=0;
+    if(!shader || !ReadProcessMemory(GetCurrentProcess(),shader,&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+        prefix.table!=shader_vtable().data() || prefix.device!=self->device || prefix.stage!=5) return E_INVALIDARG;
+    if(self->compute_shader!=shader) context_compute_shader(self,shader);
+    if(self->deferred) {
+        for(auto* buffer:self->constants[3]) {
+            const auto version=self->buffer_versions.find(buffer);
+            if(version!=self->buffer_versions.end() && version->second.mapped) return DXGI_ERROR_INVALID_CALL;
+        }
+        auto command=std::make_shared<RecordedCommand>();command->kind=RecordedCommand::dispatch;
+        command->state=capture_draw_state(self);command->count=x;command->first=y;command->base=INT(z);
+        self->recording.push_back(std::move(command));return S_OK;
+    }
+    ValidatedShader validated;
+    HRESULT hr=validated.load(shader->code.data(),shader->code.size(),5);
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    std::array<UINT,4> counts{};
+    if(SUCCEEDED(hr)) hr=validate_native_compute(self->device,validated,&root,&pipeline,&counts);
+    if(FAILED(hr)) return hr;
+    if(counts[0]>self->shader_resources[5].size() || counts[1]>self->compute_uavs.size() ||
+        counts[2]>self->constants[3].size() || counts[3]>self->compute_samplers.size()) return DXGI_ERROR_UNSUPPORTED;
+    struct Use {TitleGpuResource* gpu;bool texture;D3D12_RESOURCE_STATES state;};
+    std::vector<Use> uses;
+    const auto use=[&](TitleGpuResource& gpu,bool texture,D3D12_RESOURCE_STATES state) {
+        for(auto& entry:uses) if(entry.gpu==&gpu) {
+            if((entry.state|state)&D3D12_RESOURCE_STATE_UNORDERED_ACCESS && entry.state!=state) return false;
+            entry.state|=state;return true;
+        }
+        uses.push_back({&gpu,texture,state});return true;
+    };
+    const UINT resources=counts[0]+counts[1]+counts[2];
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> resource_heap,sampler_heap;
+    if(resources) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,resources,D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        hr=self->device->d3d12->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&resource_heap));
+    }
+    if(SUCCEEDED(hr) && counts[3]) {
+        const D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,counts[3],D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+        hr=self->device->d3d12->CreateDescriptorHeap(&desc,IID_PPV_ARGS(&sampler_heap));
+    }
+    if(FAILED(hr)) return hr;
+    const UINT resource_stride=self->device->d3d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    const UINT sampler_stride=self->device->d3d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    UINT offset=0;
+    for(UINT kind=0;kind<3;++kind) for(UINT i=0;i<counts[kind];++i,++offset) {
+        auto destination=resource_heap->GetCPUDescriptorHandleForHeapStart();destination.ptr+=SIZE_T(offset)*resource_stride;
+        if(kind==2) {
+            auto* buffer=self->constants[3][i];
+            if(!buffer || !use(buffer->gpu,false,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)) return DXGI_ERROR_UNSUPPORTED;
+            const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset,(buffer->desc.standard.ByteWidth+255)&~255u};
+            self->device->d3d12->CreateConstantBufferView(&desc,destination);
+        } else {
+            auto* view=kind ? self->compute_uavs[i] : self->shader_resources[5][i];
+            if(!view || !view->resource || !view->heap) return DXGI_ERROR_UNSUPPORTED;
+            const auto state=kind ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            if(view->resource->vtable==texture_vtable().data()) {
+                if(!use(static_cast<Texture*>(view->resource)->gpu,true,state)) return DXGI_ERROR_UNSUPPORTED;
+            } else if(view->resource->vtable==buffer_vtable().data()) {
+                if(!use(static_cast<Buffer*>(view->resource)->gpu,false,state)) return DXGI_ERROR_UNSUPPORTED;
+            } else return DXGI_ERROR_UNSUPPORTED;
+            if(kind && view->counter_buffer && !use(view->counter_buffer->gpu,false,D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
+            self->device->d3d12->CopyDescriptorsSimple(1,destination,view->host,D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+    }
+    for(UINT i=0;i<counts[3];++i) {
+        auto* sampler=self->compute_samplers[i];if(!sampler) return DXGI_ERROR_UNSUPPORTED;
+        auto destination=sampler_heap->GetCPUDescriptorHandleForHeapStart();destination.ptr+=SIZE_T(i)*sampler_stride;
+        self->device->d3d12->CopyDescriptorsSimple(1,destination,sampler->host,D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    }
+    if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
+    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(!completed.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+    if(SUCCEEDED(hr) && !self->command_allocator) hr=self->device->d3d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&self->command_allocator));
+    if(SUCCEEDED(hr)) {
+        if(!self->command_list) hr=self->device->d3d12->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,self->command_allocator.Get(),pipeline.Get(),IID_PPV_ARGS(&self->command_list));
+        else {hr=self->command_allocator->Reset();if(SUCCEEDED(hr)) hr=self->command_list->Reset(self->command_allocator.Get(),pipeline.Get());}
+    }
+    if(FAILED(hr)) return hr;
+    for(auto& entry:uses) {
+        hr=entry.texture ? begin_title_gpu_texture(*entry.gpu,self->command_list.Get(),entry.state) : begin_title_gpu_buffer(*entry.gpu,self->command_list.Get(),entry.state);
+        if(FAILED(hr)) return hr;
+    }
+    self->command_list->SetPipelineState(pipeline.Get());
+    self->command_list->SetComputeRootSignature(root.Get());
+    ID3D12DescriptorHeap* heaps[2]{};UINT heap_count=0;
+    if(resource_heap) heaps[heap_count++]=resource_heap.Get();if(sampler_heap) heaps[heap_count++]=sampler_heap.Get();
+    if(heap_count) self->command_list->SetDescriptorHeaps(heap_count,heaps);
+    UINT parameter=0;offset=0;
+    for(UINT kind=0;kind<4;++kind) if(counts[kind]) {
+        auto handle=kind==3 ? sampler_heap->GetGPUDescriptorHandleForHeapStart() : resource_heap->GetGPUDescriptorHandleForHeapStart();
+        if(kind!=3) {handle.ptr+=UINT64(offset)*resource_stride;offset+=counts[kind];}
+        self->command_list->SetComputeRootDescriptorTable(parameter++,handle);
+    }
+    self->command_list->Dispatch(x,y,z);
+    for(auto& entry:uses) {
+        hr=entry.texture ? end_title_gpu_texture(*entry.gpu,self->command_list.Get()) : end_title_gpu_buffer(*entry.gpu,self->command_list.Get());
         if(FAILED(hr)) return hr;
     }
     hr=self->command_list->Close();if(FAILED(hr)) return hr;
@@ -3413,26 +3702,22 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     hr=self->device->queue->Signal(self->submission_fence.Get(),value);
     if(SUCCEEDED(hr)) hr=self->submission_fence->SetEventOnCompletion(value,completed.Get());
     if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    // Keep descriptors/PSO alive on every in-flight failure path.
-    if(FAILED(hr)) default_trap("graphics submission retirement",14);
-    for(auto& entry : uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return hr;}
-    if (graphics_diagnostics.load() && self->completed_draws<8) {
-        for (UINT i=0;i<counts[0][1];++i) {
-            const auto* view=self->shader_resources[4][i];
-            if (view && view->resource->vtable==texture_vtable().data()) {
-                auto* texture=static_cast<Texture*>(view->resource);
-                std::fprintf(stderr,"xone-era: draw PS SRV %u format=%u resource_format=%u %ux%u\n",i,view->srv_desc.Format,
-                    texture->desc.standard.Format,texture->desc.standard.Width,texture->desc.standard.Height);
-                diagnose_presented_pixels(texture,1,"draw sampled");
-            }
+    if(FAILED(hr)) default_trap("compute submission retirement",41);
+    for(auto& entry:uses) {hr=complete_title_gpu_resource(*entry.gpu,self->submission_fence.Get(),value);if(FAILED(hr)) return hr;}
+    if(graphics_diagnostics.load()) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<8) {
+            std::fprintf(stderr,"xone-era: native compute dispatch %u,%u,%u completed after fence %llu\n",x,y,z,value);
+            for(UINT i=0;i<counts[1];++i) if(self->compute_uavs[i]->resource->vtable==texture_vtable().data())
+                diagnose_presented_pixels(static_cast<Texture*>(self->compute_uavs[i]->resource),1,"compute target");
         }
-        diagnose_presented_pixels(static_cast<Texture*>(self->render_targets[0]->resource),1,"draw target");
     }
-    ++self->completed_draws;
-    if((stop_on_missing_service() || self->device->legacy) && self->completed_draws<=2)
-        std::fprintf(stderr,"xone-era: native %s draw %llu completed, %u %s, original VS/PS\n",indexed ? "indexed" : "non-indexed",
-            self->completed_draws,count,indexed ? "indices" : "vertices");
     return S_OK;
+}
+void STDMETHODCALLTYPE context_dispatch(Context* self,UINT x,UINT y,UINT z) {
+    HRESULT hr=E_OUTOFMEMORY;
+    try {hr=execute_compute(self,x,y,z);} catch(const std::bad_alloc&) {}
+    if(FAILED(hr)) {std::fprintf(stderr,"xone-era: compute dispatch refused 0x%08lX\n",hr);default_trap("compute dispatch submission",41);}
 }
 void STDMETHODCALLTYPE context_draw_indexed(Context* self,UINT64 packed,INT base) {
     HRESULT hr=E_OUTOFMEMORY;
@@ -3440,14 +3725,16 @@ void STDMETHODCALLTYPE context_draw_indexed(Context* self,UINT64 packed,INT base
     if(FAILED(hr)) {std::fprintf(stderr,"xone-era: indexed draw failed 0x%08lX\n",hr);default_trap("indexed draw submission",14);}
 }
 void STDMETHODCALLTYPE legacy_context_draw(Context* self,UINT count,UINT first) {
-    if (graphics_diagnostics.load() && self->completed_draws<8)
-        std::fprintf(stderr,"xone-era: draw dispatch caller=%p context=%p target=%p PS0=%p thread=%lu\n",_ReturnAddress(),self,
+    if (graphics_diagnostics.load()) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<32) std::fprintf(stderr,"xone-era: draw dispatch caller=%p context=%p target=%p PS0=%p thread=%lu\n",_ReturnAddress(),self,
             self->render_targets[0] ? self->render_targets[0]->resource : nullptr,
             self->shader_resources[4][0] ? self->shader_resources[4][0]->resource : nullptr,GetCurrentThreadId());
+    }
     HRESULT hr=E_OUTOFMEMORY;
     try {hr=execute_draw(self,count,first,0,false);} catch(const std::bad_alloc&) {}
     if(FAILED(hr)) {
-        std::fprintf(stderr,"xone-era: non-indexed draw refused 0x%08lX\n",hr);
+        std::fprintf(stderr,"xone-era: non-indexed draw caller=%p refused 0x%08lX\n",_ReturnAddress(),hr);
         if(self->input_layout) for(const auto& e:self->input_layout->elements) {
             const auto* buffer=self->vertex_buffers[e.InputSlot];
             std::fprintf(stderr,"xone-era: Draw input %s%u format %u slot %u element_offset %u stride %u buffer_offset %u bytes %u\n",e.SemanticName,e.SemanticIndex,
@@ -3573,12 +3860,14 @@ HRESULT STDMETHODCALLTYPE context_finish_list(Context* self,BOOL,void** out) {
     if(!self->deferred) return E_NOTIMPL; // 11295 immediate slot 114, 180001580; output is untouched.
     if(out) *out=nullptr;
     if(FAILED(self->recording_error)) return self->recording_error;
+    for(const auto& [buffer,version]:self->buffer_versions) if(version.mapped) return DXGI_ERROR_INVALID_CALL;
     auto list=std::unique_ptr<CommandList>(new(std::nothrow) CommandList);
     if(!list) return E_OUTOFMEMORY;
     list->vtable=command_list_vtable().data();list->flags=1;list->refcount=0;
     list->device=self->device;list->context_flags=self->creation_flags;
     list->commands.swap(self->recording);
     list->references.swap(self->recorded_references);
+    self->buffer_versions.clear(); // Lists/snapshots retain every renamed version they consume.
     // 11295 18004acb0 ignores RestoreDeferredContextState; 180046940 starts fresh.
     context_clear_state(self);
     if(self->creation_flags&0x20000) { // Draw Bundles additionally discard the inline layout cache.
@@ -3593,6 +3882,91 @@ HRESULT STDMETHODCALLTYPE context_finish_list(Context* self,BOOL,void** out) {
     }
     if(out) {retain_device(self->device);*out=list.release();}
     return S_OK;
+}
+HRESULT execute_gpu_event(Context* self,UINT event);
+HRESULT execute_cache_flush(Context* self,UINT flags);
+HRESULT execute_gpu_wait(Context* self);
+HRESULT execute_update(const RecordedCommand& command) {
+    auto* resource=reinterpret_cast<GraphicsObject*>(command.update_resource.Get());
+    const bool buffer=resource->vtable==buffer_vtable().data();
+    auto& gpu=buffer ? static_cast<Buffer*>(resource)->gpu : static_cast<Texture*>(resource)->gpu;
+    void* canonical=nullptr;
+    HRESULT hr=map_title_gpu_resource(gpu,&canonical);
+    if(FAILED(hr)) return hr;
+    if(buffer) std::memcpy(static_cast<std::uint8_t*>(canonical)+command.update_offset,command.update_bytes.data(),command.update_bytes.size());
+    else {
+        auto* texture=static_cast<Texture*>(resource);
+        hr=texture->layout.copy(texture->layout.context.get(),true,const_cast<std::uint8_t*>(command.update_bytes.data()),canonical,
+            command.update_subresource,command.update_row_pitch,command.update_slice_pitch);
+    }
+    const HRESULT closed=unmap_title_gpu_resource(gpu);
+    return FAILED(hr) ? hr : closed;
+}
+void STDMETHODCALLTYPE context_update(Context* self,GraphicsObject* resource,UINT subresource,const D3D11_BOX* input,
+                                      const void* data,UINT row_pitch,UINT slice_pitch) {
+    // 11295 18000b240 -> 180030f70: resource, subresource, optional box, data and pitches.
+    // FAST_SEMANTICS returns without recording this API in the original implementation.
+    if(self->creation_flags&0x80000) return;
+    HRESULT hr=E_INVALIDARG;
+    try {
+        struct Prefix {const void* table;ULONG flags,refs;Device* device;} prefix{};
+        SIZE_T read=0;
+        if(!resource || !data || !ReadProcessMemory(GetCurrentProcess(),resource,&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+            prefix.device!=self->device || (prefix.table!=buffer_vtable().data() && prefix.table!=texture_vtable().data())) throw hr;
+        D3D11_BOX box{};
+        if(input && (!ReadProcessMemory(GetCurrentProcess(),input,&box,sizeof box,&read) || read!=sizeof box)) throw hr;
+        auto command=std::make_shared<RecordedCommand>();command->kind=RecordedCommand::update;
+        command->update_subresource=subresource;
+        UINT rows=1,depth=1;UINT64 row_bytes=0;
+        if(prefix.table==buffer_vtable().data()) {
+            const auto& desc=static_cast<Buffer*>(resource)->desc.standard;
+            if(subresource || desc.Usage!=D3D11_USAGE_DEFAULT || (desc.BindFlags&D3D11_BIND_DEPTH_STENCIL)) throw hr;
+            if(!input) box={0,0,0,desc.ByteWidth,1,1};
+            if(box.left>=box.right || box.right>desc.ByteWidth || box.top || box.front || box.bottom!=1 || box.back!=1 ||
+                ((desc.BindFlags&D3D11_BIND_CONSTANT_BUFFER) && (box.left || box.right!=desc.ByteWidth))) throw hr;
+            command->update_offset=box.left;row_bytes=box.right-box.left;
+            // Original buffer helper uses a nonzero row pitch as the copy length.
+            if(row_pitch && row_pitch!=row_bytes) {hr=DXGI_ERROR_UNSUPPORTED;throw hr;}
+        } else {
+            auto* texture=static_cast<Texture*>(resource);const auto& desc=texture->desc.standard;
+            if(desc.Usage!=D3D11_USAGE_DEFAULT || desc.SampleDesc.Count!=1 || (desc.BindFlags&D3D11_BIND_DEPTH_STENCIL) ||
+                subresource>=UINT64(desc.MipLevels)*(texture->volume ? 1 : desc.ArraySize)) throw hr;
+            const UINT mip=subresource%desc.MipLevels;
+            const UINT width=(std::max)(1u,desc.Width>>mip),height=(std::max)(1u,desc.Height>>mip);
+            depth=texture->volume ? (std::max)(1u,texture->volume_desc.standard.Depth>>mip) : 1;
+            if(input && (box.left || box.top || box.front || box.right!=width || box.bottom!=height || box.back!=depth)) {
+                hr=DXGI_ERROR_UNSUPPORTED;throw hr; // Partial tiled updates require a separately verified copy contract.
+            }
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            self->device->d3d12->GetCopyableFootprints(&texture->layout.resource_desc,subresource,1,0,&footprint,&rows,&row_bytes,nullptr);
+            if(!row_bytes || row_bytes>UINT_MAX || row_pitch<row_bytes || (depth>1 && slice_pitch<UINT64(row_pitch)*rows)) throw hr;
+        }
+        const UINT64 bytes=row_bytes*rows*depth;
+        if(!bytes || bytes>SIZE_MAX || row_bytes*rows>UINT_MAX) throw hr;
+        command->update_row_pitch=UINT(row_bytes);command->update_slice_pitch=UINT(row_bytes*rows);
+        command->update_bytes.resize(SIZE_T(bytes));
+        const UINT64 source_slice=depth>1 ? slice_pitch : 0;
+        const UINT64 source_row=rows>1 ? row_pitch : 0;
+        for(UINT z=0;z<depth;++z) for(UINT y=0;y<rows;++y) {
+            const UINT64 offset=source_slice*z+source_row*y;
+            if(offset>UINTPTR_MAX-reinterpret_cast<std::uintptr_t>(data) ||
+                !ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(data)+offset),
+                    command->update_bytes.data()+SIZE_T(z)*command->update_slice_pitch+SIZE_T(y)*command->update_row_pitch,SIZE_T(row_bytes),&read) || read!=row_bytes) throw hr;
+        }
+        command->update_resource=reinterpret_cast<IUnknown*>(resource);
+        if(graphics_diagnostics.load()) {
+            static std::atomic<UINT> observations{0};
+            if(observations.fetch_add(1)<8) std::fprintf(stderr,"xone-era: UpdateSubresource deferred=%u buffer=%u subresource=%u offset=%u bytes=%llu row=%u slice=%u\n",
+                self->deferred,prefix.table==buffer_vtable().data(),subresource,command->update_offset,UINT64(bytes),row_pitch,slice_pitch);
+        }
+        if(self->deferred) {self->recording.push_back(std::move(command));return;}
+        hr=execute_update(*command);
+        if(SUCCEEDED(hr)) return;
+    } catch(HRESULT error) {hr=error;}
+    catch(const std::bad_alloc&) {hr=E_OUTOFMEMORY;}
+    if(self->deferred) self->recording_error=hr;
+    std::fprintf(stderr,"xone-era: UpdateSubresource subresource=%u box=%p row=%u slice=%u failed 0x%08lX\n",subresource,input,row_pitch,slice_pitch,hr);
+    default_trap("ID3D11DeviceContextX",48);
 }
 void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL) {
     struct Prefix {const void* table;ULONG flags,refs;Device* device;} prefix{};
@@ -3614,7 +3988,7 @@ void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL
         auto& command=*list->commands[i];
         HRESULT hr=E_OUTOFMEMORY;
         try {
-            if(command.kind==RecordedCommand::draw || command.kind==RecordedCommand::draw_indexed) {
+            if(command.kind==RecordedCommand::draw || command.kind==RecordedCommand::draw_indexed || command.kind==RecordedCommand::dispatch) {
                 // Reuse the immediate submission objects; every operation retires before reuse.
                 struct Submission {
                     Context* immediate;Context* recorded;
@@ -3625,11 +3999,16 @@ void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL
                         std::swap(immediate->submission_value,recorded->submission_value);
                         std::swap(immediate->completed_draws,recorded->completed_draws);
                     }
-                    Submission(Context* a,Context* b):immediate(a),recorded(b) {swap();}
-                    ~Submission() {swap();}
+                    Submission(Context* a,Context* b):immediate(a),recorded(b) {swap();recorded->replaying=true;}
+                    ~Submission() {recorded->replaying=false;swap();}
                 } submission(self,command.state.get());
-                hr=execute_draw(command.state.get(),command.count,command.first,command.base,command.kind==RecordedCommand::draw_indexed);
-            } else hr=clear_view(self,command.view,command.kind==RecordedCommand::clear_color ? command.color.data() : nullptr,command.depth);
+                hr=command.kind==RecordedCommand::dispatch ? execute_compute(command.state.get(),command.count,command.first,UINT(command.base)) :
+                    execute_draw(command.state.get(),command.count,command.first,command.base,command.kind==RecordedCommand::draw_indexed);
+            } else if(command.kind==RecordedCommand::update) hr=execute_update(command);
+            else if(command.kind==RecordedCommand::gpu_wait) hr=execute_gpu_wait(self);
+            else if(command.kind==RecordedCommand::gpu_event) hr=execute_gpu_event(self,command.count);
+            else if(command.kind==RecordedCommand::cache_flush) hr=execute_cache_flush(self,command.count);
+            else hr=clear_view(self,command.view,command.kind==RecordedCommand::clear_color ? command.color.data() : nullptr,command.depth,command.clear_flags,command.stencil);
         } catch(const std::bad_alloc&) {}
         if(FAILED(hr)) {
             std::fprintf(stderr,"xone-era: ExecuteCommandList command=%zu kind=%u failed 0x%08lX\n",i,command.kind,hr);
@@ -3643,6 +4022,7 @@ void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL
     context_state<UINT,0x198>(self,UINT_MAX);
     context_state<UINT8,0x1f8>(self,context_state<UINT8,0x1f8>(self)|1);
     if(graphics_diagnostics.load()) {
+        if(!list->commands.empty()) ++self->device->diagnostic_list_sequence;
         static std::atomic<UINT> observations{0};
         if(observations.fetch_add(1)<8) std::fprintf(stderr,"xone-era: ExecuteCommandList commands=%zu flags=0x%X completed after fences\n",list->commands.size(),list->context_flags);
     }
@@ -3655,8 +4035,83 @@ void STDMETHODCALLTYPE context_flush(Context* self) {
     if(SUCCEEDED(hr)) hr=self->device->queue->Signal(self->submission_fence.Get(),++self->submission_value);
     if(FAILED(hr)) default_trap("graphics flush submission",111);
 }
+HRESULT submit_global_gpu_barrier(Context* self) {
+    HRESULT hr=S_OK;
+    if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
+    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(!completed.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+    if(SUCCEEDED(hr) && !self->command_allocator) hr=self->device->d3d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&self->command_allocator));
+    if(SUCCEEDED(hr)) {
+        if(!self->command_list) hr=self->device->d3d12->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,self->command_allocator.Get(),nullptr,IID_PPV_ARGS(&self->command_list));
+        else {hr=self->command_allocator->Reset();if(SUCCEEDED(hr)) hr=self->command_list->Reset(self->command_allocator.Get(),nullptr);}
+    }
+    if(FAILED(hr)) return hr;
+    D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    self->command_list->ResourceBarrier(1,&barrier);
+    hr=self->command_list->Close();if(FAILED(hr)) return hr;
+    ID3D12CommandList* lists[]{self->command_list.Get()};self->device->queue->ExecuteCommandLists(1,lists);
+    const UINT64 value=++self->submission_value;
+    hr=self->device->queue->Signal(self->submission_fence.Get(),value);
+    if(SUCCEEDED(hr)) hr=self->submission_fence->SetEventOnCompletion(value,completed.Get());
+    if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if(FAILED(hr)) default_trap("GPU event retirement",197);
+    return S_OK;
+}
+HRESULT execute_gpu_event(Context* self,UINT event) {
+    // 11295 180017100: CS_PARTIAL_FLUSH EVENT_WRITE / PFP_SYNC_ME, not CPU sleeps.
+    if(event!=0x407 && event!=0x80000001u) return DXGI_ERROR_UNSUPPORTED;
+    if(self->deferred) {
+        auto command=std::make_shared<RecordedCommand>();command->kind=RecordedCommand::gpu_event;command->count=event;
+        self->recording.push_back(std::move(command));return S_OK;
+    }
+    return submit_global_gpu_barrier(self);
+}
+HRESULT execute_gpu_wait(Context* self) {
+    // 11295 slot 153 -> 1800071d0: emit the current engine fence and WAIT_REG_MEM.
+    if(self->deferred) {
+        auto command=std::make_shared<RecordedCommand>();command->kind=RecordedCommand::gpu_wait;
+        self->recording.push_back(std::move(command));return S_OK;
+    }
+    return submit_global_gpu_barrier(self);
+}
+void STDMETHODCALLTYPE context_gpu_wait(Context* self) {
+    HRESULT hr=E_OUTOFMEMORY;
+    try {hr=execute_gpu_wait(self);} catch(const std::bad_alloc&) {}
+    if(FAILED(hr)) {std::fprintf(stderr,"xone-era: GPU wait failed 0x%08lX\n",hr);(void)trap_slot<kind_context,153>(self);}
+}
+HRESULT execute_cache_flush(Context* self,UINT flags) {
+    if(flags!=0x400000) return DXGI_ERROR_UNSUPPORTED;
+    if(self->deferred) {
+        auto command=std::make_shared<RecordedCommand>();command->kind=RecordedCommand::cache_flush;command->count=flags;
+        self->recording.push_back(std::move(command));return S_OK;
+    }
+    // Transfers already retire/publish through the shared registry; order the full coherent queue.
+    return submit_global_gpu_barrier(self);
+}
+void STDMETHODCALLTYPE context_cache_flush(Context* self,UINT flags,void* base,SIZE_T bytes) {
+    // 11295 1800155b0; FH2 1410c070a requests the global range (null, zero).
+    HRESULT hr=DXGI_ERROR_UNSUPPORTED;
+    try {if(!base && !bytes) hr=execute_cache_flush(self,flags);} catch(const std::bad_alloc&) {hr=E_OUTOFMEMORY;}
+    if(FAILED(hr)) {
+        std::fprintf(stderr,"xone-era: GPU cache flush flags=0x%X base=%p bytes=%llu refused 0x%08lX\n",flags,base,UINT64(bytes),hr);
+        (void)trap_slot<kind_context,152>(self,flags,reinterpret_cast<std::uintptr_t>(base),bytes);
+    }
+}
+void STDMETHODCALLTYPE context_gpu_event(Context* self,UINT event) {
+    HRESULT hr=E_OUTOFMEMORY;
+    try {hr=execute_gpu_event(self,event);} catch(const std::bad_alloc&) {}
+    if(FAILED(hr)) {
+        std::fprintf(stderr,"xone-era: GPU pipeline event 0x%X refused 0x%08lX\n",event,hr);
+        (void)trap_slot<kind_context,197>(self,event);
+    }
+}
 HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
         D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* out) {
+    if(graphics_diagnostics.load()) {
+        static std::array<std::atomic<UINT>,2> observations{};
+        if(observations[self->deferred].fetch_add(1)<8) std::fprintf(stderr,"xone-era: Map buffer caller=%p deferred=%u resource=%p subresource=%u mode=%u flags=0x%X\n",
+            _ReturnAddress(),self->deferred,resource,subresource,mode,flags);
+    }
     if (!out) return E_INVALIDARG;
     *out = {};
     if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self->device || subresource ||
@@ -3667,11 +4122,43 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
             reinterpret_cast<std::uintptr_t>(resource), subresource, mode, flags));
         return DXGI_ERROR_UNSUPPORTED;
     };
-    if (self->deferred || flags) return unsupported();
+    if (flags) return unsupported();
     if (mode != D3D11_MAP_WRITE_DISCARD && mode != D3D11_MAP_WRITE_NO_OVERWRITE) return E_INVALIDARG;
     if (mode == D3D11_MAP_WRITE_NO_OVERWRITE &&
         (!(resource->desc.standard.BindFlags & (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER)) ||
          (resource->desc.standard.BindFlags & D3D11_BIND_SHADER_RESOURCE))) return unsupported();
+    if(self->deferred) {
+        const UINT supported=D3D11_BIND_VERTEX_BUFFER|D3D11_BIND_INDEX_BUFFER|D3D11_BIND_CONSTANT_BUFFER;
+        if(resource->desc.standard.BindFlags&~supported || resource->desc.standard.MiscFlags || resource->borrowed || resource->esram_reservation)
+            return unsupported();
+        auto previous=self->buffer_versions.find(resource);
+        if(previous!=self->buffer_versions.end() && previous->second.mapped) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        Microsoft::WRL::ComPtr<IUnknown> version;
+        if(mode==D3D11_MAP_WRITE_NO_OVERWRITE) {
+            if(previous==self->buffer_versions.end()) return DXGI_ERROR_INVALID_CALL;
+            version=previous->second.version;
+        } else {
+            // 11295 18000ff10 renames WRITE_DISCARD per context, never overwriting immediate storage.
+            void* buffer=nullptr;
+            const HRESULT hr=device_create_buffer(self->device,&resource->desc,nullptr,&buffer);
+            if(FAILED(hr)) return hr;
+            version.Attach(reinterpret_cast<IUnknown*>(buffer));
+        }
+        auto* renamed=reinterpret_cast<Buffer*>(version.Get());
+        void* address=nullptr;
+        const HRESULT hr=map_title_gpu_resource(renamed->gpu,&address);
+        if(FAILED(hr)) return hr;
+        try {
+            DeferredBuffer entry;entry.original=reinterpret_cast<IUnknown*>(resource);entry.version=version;entry.mapped=true;
+            self->buffer_versions.insert_or_assign(resource,std::move(entry));
+        } catch(const std::bad_alloc&) {
+            if(FAILED(unmap_title_gpu_resource(renamed->gpu))) default_trap("deferred map rollback",15);
+            return E_OUTOFMEMORY;
+        }
+        retain_recorded_binding(self,resource);retain_recorded_binding(self,renamed);
+        out->pData=address;out->RowPitch=out->DepthPitch=resource->desc.standard.ByteWidth;
+        return S_OK;
+    }
     void* address = nullptr;
     const HRESULT hr = map_title_gpu_resource(resource->gpu, &address);
     if (hr == E_PENDING) {
@@ -3682,9 +4169,22 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
     out->RowPitch = out->DepthPitch = resource->desc.standard.ByteWidth; // Original 180051690, buffer span from SRD stride/count.
     return S_OK;
 }
-void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource, UINT subresource) {
-    if (!resource || resource->vtable != buffer_vtable().data() || resource->device != self->device || subresource ||
-        FAILED(unmap_title_gpu_resource(resource->gpu))) default_trap("ID3D11DeviceContextX", 16);
+void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource) {
+    // 11295 180009c80/1800104f0 take only context/resource; R8 is not a subresource.
+    HRESULT hr=E_INVALIDARG;
+    if(resource && resource->vtable==buffer_vtable().data() && resource->device==self->device) {
+        if(self->deferred) {
+            auto version=self->buffer_versions.find(resource);
+            if(version!=self->buffer_versions.end() && version->second.mapped) {
+                hr=unmap_title_gpu_resource(reinterpret_cast<Buffer*>(version->second.version.Get())->gpu);
+                if(SUCCEEDED(hr)) version->second.mapped=false;
+            }
+        } else hr=unmap_title_gpu_resource(resource->gpu);
+    }
+    if(FAILED(hr)) {
+        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: Unmap buffer caller=%p deferred=%u resource=%p failed 0x%08lX\n",_ReturnAddress(),self->deferred,resource,hr);
+        default_trap("ID3D11DeviceContextX",16);
+    }
 }
 HRESULT STDMETHODCALLTYPE context_map_modern(Context* self,GraphicsObject* resource,UINT subresource,
         D3D11_MAP mode,UINT flags,D3D11_MAPPED_SUBRESOURCE* out) {
@@ -3722,7 +4222,7 @@ HRESULT STDMETHODCALLTYPE context_map_modern(Context* self,GraphicsObject* resou
 }
 void STDMETHODCALLTYPE context_unmap_modern(Context* self,GraphicsObject* resource) {
     if (resource && resource->vtable == buffer_vtable().data()) {
-        context_unmap_buffer(self,static_cast<Buffer*>(resource),0); return;
+        context_unmap_buffer(self,static_cast<Buffer*>(resource)); return;
     }
     if (!resource || resource->vtable != texture_vtable().data()) { default_trap("ID3D11DeviceContextX",17); return; }
     auto* texture = static_cast<Texture*>(resource);
@@ -3764,6 +4264,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[96] = reinterpret_cast<const void*>(&trap_slot<kind_context,96>);
         t[51] = reinterpret_cast<const void*>(&trap_slot<kind_context,51>);
         t[50] = reinterpret_cast<const void*>(&context_clear_rtv); // Original 11295 1800151f0 -> 180035d90.
+        t[53] = reinterpret_cast<const void*>(&context_clear_depth); // 11295 180015270 stores XMM3 in the recorded command at +0x24.
         t[54] = reinterpret_cast<const void*>(&trap_slot<kind_context,54>);
         t[43] = reinterpret_cast<const void*>(&context_set_raster); // Original 11295 18000b140 -> 180032490.
         t[37] = reinterpret_cast<const void*>(&trap_slot<kind_context,37>);
@@ -3782,13 +4283,21 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[111] = reinterpret_cast<const void*>(&context_flush);
         t[114] = reinterpret_cast<const void*>(&context_finish_list); // 11295 18000ff00 -> 18004acb0.
         t[58] = reinterpret_cast<const void*>(&context_execute_list); // 11295 1800154e0.
+        t[48] = reinterpret_cast<const void*>(&context_update); // 11295 18000b240 -> 180030f70.
         t[196] = reinterpret_cast<const void*>(&context_automatic_gpu_flush);
+        t[197] = reinterpret_cast<const void*>(&context_gpu_event); // 11295 180017100.
+        t[152] = reinterpret_cast<const void*>(&context_cache_flush); // 11295 1800155b0, global range profile.
+        t[153] = reinterpret_cast<const void*>(&context_gpu_wait); // 11295 1800155f0 -> 1800071d0.
         t[209] = reinterpret_cast<const void*>(&context_fast_resources); // 11295 180019f00.
         t[25] = reinterpret_cast<const void*>(&context_resources<0,25>); // 11295 180010860 -> 18001f6a0.
         t[9] = reinterpret_cast<const void*>(&context_resources<4,9>); // 11295 180010840 -> 18001f2c0.
         t[67] = reinterpret_cast<const void*>(&context_resources<5,67>); // 11295 1800108e0 -> 180020640.
         t[23] = reinterpret_cast<const void*>(&context_constants<2,23>); // 11295 180011350, GS constant buffers.
         t[71] = reinterpret_cast<const void*>(&context_constants<3,71>); // 11295 180011ef0, CS constant buffers.
+        t[68] = reinterpret_cast<const void*>(&context_compute_uavs); // 11295 1800153c0.
+        t[69] = reinterpret_cast<const void*>(&context_compute_shader); // 11295 18000c0d0, public CS at +0x1f0.
+        t[70] = reinterpret_cast<const void*>(&context_compute_samplers); // 11295 18000c140 -> 18001dbb0.
+        t[41] = reinterpret_cast<const void*>(&context_dispatch); // 11295 18000b120 -> 180030aa0.
         t[19] = reinterpret_cast<const void*>(&legacy_context_vertices); // 11295 180010580 -> 18001ee50.
         t[20] = reinterpret_cast<const void*>(&context_indices); // 11295 1800107a0, format/buffer/offset.
         t[11] = reinterpret_cast<const void*>(&context_pixel_samplers); // 11295 180009230 -> 18001b900.
@@ -4095,7 +4604,10 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
         auto* metadata = static_cast<unsigned char*>(tiled) + context->htile.offset;
         if (!into_tiled) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
             UINT32 word; std::memcpy(&word,metadata+at,4);
-            if (word!=expanded) return DXGI_ERROR_UNSUPPORTED;
+            if (word!=expanded) {
+                if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: unsupported HTILE word=0x%08X expected expanded=0x%08X offset=%llu\n",word,expanded,UINT64(at));
+                return DXGI_ERROR_UNSUPPORTED;
+            }
         }
         // Validate every offset before touching the destination.
         for (UINT pass=0;pass<2;++pass) for (UINT plane=1;plane<(context->stencil.bytes ? 3u : 2u);++plane) {

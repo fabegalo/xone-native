@@ -1300,7 +1300,7 @@ static void interleave_samples(GpuWindow& window, void* mapped, bool into_array)
     }
 }
 
-static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
+static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool discard_contents=false) {
     try {
         if (!window.upload) {
             Microsoft::WRL::ComPtr<ID3D12Device> device;
@@ -1333,6 +1333,7 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
             if (FAILED(hr)) return hr;
             window.upload = std::move(upload); window.readback = std::move(readback);
         }
+        if(discard_contents) return S_OK; // Readback/sample staging is still required after a full clear.
         void* mapped = nullptr;
         const D3D12_RANGE no_read{0, 0};
         HRESULT hr = window.upload->Map(0, &no_read, &mapped);
@@ -1361,20 +1362,32 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical) {
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
-HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state) {
+HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents) {
     std::unique_lock lock(memory_mutex);
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
     HRESULT hr = claim_gpu_window(texture, list, state, true, backing, window);
-    if (FAILED(hr)) return hr;
+    if (FAILED(hr)) {std::fprintf(stderr,"xone-era: texture ingress claim failed 0x%08lX\n",hr);return hr;}
+    if(discard_contents) {
+        const auto& desc=window->texture.resource_desc;
+        if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels!=1 || desc.DepthOrArraySize!=1 ||
+            (state!=D3D12_RESOURCE_STATE_RENDER_TARGET && state!=D3D12_RESOURCE_STATE_DEPTH_WRITE)) {
+            release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();return E_INVALIDARG;
+        }
+    }
     window->preparing = true;
     auto* canonical = static_cast<unsigned char*>(texture.allocation) + texture.canonical_offset;
     // The ownership gate keeps this range alive and exclusive while CPU layout
     // conversion runs; original helpers may call allocation hooks themselves.
     lock.unlock();
-    hr = prepare_texture_upload(*window, canonical);
+    hr = prepare_texture_upload(*window, canonical,discard_contents);
     lock.lock();
     window->preparing = false;
-    if (FAILED(hr)) { release_physical(*window, &texture, false); window->active = nullptr; window->list.Reset(); return hr; }
+    if (FAILED(hr)) { std::fprintf(stderr,"xone-era: texture ingress layout failed 0x%08lX\n",hr);release_physical(*window, &texture, false); window->active = nullptr; window->list.Reset(); return hr; }
+    if(discard_contents) {
+        // A full clear defines all samples/aspects; do not decode an undefined preimage (e.g. HTILE).
+        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COMMON,state);
+        return S_OK;
+    }
     auto* copy_target = window->sample_array ? window->sample_array.Get() : texture.resource;
     gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     for (UINT i = 0; i < window->footprints.size(); ++i) {

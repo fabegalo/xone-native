@@ -52,7 +52,8 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
 // Return the representation to the state passed to begin before calling end.
 HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state);
 HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list);
-HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state);
+// discard_contents requires a full overwrite of every aspect of a single-subresource texture.
+HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents=false);
 HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list);
 // A texture's GPU fence is internal: complete also retiles readback bytes into
 // canonical memory. Publish guest completion only after this returns S_OK.

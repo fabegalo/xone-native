@@ -7,6 +7,7 @@
 // are reported with title-relative addresses.
 #include "xboxone_native/era_loader.h"
 #include "era_display.h"
+#include "era_audio.h"
 #include "sha256.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -49,9 +50,9 @@ template<std::size_t Index>
                   request.library.c_str(), request.name.c_str(), request.ordinal,
                   static_cast<unsigned long long>(caller - title_base));
     report(line);
-    std::snprintf(line, sizeof line, "xone-era: raw integer args 0x%llX 0x%llX 0x%llX 0x%llX\n",
+    std::snprintf(line, sizeof line, "xone-era: raw integer registers (not an ABI signature) 0x%llX 0x%llX 0x%llX 0x%llX thread=%lu\n",
                   static_cast<unsigned long long>(a), static_cast<unsigned long long>(b),
-                  static_cast<unsigned long long>(c), static_cast<unsigned long long>(d));
+                  static_cast<unsigned long long>(c), static_cast<unsigned long long>(d), GetCurrentThreadId());
     report(line);
     if (request.name == "D3D11XCreateDeviceX" && xboxone::era::same_library(request.library, "d3d11_x.dll")) {
         std::array<DWORD, 11> descriptor{}; // Extent verified at the reference ABI entry.
@@ -197,6 +198,13 @@ int wmain(int argc, wchar_t** argv) {
     if (run && (timeout == 0 || timeout > 600000)) { std::cerr << "timeout must be 1..600000 ms\n"; return 2; }
 
     const std::filesystem::path title = std::filesystem::absolute(argv[2]);
+    const HRESULT acp_binding = xboxone::era::bind_acp_module((title.parent_path().parent_path() /
+        L"EmbeddedXvd/Windows/System32/AcpHal.dll").wstring());
+    if (FAILED(acp_binding) && acp_binding != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+        acp_binding != HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) {
+        std::cerr << "ACP ABI binding failed: " << std::hex << acp_binding << '\n';
+        return 1;
+    }
     std::ifstream in(title, std::ios::binary);
     if (!in) { std::cerr << "cannot read input\n"; return 2; }
     const std::vector<std::uint8_t> file{std::istreambuf_iterator<char>(in), {}};
@@ -240,6 +248,7 @@ int wmain(int argc, wchar_t** argv) {
     xboxone::era::set_title_package_root(title.parent_path().wstring(),std::string(selected.begin(),selected.end()),title_hash.finish());
     xboxone::era::set_stop_on_missing_activation(stop_on_activation);
     xboxone::era::set_graphics_diagnostics(stop_on_missing || warp, warp);
+    xboxone::era::set_audio_diagnostics(stop_on_missing || warp);
     diagnostic_exceptions.store(stop_on_missing);
     for (const auto* runtime : {L"vccorlib110.dll", L"vccorlib140.dll"}) {
         const HMODULE module = GetModuleHandleW(runtime);

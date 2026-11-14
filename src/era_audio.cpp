@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include <initguid.h>
 #include "era_audio.h"
+#include "era_memory.h"
+#include "file_path.h"
+#include "sha256.h"
 #include "xboxone_native/era_loader.h"
 #include <audioclient.h>
 #include <xaudio2.h>
@@ -13,10 +16,165 @@
 #include <mutex>
 #include <new>
 #include <vector>
+#include <list>
+#include <filesystem>
+#include <wrl/wrappers/corewrappers.h>
 
 namespace xboxone::era {
 namespace {
 using Microsoft::WRL::ComPtr;
+constexpr ULONGLONG acp_attributes = 0xec810000ull;
+constexpr HRESULT acp_already_created = HRESULT(0x8aca0001u), acp_not_created = HRESULT(0x8aca0002u);
+using AudioAllocate = void* (WINAPI*)(SIZE_T, ULONGLONG);
+using AudioFree = void (WINAPI*)(void*, ULONGLONG);
+std::recursive_mutex acp_mutex;
+bool acp_bound = false;
+bool audio_diagnostics = false;
+UINT acp_data_bytes = 0x4000000, acp_control_bytes = 0x114000; // Original singleton 180001a2c.
+struct AudioBlock { UINT offset, span, used = 0, padding = 0; };
+struct AcpHeap {
+    void* memory = nullptr;
+    UINT bytes = 0;
+    bool pinned = false;
+    std::list<AudioBlock> blocks;
+    ~AcpHeap() {
+        if (memory) {
+            const auto release = reinterpret_cast<AudioFree>(resolve_kernelx({"kernelx.dll", "XMemFree"}));
+            release(memory, acp_attributes);
+            if (pinned) unpin_title_audio_memory(memory);
+        }
+    }
+};
+std::array<std::unique_ptr<AcpHeap>, 2> acp_heaps;
+
+template<class T> bool audio_output(T* output, const T& value) {
+    SIZE_T written = 0;
+    return output && WriteProcessMemory(GetCurrentProcess(), output, &value, sizeof value, &written) && written == sizeof value;
+}
+HRESULT make_acp_heap(UINT bytes, std::unique_ptr<AcpHeap>& result) {
+    auto heap = std::make_unique<AcpHeap>();
+    heap->bytes = bytes;
+    heap->blocks.push_back({0, bytes});
+    const auto allocate = reinterpret_cast<AudioAllocate>(resolve_kernelx({"kernelx.dll", "XMemAlloc"}));
+    heap->memory = allocate(bytes, acp_attributes);
+    if (!heap->memory) return E_OUTOFMEMORY;
+    const auto address = reinterpret_cast<ULONG_PTR>(heap->memory);
+    if (!address || address > UINT32_MAX || bytes > UINT32_MAX - address || (address & 4095)) return E_INVALIDARG;
+    const HRESULT hr = pin_title_audio_memory(heap->memory, bytes);
+    if (FAILED(hr)) return hr;
+    heap->pinned = true;
+    result = std::move(heap);
+    return S_OK;
+}
+HRESULT initialize_acp_heaps() { // Caller holds acp_mutex, including callbacks through XMem.
+    if (!acp_bound) return E_NOTIMPL;
+    if (acp_heaps[0]) return S_OK;
+    const auto finish = [&](HRESULT hr) {
+        if (audio_diagnostics) std::fprintf(stderr, "xone-era: ACP heap creation HRESULT 0x%08lX requested=0x%X/0x%X backing=%p/%p thread=%lu\n",
+            hr, acp_data_bytes, acp_control_bytes, acp_heaps[0] ? acp_heaps[0]->memory : nullptr,
+            acp_heaps[1] ? acp_heaps[1]->memory : nullptr, GetCurrentThreadId());
+        return hr;
+    };
+    try {
+        std::array<std::unique_ptr<AcpHeap>, 2> heaps;
+        HRESULT hr = make_acp_heap((acp_data_bytes + 4095u) & ~4095u, heaps[0]);
+        // The original adds 8 KiB to the control heap before page rounding.
+        if (SUCCEEDED(hr)) hr = make_acp_heap((acp_control_bytes + 8192u + 4095u) & ~4095u, heaps[1]);
+        if (FAILED(hr)) return finish(hr);
+        acp_heaps = std::move(heaps);
+        return finish(S_OK);
+    } catch (const std::bad_alloc&) { return finish(E_OUTOFMEMORY); }
+}
+HRESULT WINAPI apu_create_heap(UINT data_bytes, UINT control_bytes) {
+    std::lock_guard lock(acp_mutex);
+    if (!data_bytes) return E_INVALIDARG;
+    if (acp_heaps[0]) return acp_already_created;
+    if (data_bytes > 0x1f400000u || control_bytes > 0x1f3fe000u) return E_INVALIDARG;
+    acp_data_bytes = data_bytes;
+    if (control_bytes) acp_control_bytes = control_bytes;
+    return initialize_acp_heaps();
+}
+void free_audio_block(AcpHeap& heap, std::list<AudioBlock>::iterator block) {
+    block->used = block->padding = 0;
+    auto next = std::next(block);
+    if (next != heap.blocks.end() && !next->used) { block->span += next->span; heap.blocks.erase(next); }
+    if (block != heap.blocks.begin()) {
+        auto previous = std::prev(block);
+        if (!previous->used) { previous->span += block->span; heap.blocks.erase(block); }
+    }
+}
+HRESULT WINAPI apu_alloc(void** output, UINT* apu_output, UINT bytes, UINT alignment, UINT type) {
+    if (!audio_output(output, static_cast<void*>(nullptr)) || (apu_output && !audio_output(apu_output, UINT{0}))) return E_INVALIDARG;
+    if (!bytes || !alignment || (alignment & 3) || (alignment & (alignment - 1)) || type < 1 || type > 2) return E_INVALIDARG;
+    alignment = (std::max)(alignment, 256u);
+    if (bytes > UINT_MAX - (alignment - 1)) return E_OUTOFMEMORY;
+    bytes = (bytes + alignment - 1) & ~(alignment - 1);
+    std::lock_guard lock(acp_mutex);
+    const HRESULT initialized = initialize_acp_heaps();
+    if (FAILED(initialized)) return initialized;
+    auto& heap = *acp_heaps[type - 1];
+    auto best = heap.blocks.end();
+    UINT padding = 0;
+    const auto base = reinterpret_cast<ULONG_PTR>(heap.memory);
+    for (auto block = heap.blocks.begin(); block != heap.blocks.end(); ++block) {
+        const UINT pad = (UINT{0} - UINT(base + block->offset)) & (alignment - 1);
+        if (!block->used && pad <= block->span && bytes <= block->span - pad &&
+            (best == heap.blocks.end() || block->span < best->span)) { best = block; padding = pad; }
+    }
+    if (best == heap.blocks.end()) return E_OUTOFMEMORY;
+    const UINT span = padding + bytes;
+    try {
+        if (span < best->span) heap.blocks.insert(std::next(best), {best->offset + span, best->span - span});
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    best->span = span; best->used = bytes; best->padding = padding;
+    void* address = reinterpret_cast<void*>(base + best->offset + padding);
+    if (!audio_output(output, address) || (apu_output && !audio_output(apu_output, UINT(reinterpret_cast<ULONG_PTR>(address))))) {
+        free_audio_block(heap, best);
+        (void)audio_output(output, static_cast<void*>(nullptr));
+        return E_INVALIDARG;
+    }
+    return S_OK;
+}
+void WINAPI apu_free(void* address) {
+    std::lock_guard lock(acp_mutex);
+    if (FAILED(initialize_acp_heaps())) return;
+    for (auto& heap : acp_heaps) if (heap) {
+        for (auto block = heap->blocks.begin(); block != heap->blocks.end(); ++block)
+            if (block->used && reinterpret_cast<ULONG_PTR>(heap->memory) + block->offset + block->padding == reinterpret_cast<ULONG_PTR>(address)) {
+                free_audio_block(*heap, block); return;
+            }
+    }
+}
+UINT WINAPI apu_map_virtual_address(const void* address) {
+    std::lock_guard lock(acp_mutex);
+    if (FAILED(initialize_acp_heaps())) return 0;
+    const auto value = reinterpret_cast<ULONG_PTR>(address);
+    for (auto& heap : acp_heaps) if (heap) for (const auto& block : heap->blocks) if (block.used) {
+        const auto start = reinterpret_cast<ULONG_PTR>(heap->memory) + block.offset + block.padding;
+        if (value >= start && value - start < block.used) return UINT(value);
+    }
+    return 0;
+}
+void* WINAPI apu_map_apu_address(UINT address) {
+    auto* pointer = reinterpret_cast<void*>(ULONG_PTR(address));
+    return apu_map_virtual_address(pointer) ? pointer : nullptr;
+}
+bool WINAPI apu_is_virtual_address_valid(const void* address, UINT alignment) {
+    const UINT mapped = apu_map_virtual_address(address);
+    if (!alignment) alignment = 1;
+    return mapped && !(mapped & (alignment - 1));
+}
+HRESULT WINAPI apu_heap_get_state(std::array<UINT, 5>* output, UINT type) {
+    std::lock_guard lock(acp_mutex);
+    if (!output || type < 1 || type > 2) return E_INVALIDARG;
+    if (!acp_heaps[0]) return acp_not_created;
+    std::array<UINT, 5> state{}; // free, used, alignment waste, largest free block, allocation count.
+    for (const auto& block : acp_heaps[type - 1]->blocks) {
+        if (block.used) { state[1] += block.used; state[2] += block.span - block.used; ++state[4]; }
+        else { state[0] += block.span; state[3] = (std::max)(state[3], block.span); }
+    }
+    return audio_output(output, state) ? S_OK : E_INVALIDARG;
+}
 HMODULE host_xaudio2() {
     static const HMODULE module = [] {
         wchar_t system[MAX_PATH]{};
@@ -314,6 +472,50 @@ public:
     }
 };
 } // namespace
+
+HRESULT bind_acp_module(const std::wstring& original) {
+    std::lock_guard lock(acp_mutex);
+    if (acp_heaps[0]) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    acp_bound = false;
+    try {
+        const auto path = detail::file_path(std::filesystem::path(original));
+        Microsoft::WRL::Wrappers::FileHandle file(CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (!file.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+        LARGE_INTEGER bytes{};
+        if (!GetFileSizeEx(file.Get(), &bytes)) return HRESULT_FROM_WIN32(GetLastError());
+        if (bytes.QuadPart != 21504) return HRESULT_FROM_WIN32(ERROR_CRC);
+        std::array<std::uint8_t, 21504> data{}; DWORD read = 0;
+        if (!ReadFile(file.Get(), data.data(), DWORD(data.size()), &read, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
+        if (read != data.size()) return HRESULT_FROM_WIN32(ERROR_HANDLE_EOF);
+        detail::Sha256 hash; hash.update(data);
+        if (hash.finish() != "34e6beaf67f2900145ecfb9afb6ed6b48747eb63aafc2edb5974c38c480f99a1") return HRESULT_FROM_WIN32(ERROR_CRC);
+        acp_bound = true;
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+void reset_acp_heaps() {
+    std::lock_guard lock(acp_mutex);
+    acp_bound = false;
+    for (auto& heap : acp_heaps) heap.reset();
+    acp_data_bytes = 0x4000000; acp_control_bytes = 0x114000;
+}
+void set_audio_diagnostics(bool enabled) {
+    std::lock_guard lock(acp_mutex);
+    audio_diagnostics = enabled;
+}
+void* resolve_acp(const ImportRequest& request) {
+    std::lock_guard lock(acp_mutex);
+    if (!acp_bound || !same_library(request.library, "AcpHal.dll") || request.name.empty()) return nullptr;
+    if (request.name == "ApuCreateHeap") return reinterpret_cast<void*>(&apu_create_heap);
+    if (request.name == "ApuAlloc") return reinterpret_cast<void*>(&apu_alloc);
+    if (request.name == "ApuFree") return reinterpret_cast<void*>(&apu_free);
+    if (request.name == "ApuMapVirtualAddress") return reinterpret_cast<void*>(&apu_map_virtual_address);
+    if (request.name == "ApuMapApuAddress") return reinterpret_cast<void*>(&apu_map_apu_address);
+    if (request.name == "ApuIsVirtualAddressValid") return reinterpret_cast<void*>(&apu_is_virtual_address_valid);
+    if (request.name == "ApuHeapGetState") return reinterpret_cast<void*>(&apu_heap_get_state);
+    return nullptr; // SHAPE/DSP has no translated executor yet.
+}
 
 HRESULT wrap_audio_enumerator(IMMDeviceEnumerator* host, REFIID iid, void** out) {
     if (!out) return E_POINTER;

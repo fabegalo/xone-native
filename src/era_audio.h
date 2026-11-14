@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #pragma once
 #include <mmdeviceapi.h>
+#include <string>
 
 namespace xboxone::era {
+struct ImportRequest;
+// Read-only identity binding: only the audited ACP memory ABI is exposed.
+HRESULT bind_acp_module(const std::wstring& path);
+void* resolve_acp(const ImportRequest& request);
+void reset_acp_heaps(); // Before unloading title allocation callbacks.
+void set_audio_diagnostics(bool enabled);
 // Observed Xbox extension: desktop enumerator slots 0-7, then channel counts
 // and channel-count callback registration/removal. Callback slot 3 receives both counts.
 struct __declspec(uuid("8B557ADC-555E-47A0-B223-43477E481DAD")) TitleAudioEnumerator : IMMDeviceEnumerator {

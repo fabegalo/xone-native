@@ -6,6 +6,9 @@
 #include <array>
 
 namespace xboxone::era {
+// ACP heaps retain registered CPU backing until their session ends.
+HRESULT pin_title_audio_memory(void* address, std::size_t bytes);
+void unpin_title_audio_memory(void* address);
 struct TitleTextureLayout {
     std::size_t bytes = 0, alignment = 0;
     UINT tile_mode = UINT_MAX;

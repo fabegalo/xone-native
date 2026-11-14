@@ -2469,8 +2469,8 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary
         const auto nonblack=std::count_if(pixels.begin(),pixels.end(),[&](UINT value){return (value&mask)!=0;});
         detail::Sha256 hash;
         hash.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()),pixels.size()*4));
-        std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u nonblack %llu/%llu SHA256 %s\n",boundary,desc.Width,desc.Height,desc.Format,
-            static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str());
+        std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u nonblack %llu/%llu SHA256 %s resource=%p backing=%p thread=%lu\n",boundary,desc.Width,desc.Height,desc.Format,
+            static_cast<unsigned long long>(nonblack),static_cast<unsigned long long>(pixels.size()),hash.finish().c_str(),source,source->canonical,GetCurrentThreadId());
     } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
 }
 HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input,bool legacy,UINT64 cookie=0) {
@@ -3347,6 +3347,10 @@ void STDMETHODCALLTYPE context_draw_indexed(Context* self,UINT64 packed,INT base
     if(FAILED(hr)) {std::fprintf(stderr,"xone-era: indexed draw failed 0x%08lX\n",hr);default_trap("indexed draw submission",14);}
 }
 void STDMETHODCALLTYPE legacy_context_draw(Context* self,UINT count,UINT first) {
+    if (graphics_diagnostics.load() && self->completed_draws<8)
+        std::fprintf(stderr,"xone-era: draw dispatch caller=%p context=%p target=%p PS0=%p thread=%lu\n",_ReturnAddress(),self,
+            self->render_targets[0] ? self->render_targets[0]->resource : nullptr,
+            self->shader_resources[4][0] ? self->shader_resources[4][0]->resource : nullptr,GetCurrentThreadId());
     HRESULT hr=E_OUTOFMEMORY;
     try {hr=execute_draw(self,count,first,0,false);} catch(const std::bad_alloc&) {}
     if(FAILED(hr)) {

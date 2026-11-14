@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include "era_tls_slot.h"
+#include "era_audio.h"
 
 #include <cstring>
 #include <algorithm>
@@ -68,6 +69,7 @@ void Image::release() {
     if (attached_ && entry_)
         reinterpret_cast<BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID)>(entry_)(reinterpret_cast<HINSTANCE>(base_), DLL_PROCESS_DETACH, nullptr);
     attached_ = false;
+    if (base_ && kind_ == ImageKind::title) reset_acp_heaps();
     if (tls_unbind_) reinterpret_cast<EraTlsUnbind>(tls_unbind_)();
     tls_unbind_ = nullptr; tls_callbacks_ = nullptr;
     if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));

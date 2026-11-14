@@ -208,7 +208,8 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
     const auto page = (attributes >> 14) & 3;
     const auto alignment = (attributes >> 24) & 31;
     const auto type = (attributes >> 29) & 15;
-    if (!size || (attributes >> 33) || page > 1 || type > 6) {
+    const bool audio = attributes == 0xec810000ull; // AcpHal 11295 XMem layout.
+    if (!size || (attributes >> 33) || page > 1 || (type > 6 && !audio)) {
         SetLastError(ERROR_NOT_SUPPORTED); return nullptr;
     }
     constexpr SIZE_T granularity = 65536;
@@ -216,7 +217,12 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
     const SIZE_T bytes = (size + granularity - 1) & ~(granularity - 1);
     MEM_ADDRESS_REQUIREMENTS address{};
     address.Alignment = SIZE_T{1} << (alignment < 16 ? 16 : alignment);
-    if (type) {
+    if (audio) {
+        // Software ACP uses real 32-bit CPU VAs as its address space. These
+        // are not fabricated physical ACP addresses or a second memory pool.
+        address.LowestStartingAddress = reinterpret_cast<void*>(65536);
+        address.HighestEndingAddress = reinterpret_cast<void*>(ULONG_PTR(UINT32_MAX));
+    } else if (type) {
         // ERA graphics virtual addresses occupy the low 40-bit window above 4 GiB.
         address.LowestStartingAddress = reinterpret_cast<void*>(0x100000000ull);
         address.HighestEndingAddress = reinterpret_cast<void*>(0xffffffffffull);
@@ -232,7 +238,7 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
     if (!memory_capacity(bytes)) return nullptr;
     void* result = allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1);
     if (!result) return nullptr;
-    TitleRegion region{bytes, type != 0};
+    TitleRegion region{bytes, type != 0 && !audio};
     region.physical_bytes = bytes;
     region.xmem = true;
     region.attributes = attributes;
@@ -1558,6 +1564,29 @@ bool same_library(std::string_view a, std::string_view b) {
     return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](char x, char y) {
         return (x >= 'A' && x <= 'Z' ? x + 32 : x) == (y >= 'A' && y <= 'Z' ? y + 32 : y);
     });
+}
+
+HRESULT pin_title_audio_memory(void* address, std::size_t bytes) {
+    std::lock_guard lock(memory_mutex);
+    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    auto found = title_regions.upper_bound(start);
+    if (found == title_regions.begin()) return E_INVALIDARG;
+    --found;
+    auto& region = found->second;
+    const auto offset = start - found->first;
+    if (!bytes || !region.xmem || region.graphics || region.retiring ||
+        offset > region.size || bytes > region.size - offset) return E_INVALIDARG;
+    if (region.gpu_pins || !region.windows.empty()) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    ++region.gpu_pins; // Shared backing lifetime pin; no GPU resource is created.
+    return S_OK;
+}
+void unpin_title_audio_memory(void* address) {
+    std::lock_guard lock(memory_mutex);
+    auto found = title_regions.upper_bound(reinterpret_cast<std::uintptr_t>(address));
+    if (found == title_regions.begin()) return;
+    --found;
+    if (reinterpret_cast<std::uintptr_t>(address) - found->first >= found->second.size || !found->second.gpu_pins) return;
+    if (!--found->second.gpu_pins && found->second.retiring) (void)destroy_region(found);
 }
 
 void set_title_module(void* base) { title_module.store(static_cast<HMODULE>(base)); }

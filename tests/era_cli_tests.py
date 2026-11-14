@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix="xone-era-cli-") as scratch:
         assert result.returncode == 125, result
         assert "resolved 0, unresolved 2" in result.stdout, result
         assert "unimplemented missing.dll!Sleep" in result.stderr and "; stopped" in result.stderr, result
+        assert "raw integer registers (not an ABI signature)" in result.stderr and "thread=" in result.stderr, result
         assert "title entry returned" not in result.stderr, result
 result = subprocess.run([loader_tests, "--missing-activation"], capture_output=True, text=True, timeout=5)
 assert result.returncode == 125, result

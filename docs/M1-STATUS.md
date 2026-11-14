@@ -2,6 +2,27 @@
 
 Data: **2026-11-04**. Estágio máximo demonstrado: um **componente sintético próprio** foi criado como processo Windows AMD64, executou código de memória/threads/imports e terminou com código 0. **Nenhum componente original do SystemOS foi carregado ou inicializado; zero frames autênticos.**
 
+## 2026-11-14 — SystemOS: Ghidra e volumes históricos do CDN
+
+Escopo exclusivo: obter componentes originais SystemOS/XboxUI para o `xboxone-systemos` existente. DLLs encontradas em volumes embarcados de jogos não comprovam esse insumo; nenhuma mudança ERA faz parte deste incremento.
+
+`tools/InspectXvdHeader.java`, Ghidra **12.1.4**, importa somente prefixos de **0x3000 bytes**, com `BinaryLoader`, linguagem **DATA:LE:64:default** e `-noanalysis`. Define os campos como dados, calcula offsets candidatos segundo o formato público [xvdtool](https://github.com/emoose/xvdtool/tree/master/LibXboxOne/XVD) e não desassembla payloads. Dez cabeçalhos passaram (seis locais, quatro remotos); controles de magic inválida e prefixo truncado foram recusados, sem marcador de conclusão. Os autocontroles verificam limites de páginas e o segundo nível da árvore de hashes.
+
+Nos seis volumes locais `system.xvd`/`systemaux.xvd` de OSU1/2/3: tipo dinâmico, keyslot **0**, sem embedded XVD nem mutable data. SHA-256 do bloco raiz em `0x3000` confere com o campo do cabeçalho em todos. Isso verifica apenas essa relação, **não assinatura Microsoft, árvore completa ou filesystem**. Sondagens de 4 KiB nos offsets de user-data (quando presente), BAT e dados não reconheceram PE/NTFS/GPT/XVD no início; não foram uma varredura integral nem teste de descriptografia.
+
+| Volume local | User-data | BAT | Dados do drive |
+| --- | --- | --- | --- |
+| OSU1 system | `0x95c000` | `0x3455000` | `0x3458000` |
+| OSU1 systemaux | ausente | `0xc24000` | `0xc28000` |
+| OSU2/3 system | `0xc39000` | `0x1ac1000` | `0x1ac5000` |
+| OSU2/3 systemaux | ausente | `0x11c5000` | `0x11ca000` |
+
+Alternativa sem console verificada: quatro URLs do [catálogo de CDN do Xbox One Research](https://xboxoneresearch.github.io/wiki/xbox-live/update-cdn/) responderam **HTTP 206** a `Range: bytes=0-12287`: `SystemExt.green.xvd`/`systemaux.green.xvd` de **10.0.10586.1194** e `system.xvd`/`systemaux.xvd` de **10.0.14393.2152**. Somente **48 KiB** recebidos; todos indicam flags **0x9**, keyslot **0**, tipos 2/20. As versões de pacote brutas são respectivamente `0x800a0000295a04aa` e `0x800a000038390868`, mantidas separadas. `.green` não comprova criptografia desabilitada. HTTPS falhou por certificado incompatível com o hostname; usaram-se os URLs HTTP publicados, sem desabilitar TLS. Prefixos remotos não autenticados, sem hashes integrais nem download das imagens.
+
+O [relato original da Alpha 8422](https://www.betaarchive.com/forum/viewtopic.php?t=37992) identifica a distribuição como vazamento do XDK, não como recovery pública autorizada; nenhum SDK foi obtido/usado. O canal de [recovery oficial de desenvolvimento](https://learn.microsoft.com/en-us/gaming/gdk/docs/gdk-dev/console-dev/dev-kits/settings/dev-kit-os) exige acesso ao programa NDA. Nenhum conjunto SystemOS legível e autorizado foi obtido dessas alternativas.
+
+**Bloqueio preciso:** os volumes SystemOS são XVDs não-XVC (`XvcDataLength=0`). O campo `KeyMaterial` de 32 bytes em `0x34c` contém a CIK protegida, não uma chave de dados utilizável. Falta material autorizado que permita abrir essa CIK por volume (ODK correspondente ao slot 0), ou um conjunto já legível com EXE/DLLs, manifestos e recursos da mesma revisão. Corrigir offsets, montar NTFS ou oferecer uma chave CIK de outro pacote não resolve esse passo. A primeira dependência de execução SystemOS permanece **não identificável sem código legível**; não foi inventado um serviço HLE para substituí-la. Nenhuma execução SystemOS ou imagem original foi demonstrada. Próxima entrada útil: recovery de desenvolvimento obtida por acesso autorizado e comprovadamente legível, ou conjunto original já extraído com procedência/revisão verificáveis.
+
 ## 2026-11-14 — busca além dos OSUs e validação de assets AppModel
 
 Pesquisa pública de XboxUI/shell/Guide, recoveries de desenvolvimento e dumps já extraídos, partindo de `35dec31`: **nenhum conjunto executável Xbox One com conteúdo, revisão e procedência verificáveis foi obtido**. Isso limita esta busca, não prova inexistência na internet. Não houve download de firmware/SDK, montagem, deployment ou execução de scripts externos.

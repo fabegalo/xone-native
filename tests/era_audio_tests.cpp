@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <filesystem>
+#include <thread>
 using Microsoft::WRL::ComPtr;
 using namespace xboxone::era;
 namespace {
@@ -53,8 +54,8 @@ int test_acp(const std::wstring& original) {
     const auto state = reinterpret_cast<State>(resolve_acp({"AcpHal.dll", "ApuHeapGetState"}));
     check(create && allocate && release && map && reverse && valid && state, "audited ACP memory exports resolve");
     if (!create || !allocate || !release || !map || !reverse || !valid || !state) return 1;
-    check(!resolve_acp({"AcpHal.dll", "", 5}) && !resolve_acp({"AcpHal.dll", "AcpHalAllocateShapeContexts"}) &&
-          !resolve_acp({"other.dll", "ApuAlloc"}), "ordinals, foreign modules and untranslated DSP remain explicit");
+    check(!resolve_acp({"AcpHal.dll", "", 5}) && !resolve_acp({"AcpHal.dll", "UnknownExport"}) &&
+          !resolve_acp({"other.dll", "ApuAlloc"}), "ordinals, foreign modules and unknown exports remain explicit");
     std::array<UINT, 5> snapshot{};
     check(state(&snapshot, 1) == HRESULT(0x8aca0002u), "heap query before creation reports no real heap");
     check(create(0, 1) == E_INVALIDARG && create(UINT_MAX, 1) == E_INVALIDARG, "invalid heap requests fail");
@@ -130,6 +131,128 @@ int test_acp(const std::wstring& original) {
           "allocation before explicit creation uses the audited default sizes and real title budget");
     reset_acp_heaps();
     check(used() == initial && !resolve_acp({"AcpHal.dll", "ApuAlloc"}), "session teardown clears backing, configuration and ABI binding");
+    struct Contexts { std::array<UINT, 6> counts{}; std::array<void*, 6> cpu{}; std::array<UINT, 6> apu{}; };
+    static_assert(sizeof(Contexts) == 96 && offsetof(Contexts, cpu) == 24 && offsetof(Contexts, apu) == 72);
+    check(bind_acp_module(original) == S_OK, "SHAPE uses the same verified session");
+    const auto shape = reinterpret_cast<HRESULT(WINAPI*)(Contexts*)>(resolve_acp({"AcpHal.dll", "AcpHalAllocateShapeContexts"}));
+    const auto shape_release = reinterpret_cast<HRESULT(WINAPI*)()>(resolve_acp({"AcpHal.dll", "AcpHalReleaseShapeContexts"}));
+    check(shape && shape_release, "audited SHAPE allocation and release exports resolve");
+    if (!shape || !shape_release) return 1;
+    check(create(65536, 4096) == S_OK && shape_release() == HRESULT(0x8ac80002u), "release before allocation reports missing contexts");
+    check(shape(nullptr) == E_INVALIDARG && shape(reinterpret_cast<Contexts*>(1)) == E_INVALIDARG, "invalid SHAPE structure pointers fail");
+    for (unsigned index = 0; index < 6; ++index) {
+        Contexts bad{}; bad.counts[index] = index == 4 ? 513 : index == 5 ? 3585 : 4097;
+        check(shape(&bad) == E_INVALIDARG, "each SHAPE count has its original upper bound");
+    }
+    Contexts mismatch{}; mismatch.counts = {2, 0, 0, 0, 0, 1};
+    check(shape(&mismatch) == E_INVALIDARG, "SRC count must match XMA plus PCM");
+    Contexts exhausted{}; exhausted.counts = {1, 100, 0, 0, 0, 1};
+    check(shape(&exhausted) == E_OUTOFMEMORY && state(&snapshot, 2) == S_OK && snapshot[4] == 0 && !exhausted.cpu[0],
+          "partial SHAPE allocation rolls back the control heap without publishing outputs");
+    reset_acp_heaps();
+    check(bind_acp_module(original) == S_OK && create(65536, 65536) == S_OK, "SHAPE session can be recreated");
+    Contexts contexts{}; contexts.counts = {3, 2, 4, 5, 1, 2};
+    struct Guarded { UINT64 before = 0x12345678; Contexts value; UINT64 after = 0xabcdef; } guarded{0x12345678, contexts, 0xabcdef};
+    check(shape(&guarded.value) == S_OK && guarded.before == 0x12345678 && guarded.after == 0xabcdef && guarded.value.counts == contexts.counts,
+          "96-byte SHAPE ABI preserves counts and adjacent guards");
+    contexts = guarded.value;
+    for (unsigned i = 0; i < 5; ++i) {
+        check(contexts.cpu[i] && map(contexts.cpu[i]) == contexts.apu[i] && !(contexts.apu[i] & 255), "context arrays use live aligned CPU/APU control allocations");
+        if (contexts.cpu[i]) std::memset(contexts.cpu[i], 0x31 + i, 32);
+    }
+    check(contexts.cpu[5] == static_cast<char*>(contexts.cpu[4]) + 64 && contexts.apu[5] == contexts.apu[4] + 1 &&
+          *static_cast<unsigned char*>(reverse(contexts.apu[4])) == 0x35, "shared XMA/PCM CPU layout and original encoded APU field are preserved");
+    check(state(&snapshot, 2) == S_OK && snapshot[4] == 5 && snapshot[1] == 1536 && state(&snapshot, 1) == S_OK && snapshot[4] == 0,
+          "five actual context allocations charge only the existing control heap");
+    check(shape(&guarded.value) == HRESULT(0x8ac80001u) && !map(contexts.cpu[0]) && shape_release() == HRESULT(0x8ac80002u),
+          "duplicate allocation follows original error cleanup and invalidates old maps");
+    Contexts empty{};
+    check(shape(&empty) == S_OK && shape_release() == S_OK, "empty context set registers and releases without allocations");
+    Contexts pcm{}; pcm.counts = {1, 0, 0, 0, 0, 1};
+    check(shape(&pcm) == S_OK && !pcm.cpu[4] && pcm.cpu[5] && map(pcm.cpu[5]) == pcm.apu[5], "PCM-only contexts own their shared backing");
+    std::atomic<unsigned> released{0}, missing{0};
+    std::array<std::thread, 4> workers;
+    for (auto& worker : workers) worker = std::thread([&] {
+        const auto hr = shape_release();
+        if (hr == S_OK) ++released; else if (hr == HRESULT(0x8ac80002u)) ++missing;
+    });
+    for (auto& worker : workers) worker.join();
+    check(released == 1 && missing == 3 && !map(pcm.cpu[5]) && state(&snapshot, 2) == S_OK && snapshot[4] == 0,
+          "concurrent release retires each allocation exactly once");
+    auto* readonly = static_cast<Contexts*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (readonly) {
+        *readonly = pcm; DWORD protection = 0;
+        check(VirtualProtect(readonly, 4096, PAGE_READONLY, &protection) && shape(readonly) == E_INVALIDARG &&
+              state(&snapshot, 2) == S_OK && snapshot[4] == 0, "read-only output rolls back all allocations");
+        VirtualFree(readonly, 0, MEM_RELEASE);
+    } else check(false, "read-only ABI fixture allocation");
+    check(shape(&pcm) == S_OK, "contexts can be reallocated after output failure");
+    reset_acp_heaps();
+    check(used() == initial && !map(pcm.cpu[5]) && !resolve_acp({"AcpHal.dll", "AcpHalAllocateShapeContexts"}),
+          "session teardown releases live contexts before backings and clears binding");
+    check(bind_acp_module(original) == S_OK && create(65536, 0) == S_OK, "SHAPE maximum-count fixture uses original control default");
+    Contexts maximum{}; maximum.counts = {4096, 4096, 4096, 4096, 512, 3584};
+    check(shape(&maximum) == S_OK && state(&snapshot, 2) == S_OK && snapshot[4] == 5 && snapshot[1] == 1130496,
+          "all inclusive original count limits fit the real default control heap");
+    check(shape_release() == S_OK && state(&snapshot, 2) == S_OK && snapshot[4] == 0 && snapshot[0] == 0x116000,
+          "maximum context release coalesces the shared allocation and all four arrays");
+    reset_acp_heaps();
+    check(used() == initial, "maximum context fixture retains no title memory");
+    check(bind_acp_module(original) == S_OK && create(65536, 65536) == S_OK, "ACP client fixture uses existing heaps");
+    const auto client_create = reinterpret_cast<HRESULT(WINAPI*)(void**)>(resolve_acp({"AcpHal.dll", "AcpHalCreate"}));
+    const auto affinity = reinterpret_cast<DWORD_PTR(WINAPI*)(DWORD_PTR)>(resolve_title_import({"MMDevAPI.dll", "SetWasapiThreadAffinityMask"}));
+    if (affinity) {
+        DWORD_PTR process = 0, system = 0;
+        check(GetProcessAffinityMask(GetCurrentProcess(), &process, &system), "host process affinity is observable");
+        check(affinity(process) == 0 && GetLastError() == ERROR_NOT_SUPPORTED,
+              "unavailable WASAPI worker affinity returns a real failure, not a successful configuration");
+        if (~process) check(affinity(~process) == 0 && GetLastError() == ERROR_INVALID_PARAMETER, "foreign CPU mask retains the original parameter error");
+    } else check(false, "WASAPI affinity ABI resolves");
+    if (!client_create) { check(false, "ACP client ABI resolves"); return 1; }
+    void* client = nullptr;
+    check(client_create && client_create(nullptr) == E_INVALIDARG && client_create(reinterpret_cast<void**>(1)) == E_INVALIDARG &&
+          client_create(&client) == S_OK && client, "ACP client creation validates outputs and returns a real owned instance");
+    if (client) {
+        auto** table = *static_cast<void***>(client);
+        const auto connect = reinterpret_cast<HRESULT(WINAPI*)(void*, UINT, UINT)>(table[0]);
+        const auto disconnect = reinterpret_cast<HRESULT(WINAPI*)(void*)>(table[1]);
+        const auto submit = reinterpret_cast<HRESULT(WINAPI*)(void*, UINT, UINT64, UINT, const void*, UINT)>(table[2]);
+        const auto message = reinterpret_cast<bool(WINAPI*)(void*, void*)>(table[3]);
+        const auto messages = reinterpret_cast<UINT(WINAPI*)(void*)>(table[4]);
+        UINT mask = 0xfe;
+        check(submit(client, 2, 0, UINT_MAX, &mask, 0) == HRESULT(0x8000000eu) && disconnect(client) == HRESULT(0x8ac8000au),
+              "disconnected client preserves original command and disconnect errors");
+        check(connect(client, 0, 1) == E_INVALIDARG && connect(client, UINT_MAX, 1) == E_INVALIDARG &&
+              connect(client, 1, UINT_MAX) == E_INVALIDARG, "queue counts validate zero and byte-size overflow");
+        check(connect(client, 1024, 1024) == E_OUTOFMEMORY && state(&snapshot, 1) == S_OK && snapshot[4] == 0,
+              "queue exhaustion publishes no partial connection or allocation");
+        check(shape(&empty) == S_OK && connect(client, 4, 4) == S_OK && connect(client, 4, 4) == HRESULT(0x8ac80009u) &&
+              shape_release() == HRESULT(0x8ac80010u), "connected client owns its queues and prevents live context release");
+        check(state(&snapshot, 1) == S_OK && snapshot[4] == 3 && snapshot[1] == 2304, "client queues reuse the charged data heap");
+        check(submit(client, 2, 0, UINT_MAX, &mask, 0) == S_OK && submit(client, 3, 0, UINT_MAX, &mask, 0) == S_OK,
+              "register and unregister execute the client subscription changes");
+        std::array<UINT, 6> received{}; received.fill(0x12345678);
+        check(!message(client, &received) && received[0] == 0x12345678 && messages(client) == 0,
+              "subscriptions do not fabricate audio frames, completed commands or overwrite an empty read");
+        check(submit(client, 1, 0, UINT_MAX, &mask, 0) == E_NOTIMPL && submit(client, 4, 0, UINT_MAX, nullptr, 0) == E_NOTIMPL &&
+              submit(client, 2, 0, 123, &mask, 0) == E_NOTIMPL && submit(client, 2, 0, UINT_MAX, &mask, 1) == E_NOTIMPL,
+              "untranslated DSP, future-frame work and notifications cannot complete successfully");
+        check(submit(client, 2, 0, UINT_MAX, reinterpret_cast<void*>(1), 0) == E_INVALIDARG &&
+              submit(client, 2, 0, UINT_MAX, nullptr, 0) == E_INVALIDARG && submit(client, 28, 0, UINT_MAX, &mask, 0) == E_INVALIDARG,
+              "command bounds and parameter pointers preserve errors");
+        check(disconnect(client) == S_OK && connect(client, 4, 4) == S_OK && state(&snapshot, 1) == S_OK && snapshot[4] == 3 &&
+              disconnect(client) == S_OK && shape_release() == S_OK, "reconnect reuses the same queues and disconnect relinquishes context ownership");
+        reinterpret_cast<void(WINAPI*)(void*)>(table[5])(client);
+        check(state(&snapshot, 1) == S_OK && snapshot[4] == 0, "client release retires all three queues");
+    }
+    std::array<void*, 5> clients{};
+    for (auto& item : clients) check(client_create(&item) == S_OK && item, "independent ACP client instance");
+    for (unsigned i = 0; i < clients.size(); ++i) if (clients[i]) {
+        const auto connect = reinterpret_cast<HRESULT(WINAPI*)(void*, UINT, UINT)>((*static_cast<void***>(clients[i]))[0]);
+        check(connect(clients[i], 1, 0) == (i < 4 ? S_OK : HRESULT(0x8000ffffu)), "four connected ACP slots enforce the original bound");
+    }
+    reset_acp_heaps();
+    check(used() == initial, "session teardown retires live clients and their queues before freeing heaps");
     std::cout << "ACP memory ABI: " << (failures ? "failed" : "passed") << '\n';
     return failures ? 1 : 0;
 }

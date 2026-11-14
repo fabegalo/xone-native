@@ -17,6 +17,7 @@
 #include <new>
 #include <vector>
 #include <list>
+#include <intrin.h>
 #include <filesystem>
 #include <wrl/wrappers/corewrappers.h>
 
@@ -174,6 +175,192 @@ HRESULT WINAPI apu_heap_get_state(std::array<UINT, 5>* output, UINT type) {
         else { state[0] += block.span; state[3] = (std::max)(state[3], block.span); }
     }
     return audio_output(output, state) ? S_OK : E_INVALIDARG;
+}
+// AcpHal 11295: 1800026f8/18000215c, six counts followed by CPU and APU arrays.
+struct ShapeContexts {
+    std::array<UINT, 6> counts{};
+    std::array<void*, 6> cpu{};
+    std::array<UINT, 6> apu{};
+};
+static_assert(sizeof(ShapeContexts) == 96 && offsetof(ShapeContexts, cpu) == 24 && offsetof(ShapeContexts, apu) == 72);
+std::unique_ptr<ShapeContexts> shape_contexts;
+UINT connected_acp_clients = 0;
+void free_shape_contexts(ShapeContexts& contexts) {
+    for (unsigned i = 0; i < 4; ++i) if (contexts.cpu[i]) apu_free(contexts.cpu[i]);
+    // XMA (64 bytes) and PCM (32 bytes) share a single allocation, including PCM-only.
+    if (contexts.cpu[4] || contexts.cpu[5]) apu_free(contexts.cpu[4] ? contexts.cpu[4] : contexts.cpu[5]);
+}
+HRESULT WINAPI allocate_shape_contexts(ShapeContexts* output) {
+    std::lock_guard lock(acp_mutex);
+    HRESULT hr = initialize_acp_heaps();
+    if (FAILED(hr)) return hr;
+    if (shape_contexts) {
+        // Original error path 1800021ac also releases a previously allocated set.
+        free_shape_contexts(*shape_contexts); shape_contexts.reset();
+        return HRESULT(0x8ac80001u);
+    }
+    ShapeContexts input{};
+    SIZE_T read = 0;
+    if (!output || !ReadProcessMemory(GetCurrentProcess(), output, &input, sizeof input, &read) || read != sizeof input)
+        return E_INVALIDARG;
+    const auto& counts = input.counts;
+    if (counts[0] > 4096 || counts[1] > 4096 || counts[2] > 4096 || counts[3] > 4096 ||
+        counts[4] > 512 || counts[5] > 3584 || ((counts[0] || counts[5]) && counts[0] != counts[4] + counts[5]))
+        return E_INVALIDARG;
+    try {
+        auto contexts = std::make_unique<ShapeContexts>();
+        contexts->counts = counts;
+        constexpr UINT strides[]{32, 160, 32, 16};
+        constexpr UINT alignments[]{32, 16, 32, 16};
+        for (unsigned i = 0; i < 4 && SUCCEEDED(hr); ++i) if (counts[i])
+            hr = apu_alloc(&contexts->cpu[i], &contexts->apu[i], counts[i] * strides[i], alignments[i], 2);
+        if (SUCCEEDED(hr) && (counts[4] || counts[5])) {
+            void* shared = nullptr; UINT address = 0;
+            hr = apu_alloc(&shared, &address, (counts[4] * 2 + counts[5]) * 32, 64, 2);
+            if (SUCCEEDED(hr)) {
+                if (counts[4]) { contexts->cpu[4] = shared; contexts->apu[4] = address; }
+                if (counts[5]) {
+                    contexts->cpu[5] = static_cast<char*>(shared) + counts[4] * 64;
+                    // Original 18000215c publishes this encoded value, not the CPU byte displacement.
+                    contexts->apu[5] = address + counts[4];
+                }
+            }
+        }
+        if (SUCCEEDED(hr) && !audio_output(output, *contexts)) hr = E_INVALIDARG;
+        if (FAILED(hr)) { free_shape_contexts(*contexts); return hr; }
+        // Execute REGISTER_CONTEXT_ARRAYS (0x80000002) by retaining the actual shared arrays.
+        // No flowgraph is started and no DSP completion or notification is manufactured.
+        shape_contexts = std::move(contexts);
+        if (audio_diagnostics) std::fprintf(stderr, "xone-era: ACP SHAPE contexts registered counts=%u/%u/%u/%u/%u/%u control=%p thread=%lu\n",
+            counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], acp_heaps[1]->memory, GetCurrentThreadId());
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+}
+HRESULT WINAPI release_shape_contexts() {
+    std::lock_guard lock(acp_mutex);
+    const HRESULT hr = initialize_acp_heaps();
+    if (FAILED(hr)) return hr;
+    if (!shape_contexts) return HRESULT(0x8ac80002u);
+    if (connected_acp_clients) return HRESULT(0x8ac80010u);
+    free_shape_contexts(*shape_contexts); shape_contexts.reset();
+    return S_OK;
+}
+struct AcpClient {
+    const void* const* vtable = nullptr;
+    std::array<void*, 3> queues{}; // Command packets, pending list, message packets.
+    UINT command_count = 0, message_count = 0, message_mask = 0;
+    UINT message_read = 0;
+    bool connected = false;
+    ~AcpClient() { for (void* queue : queues) if (queue) apu_free(queue); }
+};
+std::list<std::unique_ptr<AcpClient>> acp_clients;
+HRESULT WINAPI acp_disconnect(AcpClient* self) {
+    std::lock_guard lock(acp_mutex);
+    if (!self->connected) return HRESULT(0x8ac8000au);
+    self->connected = false; self->message_mask = 0; --connected_acp_clients;
+    return S_OK;
+}
+HRESULT WINAPI acp_connect(AcpClient* self, UINT commands, UINT messages) {
+    std::lock_guard lock(acp_mutex);
+    if (self->connected) return HRESULT(0x8ac80009u);
+    if (!commands || commands > UINT_MAX / 256 || messages > UINT_MAX / 256) return E_INVALIDARG;
+    if (connected_acp_clients == 4) return HRESULT(0x8000ffffu);
+    const HRESULT initialized = initialize_acp_heaps();
+    if (FAILED(initialized)) return initialized;
+    // Original 1800010ec: three XMem-backed allocations, all in the data heap.
+    AcpClient pending;
+    HRESULT hr = S_OK;
+    if (self->command_count != commands) {
+        hr = apu_alloc(&pending.queues[0], nullptr, commands * 256, 256, 1);
+        if (SUCCEEDED(hr)) hr = apu_alloc(&pending.queues[1], nullptr, commands * 12, 256, 1);
+    }
+    if (SUCCEEDED(hr) && messages && self->message_count != messages)
+        hr = apu_alloc(&pending.queues[2], nullptr, messages * 256, 256, 1);
+    if (FAILED(hr)) return hr;
+    for (unsigned i = 0; i < 3; ++i) if (pending.queues[i] || (i == 2 && !messages)) {
+        if (self->queues[i]) apu_free(self->queues[i]);
+        self->queues[i] = pending.queues[i]; pending.queues[i] = nullptr;
+    }
+    std::memset(self->queues[0], 0, commands * 256);
+    std::memset(self->queues[1], 0, commands * 12);
+    if (messages) std::memset(self->queues[2], 0, messages * 256);
+    self->command_count = commands; self->message_count = messages;
+    self->message_mask = 0; self->message_read = 0; self->connected = true; ++connected_acp_clients;
+    if (audio_diagnostics) std::fprintf(stderr, "xone-era: ACP client connected commands=%u messages=%u thread=%lu\n", commands, messages, GetCurrentThreadId());
+    return S_OK;
+}
+HRESULT WINAPI acp_submit(AcpClient* self, UINT command, UINT64 id, UINT frame, const void* parameters, UINT notification) {
+    std::lock_guard lock(acp_mutex);
+    if (!self->connected) return HRESULT(0x8000000eu);
+    if (!command || command > 27 || (!parameters && command != 4)) return E_INVALIDARG;
+    if ((command == 2 || command == 3) && !notification && frame == UINT_MAX) {
+        UINT mask = 0; SIZE_T read = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), parameters, &mask, sizeof mask, &read) || read != sizeof mask) return E_INVALIDARG;
+        // The subscription changes real client state; it does not emit any audio/DSP event.
+        if (command == 2) self->message_mask |= mask; else self->message_mask &= ~mask;
+        if (audio_diagnostics) std::fprintf(stderr, "xone-era: ACP notification mask=0x%X command=%u id=0x%llX frame=0x%X\n", self->message_mask, command, id, frame);
+        return S_OK;
+    }
+    if (audio_diagnostics) {
+        const auto caller = reinterpret_cast<ULONG_PTR>(_ReturnAddress());
+        MEMORY_BASIC_INFORMATION region{}; VirtualQuery(reinterpret_cast<void*>(caller), &region, sizeof region);
+        std::fprintf(stderr, "xone-era: untranslated ACP command=%u id=0x%llX frame=0x%X notification=0x%X caller+0x%llX parameters=%p; HRESULT 0x80004001\n",
+            command, id, frame, notification, caller - reinterpret_cast<ULONG_PTR>(region.AllocationBase), parameters);
+        std::array<UINT, 4> words{}; SIZE_T read = 0;
+        if (parameters && ReadProcessMemory(GetCurrentProcess(), parameters, words.data(), sizeof words, &read) && read == sizeof words)
+            std::fprintf(stderr, "xone-era: ACP parameter prefix %08X %08X %08X %08X\n", words[0], words[1], words[2], words[3]);
+    }
+    return E_NOTIMPL;
+}
+bool WINAPI acp_get_message(AcpClient* self, void* output) {
+    std::lock_guard lock(acp_mutex);
+    if (!self->message_count || !output) return false;
+    auto* packet = static_cast<char*>(self->queues[2]) + self->message_read * 256;
+    if (!*reinterpret_cast<UINT*>(packet)) return false;
+    std::array<UINT, 6> message{}; std::memcpy(message.data(), packet + 4, sizeof message);
+    if (!audio_output(static_cast<std::array<UINT, 6>*>(output), message)) return false;
+    *reinterpret_cast<UINT*>(packet) = 0;
+    self->message_read = (self->message_read + 1) % self->message_count;
+    return true;
+}
+UINT WINAPI acp_message_count(AcpClient* self) {
+    std::lock_guard lock(acp_mutex);
+    UINT count = 0;
+    while (count < self->message_count && *reinterpret_cast<UINT*>(static_cast<char*>(self->queues[2]) +
+        ((self->message_read + count) % self->message_count) * 256)) ++count;
+    return count;
+}
+DWORD_PTR WINAPI set_wasapi_affinity(DWORD_PTR mask) {
+    DWORD_PTR process = 0, system = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system)) return 0;
+    // Original 1800081f0 targets MMDevAPI's own workers, never the calling title thread.
+    // Desktop WASAPI does not expose those handles; report failure instead of changing unrelated threads.
+    const DWORD error = (mask & ~process) ? ERROR_INVALID_PARAMETER : ERROR_NOT_SUPPORTED;
+    if (audio_diagnostics) std::fprintf(stderr, "xone-era: WASAPI worker affinity mask=0x%llX refused Win32 %lu; host workers are not exposed\n", UINT64(mask), error);
+    SetLastError(error);
+    return 0;
+}
+HRESULT WINAPI acp_reserved() { return HRESULT(0x8ac80f0eu); } // Original slots 6-9, 18000184c.
+void WINAPI acp_release(AcpClient* self) {
+    std::lock_guard lock(acp_mutex);
+    if (self->connected) (void)acp_disconnect(self);
+    for (auto it = acp_clients.begin(); it != acp_clients.end(); ++it)
+        if (it->get() == self) { acp_clients.erase(it); return; }
+}
+HRESULT WINAPI acp_create(AcpClient** output) {
+    std::lock_guard lock(acp_mutex);
+    if (!acp_bound) return E_NOTIMPL;
+    if (!output) return E_INVALIDARG;
+    static const void* const table[]{reinterpret_cast<void*>(&acp_connect), reinterpret_cast<void*>(&acp_disconnect),
+        reinterpret_cast<void*>(&acp_submit), reinterpret_cast<void*>(&acp_get_message), reinterpret_cast<void*>(&acp_message_count),
+        reinterpret_cast<void*>(&acp_release), reinterpret_cast<void*>(&acp_reserved), reinterpret_cast<void*>(&acp_reserved),
+        reinterpret_cast<void*>(&acp_reserved), reinterpret_cast<void*>(&acp_reserved)};
+    try {
+        auto client = std::make_unique<AcpClient>(); client->vtable = table;
+        acp_clients.push_back(std::move(client));
+        if (!audio_output(output, acp_clients.back().get())) { acp_clients.pop_back(); return E_INVALIDARG; }
+        return S_OK;
+    } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 HMODULE host_xaudio2() {
     static const HMODULE module = [] {
@@ -496,6 +683,8 @@ HRESULT bind_acp_module(const std::wstring& original) {
 }
 void reset_acp_heaps() {
     std::lock_guard lock(acp_mutex);
+    acp_clients.clear(); connected_acp_clients = 0;
+    if (shape_contexts) { free_shape_contexts(*shape_contexts); shape_contexts.reset(); }
     acp_bound = false;
     for (auto& heap : acp_heaps) heap.reset();
     acp_data_bytes = 0x4000000; acp_control_bytes = 0x114000;
@@ -514,7 +703,15 @@ void* resolve_acp(const ImportRequest& request) {
     if (request.name == "ApuMapApuAddress") return reinterpret_cast<void*>(&apu_map_apu_address);
     if (request.name == "ApuIsVirtualAddressValid") return reinterpret_cast<void*>(&apu_is_virtual_address_valid);
     if (request.name == "ApuHeapGetState") return reinterpret_cast<void*>(&apu_heap_get_state);
-    return nullptr; // SHAPE/DSP has no translated executor yet.
+    if (request.name == "AcpHalAllocateShapeContexts") return reinterpret_cast<void*>(&allocate_shape_contexts);
+    if (request.name == "AcpHalReleaseShapeContexts") return reinterpret_cast<void*>(&release_shape_contexts);
+    if (request.name == "AcpHalCreate") return reinterpret_cast<void*>(&acp_create);
+    return nullptr; // Other ACP exports remain unaudited.
+}
+void* resolve_audio_device(const ImportRequest& request) {
+    if (same_library(request.library, "mmdevapi.dll") && request.name == "SetWasapiThreadAffinityMask")
+        return reinterpret_cast<void*>(&set_wasapi_affinity);
+    return nullptr;
 }
 
 HRESULT wrap_audio_enumerator(IMMDeviceEnumerator* host, REFIID iid, void** out) {

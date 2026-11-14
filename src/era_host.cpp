@@ -140,6 +140,11 @@ void* resolve_host_module(const ImportRequest& request) {
         return module ? reinterpret_cast<void*>(GetProcAddress(module, request.name.c_str())) : nullptr;
     }
     if (same_library(request.library, "ws2_32.dll")) return socket_import(request);
+    // FH2 141a62890 requests desktop IAudioClient2 and the standard five-argument async ABI.
+    if (same_library(request.library, "mmdevapi.dll") && request.name == "ActivateAudioInterfaceAsync") {
+        const HMODULE module = LoadLibraryExW(L"mmdevapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        return module ? reinterpret_cast<void*>(GetProcAddress(module, "ActivateAudioInterfaceAsync")) : nullptr;
+    }
     if (same_library(request.library, "bcrypt.dll") && request.name == "BCryptGenRandom") {
         const HMODULE module = LoadLibraryExW(L"bcrypt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         return module ? reinterpret_cast<void*>(GetProcAddress(module, "BCryptGenRandom")) : nullptr;
@@ -170,6 +175,7 @@ void* resolve_host_module(const ImportRequest& request) {
 void* resolve_title_import(const ImportRequest& request) {
     if (void* address = resolve_kernelx(request)) return address;
     if (void* address = resolve_acp(request)) return address;
+    if (void* address = resolve_audio_device(request)) return address;
     if (void* address = resolve_etwplus(request)) return address;
     if (void* address = resolve_d3d11x(request)) return address;
     if (void* address = resolve_xg_module(request)) return address;

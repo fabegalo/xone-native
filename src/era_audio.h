@@ -5,9 +5,10 @@
 
 namespace xboxone::era {
 struct ImportRequest;
-// Read-only identity binding: only the audited ACP memory ABI is exposed.
+// Read-only identity binding: audited ACP heaps, SHAPE arrays and client ABI.
 HRESULT bind_acp_module(const std::wstring& path);
 void* resolve_acp(const ImportRequest& request);
+void* resolve_audio_device(const ImportRequest& request);
 void reset_acp_heaps(); // Before unloading title allocation callbacks.
 void set_audio_diagnostics(bool enabled);
 // Observed Xbox extension: desktop enumerator slots 0-7, then channel counts

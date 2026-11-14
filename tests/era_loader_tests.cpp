@@ -1136,18 +1136,57 @@ int main(int argc, char** argv) {
                                     reinterpret_cast<SetTargets>(vt(deferred)[33])(deferred,1,targets,nullptr);
                                     void* deferred_view=reinterpret_cast<void*>(1);void* deferred_depth=reinterpret_cast<void*>(1);
                                     reinterpret_cast<GetTargets>(vt(deferred)[89])(deferred,1,&deferred_view,&deferred_depth);
-                                    check(!deferred_view && !deferred_depth,"original deferred OM query exposes no immediate render target bindings");
+                                    check(deferred_view==view && !deferred_depth,"tracked deferred OM query returns its retained render target binding");
+                                    if(deferred_view) reinterpret_cast<Count>(vt(deferred_view)[2])(deferred_view);
                                     static UINT clear_slot=0;
                                     set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{clear_slot=slot;return 0;});
                                     const FLOAT black[]{0,0,0,0};
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(deferred)[50])(deferred,view,black);
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[111])(deferred);
                                     set_d3d11x_trap_handler(nullptr);
-                                    check(clear_slot==50 && !std::memcmp(before.data(),alias,before.size()),
-                                          "deferred clear stays explicit and cannot execute immediately or modify canonical pixels");
+                                    check(clear_slot==0 && !std::memcmp(before.data(),alias,before.size()),
+                                          "deferred clear records without executing or modifying canonical pixels");
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[110])(deferred);
                                     check(!std::memcmp(before.data(),alias,before.size()),
                                           "deferred ClearState releases bindings without submitting GPU work or changing physical pixels");
+                                    using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                    using Execute=void(STDMETHODCALLTYPE*)(void*,void*,BOOL);
+                                    void* list=nullptr;
+                                    check(reinterpret_cast<Finish>(vt(deferred)[114])(deferred,FALSE,&list)==S_OK && list,
+                                          "deferred clear survives ClearState and finishes without executing");
+                                    if(list) {
+                                        reinterpret_cast<Execute>(vt(context)[58])(context,list,FALSE);
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                            std::all_of(linear.begin(),linear.end(),[](auto v){return v==0;}),
+                                            "ExecuteCommandList publishes the recorded clear after its real fence");
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
+                                        reinterpret_cast<Execute>(vt(context)[58])(context,list,TRUE);
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                            std::all_of(linear.begin(),linear.end(),[](auto v){return v==0;}),
+                                            "reused clear list sees current resource ownership and clears again");
+                                        reinterpret_cast<Count>(vt(list)[2])(list);
+                                    }
                                     reinterpret_cast<Count>(vt(deferred)[2])(deferred);
+                                }
+                                deferred=nullptr;
+                                check(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&deferred)==S_OK && deferred,
+                                      "binding-only list creates a normal deferred context");
+                                if(deferred) {
+                                    const ULONG baseline=reinterpret_cast<Count>(vt(view)[1])(view);
+                                    reinterpret_cast<Count>(vt(view)[2])(view);
+                                    bind_targets(deferred,1,targets,nullptr);
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[110])(deferred);
+                                    void* list=nullptr;
+                                    using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                    check(reinterpret_cast<Finish>(vt(deferred)[114])(deferred,FALSE,&list)==S_OK && list,
+                                          "binding-only list finishes after unbinding without requiring shaders");
+                                    reinterpret_cast<Count>(vt(deferred)[2])(deferred);
+                                    check(reinterpret_cast<Count>(vt(view)[1])(view)==baseline+1,
+                                          "recorded bindings retain resources after unbinding and producer destruction, even without draws");
+                                    reinterpret_cast<Count>(vt(view)[2])(view);
+                                    if(list) reinterpret_cast<Count>(vt(list)[2])(list);
+                                    check(reinterpret_cast<Count>(vt(view)[1])(view)==baseline,"list release retires binding-only references exactly once");
+                                    reinterpret_cast<Count>(vt(view)[2])(view);
                                 }
                                 const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
                                 const auto compile=compiler ? reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")) : nullptr;
@@ -1245,6 +1284,78 @@ int main(int argc, char** argv) {
                                         reinterpret_cast<Count>(vt(deferred_draw)[2])(deferred_draw);
                                     }
                                     set_d3d11x_trap_handler(nullptr);
+                                    deferred_draw=nullptr;
+                                    check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&deferred_draw)==S_OK && deferred_draw,
+                                          "deferred draw recording uses the existing context ABI");
+                                    if(deferred_draw) {
+                                        using Clear=void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*);
+                                        using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                        using Execute=void(STDMETHODCALLTYPE*)(void*,void*,BOOL);
+                                        const auto clear=reinterpret_cast<Clear>(vt(deferred_draw)[50]);
+                                        bind_targets(deferred_draw,1,targets,nullptr);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(deferred_draw)[44])(deferred_draw,1,&viewport);
+                                        auto* data=static_cast<char*>(deferred_draw);
+                                        std::memcpy(data+0x170,&topology,sizeof topology);
+                                        std::memcpy(data+0x178,&empty_layout,sizeof empty_layout);
+                                        std::memcpy(data+0x180,&shaders[0],sizeof(void*));
+                                        clear(deferred_draw,view,black);
+                                        std::memcpy(data+0x188,&shaders[1],sizeof(void*));
+                                        draw(deferred_draw,3,0);
+                                        clear(deferred_draw,view,white);
+                                        std::memcpy(data+0x188,&shaders[2],sizeof(void*));
+                                        draw(deferred_draw,3,0);
+                                        const UINT16 indices[]{99,0,1,2};
+                                        struct IndexDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} index_desc{{sizeof indices,D3D11_USAGE_DEFAULT,D3D11_BIND_INDEX_BUFFER,0,0,0},0};
+                                        const D3D11_SUBRESOURCE_DATA index_data{indices,0,0};
+                                        using CreateIndex=HRESULT(STDMETHODCALLTYPE*)(void*,const IndexDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                                        void* recorded_indices=nullptr;
+                                        check(reinterpret_cast<CreateIndex>(vt(device)[3])(device,&index_desc,&index_data,&recorded_indices)==S_OK && recorded_indices,
+                                              "deferred indexed draw uses a real retained index resource");
+                                        if(recorded_indices) {
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,UINT)>(vt(deferred_draw)[20])(deferred_draw,0,recorded_indices,0);
+                                            std::memcpy(data+0x188,&shaders[1],sizeof(void*));
+                                            clear(deferred_draw,view,white);
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT64,INT)>(vt(deferred_draw)[13])(deferred_draw,(UINT64(3)<<32)|1,0);
+                                        }
+                                        void* list=nullptr;
+                                        check(reinterpret_cast<Finish>(vt(deferred_draw)[114])(deferred_draw,TRUE,&list)==S_OK && list &&
+                                            !std::memcmp(before.data(),alias,before.size()),
+                                            "FinishCommandList never executes clears or draws and captures changing inline shaders");
+                                        void* reset_shader=reinterpret_cast<void*>(1);void* reset_layout=reinterpret_cast<void*>(1);
+                                        std::memcpy(&reset_shader,data+0x188,sizeof reset_shader);std::memcpy(&reset_layout,data+0x178,sizeof reset_layout);
+                                        check(!reset_shader && !reset_layout,"11295 FinishCommandList resets deferred inline bindings even with restore true");
+                                        if(recorded_indices) reinterpret_cast<Count>(vt(recorded_indices)[2])(recorded_indices);
+                                        reinterpret_cast<Count>(vt(deferred_draw)[2])(deferred_draw);
+                                        if(list) {
+                                            // Destroy the producer and then replay twice, preserving recorded state and order.
+                                            for(UINT pass=0;pass<2;++pass) {
+                                                reinterpret_cast<Clear>(vt(context)[50])(context,view,black);
+                                                reinterpret_cast<Execute>(vt(context)[58])(context,list,pass!=0);
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                    std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
+                                                    "deferred clears and original shader draws replay in order after producer release, with fenced exact pixels");
+                                            }
+                                            void* merged=nullptr;
+                                            check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&merged)==S_OK && merged,"merged list has its own deferred producer");
+                                            if(merged) {
+                                                reinterpret_cast<Execute>(vt(merged)[58])(merged,list,FALSE);
+                                                void* merged_list=nullptr;
+                                                check(reinterpret_cast<Finish>(vt(merged)[114])(merged,FALSE,&merged_list)==S_OK && merged_list,
+                                                      "executing on a deferred context records rather than submitting");
+                                                reinterpret_cast<Count>(vt(merged)[2])(merged);
+                                                reinterpret_cast<Count>(vt(list)[2])(list);list=nullptr;
+                                                if(merged_list) {
+                                                    reinterpret_cast<Clear>(vt(context)[50])(context,view,black);
+                                                    reinterpret_cast<Execute>(vt(context)[58])(context,merged_list,FALSE);
+                                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                        std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
+                                                        "merged list retains commands and resources after both producer and source list release");
+                                                    reinterpret_cast<Count>(vt(merged_list)[2])(merged_list);
+                                                }
+                                            }
+                                            if(list) reinterpret_cast<Count>(vt(list)[2])(list);
+                                        }
+                                    }
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
                                     void* retained_layout=nullptr;
                                     std::memcpy(&retained_layout,static_cast<char*>(context)+0x178,sizeof retained_layout);
@@ -2940,8 +3051,9 @@ int main(int argc, char** argv) {
                     if (deferred) {
                         reinterpret_cast<SetViewports>(vt(deferred)[44])(deferred,2,viewport_values);
                         viewport_capacity=1;reinterpret_cast<GetViewports>(vt(deferred)[95])(deferred,&viewport_capacity,&viewport_result.value);
-                        check(!viewport_capacity && !std::memcmp(&viewport_result.value,&zero_viewport,sizeof zero_viewport),
-                              "original deferred viewport query returns zero and clears only the requested output");
+                        check(flags&0x80000 ? (!viewport_capacity && !std::memcmp(&viewport_result.value,&zero_viewport,sizeof zero_viewport)) :
+                            (viewport_capacity==1 && !std::memcmp(&viewport_result.value,&viewport_values[0],sizeof zero_viewport)),
+                              "only FAST_SEMANTICS suppresses deferred viewport queries; tracked contexts preserve values and capacity");
                         using State = UINT (STDMETHODCALLTYPE*)(void*);
                         const auto data = static_cast<unsigned char*>(deferred);
                         check((reinterpret_cast<std::uintptr_t>(deferred) & 63) == 0 &&
@@ -3007,14 +3119,42 @@ int main(int argc, char** argv) {
                         std::memcpy(observed,data+0x180,16);
                         check(observed[0]==vertex_marker && observed[1]==pixel_marker && data[0x390]==1,
                               "ClearState preserves the original special shader markers and out-of-line dispatch");
-                        static unsigned command_slot = 0;
-                        set_d3d11x_trap_handler([](const char*, unsigned slot) -> std::uintptr_t {
-                            command_slot = slot; return static_cast<UINT32>(E_NOTIMPL);
-                        });
                         using Finish = HRESULT (STDMETHODCALLTYPE*)(void*, BOOL, void**);
+                        using Execute = void (STDMETHODCALLTYPE*)(void*,void*,BOOL);
+                        const auto finish=reinterpret_cast<Finish>(vt(deferred)[114]);
+                        const auto execute=reinterpret_cast<Execute>(vt(context)[58]);
                         void* command_list = nullptr;
-                        check(reinterpret_cast<Finish>(vt(deferred)[114])(deferred, FALSE, &command_list) == E_NOTIMPL && command_slot == 114,
-                              "native FinishCommandList slot stays unsupported, never aliases a successful flags getter");
+                        check(finish(deferred,FALSE,&command_list)==S_OK && command_list,
+                              "FinishCommandList creates an immutable empty list at the native slot");
+                        if(command_list) {
+                            check(reinterpret_cast<State>(vt(command_list)[8])(command_list)==flags,
+                                  "command list GetContextFlags preserves original deferred creation flags");
+                            void* owner=nullptr;
+                            reinterpret_cast<GetDevice>(vt(command_list)[3])(command_list,&owner);
+                            check(owner==device,"command list shares device identity");
+                            if(owner) reinterpret_cast<Count>(vt(owner)[2])(owner);
+                            const D3D11_VIEWPORT keep{2,3,16,8,0,1};
+                            reinterpret_cast<SetViewports>(vt(context)[44])(context,1,&keep);
+                            execute(context,command_list,FALSE);execute(context,command_list,TRUE);
+                            UINT capacity=1;D3D11_VIEWPORT result{};
+                            reinterpret_cast<GetViewports>(vt(context)[95])(context,&capacity,&result);
+                            const D3D11_VIEWPORT empty{};
+                            check(flags&0x20000 ? (capacity==1 && !std::memcmp(&result,&keep,sizeof keep)) :
+                                (!capacity && !std::memcmp(&result,&empty,sizeof empty)),
+                                  "11295 ExecuteCommandList ignores restore: common lists clear tracked state, Draw Bundles preserve bindings on reuse");
+                            reinterpret_cast<Count>(vt(command_list)[2])(command_list);
+                        }
+                        check(finish(deferred,TRUE,nullptr)==S_OK,"null FinishCommandList output discards the recording");
+                        void* invalid=reinterpret_cast<void*>(1);
+                        check(reinterpret_cast<Finish>(vt(context)[114])(context,FALSE,&invalid)==E_NOTIMPL && invalid==reinterpret_cast<void*>(1),
+                              "11295 immediate FinishCommandList preserves the original error and untouched output");
+                        static unsigned command_slot=0;
+                        set_d3d11x_trap_handler([](const char*,unsigned slot)->std::uintptr_t {command_slot=slot;return E_NOTIMPL;});
+                        execute(context,reinterpret_cast<void*>(1),FALSE);
+                        check(command_slot==58,"ExecuteCommandList rejects unreadable list identity before submission");
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[200])(deferred);
+                        check(finish(deferred,FALSE,&invalid)==E_NOTIMPL && !invalid,
+                              "unsupported deferred commands cannot produce a successful partial list");
                         set_d3d11x_trap_handler(nullptr);
                         void* owned = nullptr;
                         reinterpret_cast<GetDevice>(vt(deferred)[3])(deferred, &owned);

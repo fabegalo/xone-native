@@ -81,6 +81,7 @@ struct GraphicsObject {
 static_assert(offsetof(GraphicsObject, flags) == 8 && offsetof(GraphicsObject, refcount) == 12);
 
 struct Context;
+struct RecordedCommand;
 struct DepthState;
 struct Sampler;
 struct BlendState;
@@ -104,6 +105,7 @@ struct Device : GraphicsObject {
     ID3D12Fence* retirement = nullptr;
     HANDLE retired = nullptr;
     std::mutex ownership;
+    std::mutex list_execution;
     ULONG legacy_dependents = 0; // Keeps storage alive without altering the public device count.
     Context* immediate = nullptr; // Legacy context storage belongs to the device.
     std::array<std::shared_ptr<DmaEngine>, 3> dma; // The observed engine selectors are 1 and 2.
@@ -147,9 +149,29 @@ struct alignas(64) Context : GraphicsObject {
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
     Microsoft::WRL::ComPtr<ID3D12Fence> submission_fence;
     UINT64 submission_value = 0, completed_draws = 0;
+    std::vector<std::shared_ptr<RecordedCommand>> recording;
+    std::vector<Microsoft::WRL::ComPtr<IUnknown>> recorded_references;
+    HRESULT recording_error = S_OK;
     ~Context();
 };
 static_assert(offsetof(Context, private_data) == 24 && offsetof(Context, functions) == 0x3d0);
+struct RecordedCommand {
+    enum Kind { draw, draw_indexed, clear_color, clear_depth } kind;
+    std::unique_ptr<Context> state;
+    BufferView* view = nullptr;
+    std::array<FLOAT,4> color{};
+    FLOAT depth = 0;
+    UINT count = 0, first = 0;
+    INT base = 0;
+    ~RecordedCommand();
+};
+struct CommandList : GraphicsObject {
+    Device* device = nullptr;
+    void* private_data = nullptr;
+    UINT context_flags = 0;
+    std::vector<std::shared_ptr<RecordedCommand>> commands;
+    std::vector<Microsoft::WRL::ComPtr<IUnknown>> references;
+};
 struct DmaOperation { ID3D12Fence* fence; UINT64 value; bool wait; };
 struct Shader : GraphicsObject {
     Device* device = nullptr;
@@ -324,8 +346,8 @@ const std::array<const void*, vtable_slots>& shader_vtable();
     __fastfail(FAST_FAIL_FATAL_APP_EXIT); // Never continue with a fabricated result.
 }
 
-enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv, kind_texture, kind_rtv };
-constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView", "ID3D11Texture2D", "ID3D11RenderTargetView"};
+enum Kind : unsigned { kind_device, kind_context, kind_dxgi_device, kind_adapter, kind_factory, kind_swapchain, kind_dma, kind_shader, kind_buffer, kind_uav, kind_srv, kind_texture, kind_rtv, kind_command_list };
+constexpr const char* kind_names[]{"ID3D11DeviceX", "ID3D11DeviceContextX", "IDXGIDevice1", "IDXGIAdapter", "IDXGIFactory", "IDXGISwapChain1", "ID3D11DmaEngineContextX", "ID3D11Shader", "ID3D11Buffer", "ID3D11UnorderedAccessView", "ID3D11ShaderResourceView", "ID3D11Texture2D", "ID3D11RenderTargetView", "ID3D11CommandList"};
 
 void diagnose_shader(std::uintptr_t address, SIZE_T bytes, bool instructions = false) {
     if (!address || bytes < 32 || bytes > (16u << 20)) return;
@@ -367,6 +389,10 @@ void diagnose_shader(std::uintptr_t address, SIZE_T bytes, bool instructions = f
 
 template <unsigned K, unsigned Slot>
 std::uintptr_t trap_slot(void* object, std::uintptr_t a = 0, std::uintptr_t b = 0, std::uintptr_t c = 0, std::uintptr_t d = 0) {
+    if constexpr (K == kind_context) {
+        auto* context = static_cast<Context*>(object);
+        if (context && context->deferred) context->recording_error = E_NOTIMPL;
+    }
     if (auto handler = trap_handler.load()) return handler(kind_names[K], Slot);
     if (graphics_diagnostics.load()) {
         const auto caller = reinterpret_cast<ULONG_PTR>(_ReturnAddress());
@@ -2813,18 +2839,24 @@ void clear_context_bindings(Context* self,bool preserve_layout=false) {
     if (self->index_buffer) buffer_release(self->index_buffer); self->index_buffer=nullptr;
 }
 Context::~Context() { clear_context_bindings(this); }
+RecordedCommand::~RecordedCommand() { if (view) view_release(view); }
+void retain_recorded_binding(Context* self,GraphicsObject* object) {
+    if(!self->deferred || !object) return;
+    try {self->recorded_references.emplace_back(reinterpret_cast<IUnknown*>(object));}
+    catch(const std::bad_alloc&) {self->recording_error=E_OUTOFMEMORY;}
+}
 template<class T,std::size_t N,class Valid,class Release>
-bool bind_range(std::array<T*,N>& current,UINT start,UINT count,T* const* input,Valid valid,Release release) {
+bool bind_range(Context* self,std::array<T*,N>& current,UINT start,UINT count,T* const* input,Valid valid,Release release) {
     if(start>N || count>N-start) return false;
     std::array<T*,N> next{}; SIZE_T read=0;
     if(input && count && (!ReadProcessMemory(GetCurrentProcess(),input,next.data(),count*sizeof(T*),&read) || read!=count*sizeof(T*))) return false;
     for(UINT i=0;i<count;++i) if(next[i] && !valid(next[i])) return false;
-    for(UINT i=0;i<count;++i) if(next[i]) add_ref(next[i]);
+    for(UINT i=0;i<count;++i) if(next[i]) {retain_recorded_binding(self,next[i]);add_ref(next[i]);}
     for(UINT i=0;i<count;++i) {if(current[start+i]) release(current[start+i]);current[start+i]=next[i];}
     return true;
 }
 void STDMETHODCALLTYPE context_pixel_samplers(Context* self,UINT start,UINT count,Sampler* const* input) {
-    if(!bind_range(self->pixel_samplers,start,count,input,[&](Sampler* s){return s->vtable==sampler_vtable().data() && s->device==self->device;},sampler_release))
+    if(!bind_range(self,self->pixel_samplers,start,count,input,[&](Sampler* s){return s->vtable==sampler_vtable().data() && s->device==self->device;},sampler_release))
         default_trap("ID3D11DeviceContextX",self->device->legacy ? 11 : 12);
 }
 void STDMETHODCALLTYPE context_pixel_resources(Context* self,BufferView* const* input,UINT start,UINT packet) {
@@ -2832,12 +2864,12 @@ void STDMETHODCALLTYPE context_pixel_resources(Context* self,BufferView* const* 
     // count minus one occupies the header above bit 18.
     const UINT address=packet&0xffff, count=(packet>>19)+1;
     if(address<0x6b40 || ((address-0x6b40)&31) || ((packet>>16)&7)!=7 || start!=((address-0x6b40)>>5) ||
-        !bind_range(self->shader_resources[4],start,count,input,[&](BufferView* v){return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;},view_release))
+        !bind_range(self,self->shader_resources[4],start,count,input,[&](BufferView* v){return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;},view_release))
         default_trap("ID3D11DeviceContextX",10);
 }
 template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_resources(Context* self,UINT start,UINT count,BufferView* const* input) {
     auto& resources=self->shader_resources[Stage];
-    if(!bind_range(resources,start,count,input,[&](BufferView* v){
+    if(!bind_range(self,resources,start,count,input,[&](BufferView* v){
         return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;
     },view_release)) default_trap("ID3D11DeviceContextX",Slot);
 }
@@ -2880,9 +2912,9 @@ HRESULT bind_fast_resources(Context* self,const void* begin,const void* end) {
         }
     }
     // Validate the whole batch before publishing any binding or ownership change.
-    return bind_range(self->shader_resources[4],0,UINT(next.size()),next.data(),[&](BufferView* v){
+    return bind_range(self,self->shader_resources[4],0,UINT(next.size()),next.data(),[&](BufferView* v){
         return v->vtable==srv_vtable().data() && v->device==self->device && v->view_type==2;
-    },view_release) && bind_range(self->pixel_samplers,0,UINT(next_samplers.size()),next_samplers.data(),[&](Sampler* s){
+    },view_release) && bind_range(self,self->pixel_samplers,0,UINT(next_samplers.size()),next_samplers.data(),[&](Sampler* s){
         return s->vtable==sampler_vtable().data() && s->device==self->device;
     },sampler_release) ? S_OK : E_INVALIDARG;
 }
@@ -2894,11 +2926,12 @@ void STDMETHODCALLTYPE context_fast_resources(Context* self,const void* begin,co
     }
 }
 template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_constants(Context* self,UINT start,UINT count,Buffer* const* input) {
-    if(!bind_range(self->constants[Stage],start,count,input,[&](Buffer* b){return b->vtable==buffer_vtable().data() && b->device==self->device &&
+    if(!bind_range(self,self->constants[Stage],start,count,input,[&](Buffer* b){return b->vtable==buffer_vtable().data() && b->device==self->device &&
         (b->desc.standard.BindFlags&D3D11_BIND_CONSTANT_BUFFER);},buffer_release)) default_trap("ID3D11DeviceContextX",Slot);
 }
 template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_shader(Context* self,Shader* shader) {
     if(shader && (shader->vtable!=shader_vtable().data() || shader->device!=self->device || shader->stage!=Stage)) {default_trap("ID3D11DeviceContextX",Slot);return;}
+    retain_recorded_binding(self,shader);
     if(shader) add_ref(shader);
     if(self->shaders[Stage]) shader_release(self->shaders[Stage]);
     self->shaders[Stage]=shader;
@@ -2907,6 +2940,7 @@ template<UINT Stage,UINT Slot> void STDMETHODCALLTYPE context_shader(Context* se
 }
 void STDMETHODCALLTYPE context_input_layout(Context* self,InputLayout* layout) {
     if(layout && (layout->vtable!=input_layout_vtable().data() || layout->device!=self->device)) {default_trap("ID3D11DeviceContextX",19);return;}
+    retain_recorded_binding(self,layout);
     if(layout) add_ref(layout);
     if(self->input_layout) input_layout_release(self->input_layout);
     self->input_layout=layout;
@@ -2917,7 +2951,7 @@ void STDMETHODCALLTYPE context_vertices(Context* self,UINT start,UINT count,Buff
     if(start>next_strides.size() || count>next_strides.size()-start || (count &&
         (!strides || !offsets || !ReadProcessMemory(GetCurrentProcess(),strides,next_strides.data(),count*sizeof(UINT),&read) || read!=count*sizeof(UINT) ||
         !ReadProcessMemory(GetCurrentProcess(),offsets,next_offsets.data(),count*sizeof(UINT),&read) || read!=count*sizeof(UINT)))) {default_trap("ID3D11DeviceContextX",20);return;}
-    if(!bind_range(self->vertex_buffers,start,count,input,[&](Buffer* b){return b->vtable==buffer_vtable().data() && b->device==self->device &&
+    if(!bind_range(self,self->vertex_buffers,start,count,input,[&](Buffer* b){return b->vtable==buffer_vtable().data() && b->device==self->device &&
         (b->desc.standard.BindFlags&D3D11_BIND_VERTEX_BUFFER);},buffer_release)) {default_trap("ID3D11DeviceContextX",20);return;}
     std::copy_n(next_strides.begin(),count,self->vertex_strides.begin()+start);
     std::copy_n(next_offsets.begin(),count,self->vertex_offsets.begin()+start);
@@ -2935,18 +2969,21 @@ void STDMETHODCALLTYPE context_indices(Context* self,UINT format,Buffer* buffer,
         !(buffer->desc.standard.BindFlags&D3D11_BIND_INDEX_BUFFER) || offset>buffer->desc.standard.ByteWidth || offset%(format ? 4 : 2)))) {
         default_trap("ID3D11DeviceContextX",21);return;
     }
+    retain_recorded_binding(self,buffer);
     if(buffer) add_ref(buffer);
     if(self->index_buffer) buffer_release(self->index_buffer);
     self->index_buffer=buffer;self->index_offset=offset;self->index_format=format ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
 }
 void STDMETHODCALLTYPE context_set_raster(Context* self,RasterState* state) {
     if(state && (state->vtable!=raster_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",self->device->legacy ? 43 : 44);return;}
+    retain_recorded_binding(self,state);
     if(state) add_ref(state);
     if(self->raster_state) raster_state_release(self->raster_state);
     self->raster_state=state;
 }
 void STDMETHODCALLTYPE context_set_depth_state(Context* self,DepthState* state,UINT reference) {
     if(state && (state->vtable!=depth_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",self->device->legacy ? 36 : 37);return;}
+    retain_recorded_binding(self,state);
     if(state) add_ref(state);
     if(self->depth_state) depth_state_release(self->depth_state);
     self->depth_state=state; self->stencil_reference=reference;
@@ -2956,6 +2993,7 @@ void STDMETHODCALLTYPE context_set_blend(Context* self,BlendState* state,const F
     if(state && (state->vtable!=blend_state_vtable().data() || state->device!=self->device)) {default_trap("ID3D11DeviceContextX",slot);return;}
     std::array<FLOAT,4> next{1,1,1,1}; SIZE_T read=0;
     if(factor && (!ReadProcessMemory(GetCurrentProcess(),factor,next.data(),sizeof next,&read) || read!=sizeof next)) {default_trap("ID3D11DeviceContextX",slot);return;}
+    retain_recorded_binding(self,state);
     if(state) add_ref(state);
     if(self->blend_state) blend_state_release(self->blend_state);
     self->blend_state=state; self->blend_factor=next; self->sample_mask=mask;
@@ -2973,18 +3011,19 @@ void STDMETHODCALLTYPE context_set_render_targets(Context* self, UINT count, Buf
     }
     for (auto* view : next) if (view && (view->device != self->device || view->view_type != 0 || !view->heap)) { invalid(); return; }
     if (depth && (depth->device != self->device || depth->view_type != 1 || !depth->heap)) { invalid(); return; }
-    for (auto* view : next) if (view) view_add_ref(view);
-    if (depth) view_add_ref(depth);
+    for (auto* view : next) if (view) {retain_recorded_binding(self,view);view_add_ref(view);}
+    if (depth) {retain_recorded_binding(self,depth);view_add_ref(depth);}
     for (auto* view : self->render_targets) if (view) view_release(view);
     if (self->depth_target) view_release(self->depth_target);
     self->render_targets = next; self->depth_target = depth;
 }
 void STDMETHODCALLTYPE context_get_render_targets(Context* self,UINT count,BufferView** views,BufferView** depth) {
     if (count>self->render_targets.size()) { default_trap("ID3D11DeviceContextX",89);return; }
+    // 11295 180007cb0: FAST_SEMANTICS suppresses queries, not deferred type itself.
     if (views) for (UINT i=0;i<count;++i) {
-        auto* view=self->deferred ? nullptr : self->render_targets[i];if (view) view_add_ref(view);views[i]=view;
+        auto* view=(self->creation_flags&0x80000) ? nullptr : self->render_targets[i];if (view) view_add_ref(view);views[i]=view;
     }
-    if (depth) { auto* view=self->deferred ? nullptr : self->depth_target;if (view) view_add_ref(view);*depth=view; }
+    if (depth) { auto* view=(self->creation_flags&0x80000) ? nullptr : self->depth_target;if (view) view_add_ref(view);*depth=view; }
 }
 void STDMETHODCALLTYPE context_set_viewports(Context* self, UINT count, const D3D11_VIEWPORT* input) {
     decltype(self->viewports) next{};
@@ -3022,7 +3061,8 @@ void STDMETHODCALLTYPE legacy_context_set_viewports(Context* self,UINT count,con
 void STDMETHODCALLTYPE legacy_context_get_viewports(Context* self,UINT* count,D3D11_VIEWPORT* out) {
     if (!count) return;
     const UINT capacity=*count;
-    if (self->deferred) {
+    // 11295 180008600 suppresses queries only for FAST_SEMANTICS (private +0xc11 bit 5).
+    if (self->creation_flags&0x80000) {
         if (out && capacity>self->viewports.size()) {default_trap("ID3D11DeviceContextX",95);return;}
         if (out) std::fill_n(out,capacity,D3D11_VIEWPORT{});
         *count=0;return;
@@ -3030,10 +3070,44 @@ void STDMETHODCALLTYPE legacy_context_get_viewports(Context* self,UINT* count,D3
     context_get_viewports(self,count,out);
     if (out) *count=(std::min)(capacity,*count);
 }
+// Capture the same state consumed by execute_draw, retaining objects rather than pixel copies.
+std::unique_ptr<Context> capture_draw_state(Context* self) {
+    auto state=std::make_unique<Context>();
+    state->device=self->device;
+    state->inline_state=self->inline_state;
+    const auto retain=[](auto* object) { if(object) add_ref(object);return object; };
+    const auto range=[&](auto& out,const auto& in) {
+        for(SIZE_T i=0;i<out.size();++i) out[i]=retain(in[i]);
+    };
+    range(state->render_targets,self->render_targets);
+    state->depth_target=retain(self->depth_target);
+    state->viewports=self->viewports;state->viewport_count=self->viewport_count;
+    state->raster_state=retain(self->raster_state);state->depth_state=retain(self->depth_state);
+    state->blend_state=retain(self->blend_state);
+    state->stencil_reference=self->stencil_reference;state->sample_mask=self->sample_mask;state->blend_factor=self->blend_factor;
+    range(state->shaders,self->shaders);state->input_layout=retain(self->input_layout);
+    range(state->pixel_samplers,self->pixel_samplers);
+    for(SIZE_T i=0;i<state->shader_resources.size();++i) range(state->shader_resources[i],self->shader_resources[i]);
+    for(SIZE_T i=0;i<state->constants.size();++i) range(state->constants[i],self->constants[i]);
+    range(state->vertex_buffers,self->vertex_buffers);
+    state->vertex_strides=self->vertex_strides;state->vertex_offsets=self->vertex_offsets;
+    state->index_buffer=retain(self->index_buffer);state->index_format=self->index_format;state->index_offset=self->index_offset;
+    return state;
+}
 HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth) {
-    if (self->deferred) return DXGI_ERROR_UNSUPPORTED;
     if (!view || view->device != self->device || !view->resource ||
         view->resource->vtable != texture_vtable().data() || !view->heap || view->view_type != (color ? 0u : 1u)) return E_INVALIDARG;
+    if(self->deferred) {
+        try {
+            auto command=std::make_shared<RecordedCommand>();
+            command->kind=color ? RecordedCommand::clear_color : RecordedCommand::clear_depth;
+            command->view=view;view_add_ref(view);
+            if(color) std::copy_n(color,4,command->color.begin());
+            command->depth=depth;
+            self->recording.push_back(std::move(command));
+            return S_OK;
+        } catch(const std::bad_alloc&) { self->recording_error=E_OUTOFMEMORY;return E_OUTOFMEMORY; }
+    }
     auto* texture = static_cast<Texture*>(view->resource);
     HRESULT hr = S_OK;
     if (!self->command_allocator) hr=self->device->d3d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&self->command_allocator));
@@ -3059,17 +3133,18 @@ HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth
     if(SUCCEEDED(hr) && !completed.IsValid()) hr=HRESULT_FROM_WIN32(GetLastError());
     if(SUCCEEDED(hr)) hr=texture->creation_fence->SetEventOnCompletion(value,completed.Get());
     if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if(FAILED(hr)) default_trap("clear submission retirement",50);
     if(SUCCEEDED(hr)) hr=complete_title_gpu_resource(texture->gpu,texture->creation_fence.Get(),value);
     return hr;
 }
 void STDMETHODCALLTYPE context_clear_rtv(Context* self,BufferView* view,const FLOAT* color) {
-    if (self->deferred) {
-        if (self->device->legacy) (void)trap_slot<kind_context,50>(self,reinterpret_cast<std::uintptr_t>(view),reinterpret_cast<std::uintptr_t>(color));
-        else (void)trap_slot<kind_context,51>(self,reinterpret_cast<std::uintptr_t>(view),reinterpret_cast<std::uintptr_t>(color));
-        return;
-    }
     FLOAT value[4]{}; SIZE_T read=0;
     HRESULT hr=color && ReadProcessMemory(GetCurrentProcess(),color,value,sizeof value,&read) && read==sizeof value ? S_OK : E_INVALIDARG;
+    if(graphics_diagnostics.load() && SUCCEEDED(hr)) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<32) std::fprintf(stderr,"xone-era: clear RTV caller=%p context=%p deferred=%u view=%p resource=%p color=%g,%g,%g,%g\n",
+            _ReturnAddress(),self,self->deferred,view,view ? view->resource : nullptr,value[0],value[1],value[2],value[3]);
+    }
     if(SUCCEEDED(hr)) hr=clear_view(self,view,value,0);
     if(FAILED(hr)) { std::fprintf(stderr,"xone-era: render-target clear failed 0x%08lX\n",hr); default_trap("ID3D11DeviceContextX",self->device->legacy ? 50 : 51); }
 }
@@ -3116,9 +3191,15 @@ HRESULT refresh_graphics_bindings(Context* self) {
     return S_OK;
 }
 HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) {
-    if(self->deferred) return DXGI_ERROR_UNSUPPORTED;
     const HRESULT refreshed=refresh_graphics_bindings(self);
     if(FAILED(refreshed)) return refreshed;
+    if(self->deferred) {
+        auto command=std::make_shared<RecordedCommand>();
+        command->kind=indexed ? RecordedCommand::draw_indexed : RecordedCommand::draw;
+        command->state=capture_draw_state(self);command->count=count;command->first=first;command->base=base;
+        self->recording.push_back(std::move(command));
+        return S_OK;
+    }
     UINT64 topology=0;std::memcpy(&topology,self->inline_state.data()+0x170-32,sizeof topology);
     const auto primitive = topology == 0x000009ffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST :
         topology == 0x00000dffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
@@ -3459,6 +3540,121 @@ void STDMETHODCALLTYPE context_clear_state(Context* self) {
     context_state<UINT8,0x1f8>(self,predicate_flags); context_state<UINT64,0x1f0>(self,0);
     context_state<UINT64,0x218>(self,context_state<UINT64,0x218>(self)|0x4c000020ull);
 }
+HRESULT STDMETHODCALLTYPE command_list_query(CommandList* self,REFIID iid,void** out) {
+    return query(self,iid,out,{iid_unknown,iid_graphics_unknown,iid_device_child,__uuidof(ID3D11CommandList)});
+}
+ULONG STDMETHODCALLTYPE command_list_add_ref(CommandList* self) { return add_ref(self); }
+ULONG STDMETHODCALLTYPE command_list_release(CommandList* self) {
+    const ULONG left=InterlockedDecrement(counter(self));
+    if(!left) {
+        auto* device=self->device;
+        delete self; // Retire retained resources before releasing device storage.
+        release_device(device);
+    }
+    return left;
+}
+void STDMETHODCALLTYPE command_list_get_device(CommandList* self,void** out) {
+    if(out) {add_ref(self->device);*out=self->device;}
+}
+UINT STDMETHODCALLTYPE command_list_get_flags(CommandList* self) { return self->context_flags; }
+const std::array<const void*,vtable_slots>& command_list_vtable() {
+    static const auto table=[] {
+        auto t=traps<kind_command_list>();
+        t[0]=reinterpret_cast<const void*>(&command_list_query);
+        t[1]=reinterpret_cast<const void*>(&command_list_add_ref);
+        t[2]=reinterpret_cast<const void*>(&command_list_release);
+        t[3]=reinterpret_cast<const void*>(&command_list_get_device);
+        t[8]=reinterpret_cast<const void*>(&command_list_get_flags); // 11295 18004aef0.
+        return t;
+    }();
+    return table;
+}
+HRESULT STDMETHODCALLTYPE context_finish_list(Context* self,BOOL,void** out) {
+    if(!self->deferred) return E_NOTIMPL; // 11295 immediate slot 114, 180001580; output is untouched.
+    if(out) *out=nullptr;
+    if(FAILED(self->recording_error)) return self->recording_error;
+    auto list=std::unique_ptr<CommandList>(new(std::nothrow) CommandList);
+    if(!list) return E_OUTOFMEMORY;
+    list->vtable=command_list_vtable().data();list->flags=1;list->refcount=0;
+    list->device=self->device;list->context_flags=self->creation_flags;
+    list->commands.swap(self->recording);
+    list->references.swap(self->recorded_references);
+    // 11295 18004acb0 ignores RestoreDeferredContextState; 180046940 starts fresh.
+    context_clear_state(self);
+    if(self->creation_flags&0x20000) { // Draw Bundles additionally discard the inline layout cache.
+        clear_context_bindings(self);
+        std::memset(self->inline_state.data()+0x168-32,0,0x88);
+        context_state<UINT,0x168>(self,0x3fffc0|0x30000);
+        context_state<UINT,0x198>(self,UINT_MAX);
+    }
+    if(graphics_diagnostics.load()) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<8) std::fprintf(stderr,"xone-era: FinishCommandList commands=%zu flags=0x%X\n",list->commands.size(),list->context_flags);
+    }
+    if(out) {retain_device(self->device);*out=list.release();}
+    return S_OK;
+}
+void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL) {
+    struct Prefix {const void* table;ULONG flags,refs;Device* device;} prefix{};
+    SIZE_T read=0;
+    if(!list || !ReadProcessMemory(GetCurrentProcess(),list,&prefix,sizeof prefix,&read) || read!=sizeof prefix ||
+        prefix.table!=command_list_vtable().data() || prefix.device!=self->device) {
+        (void)trap_slot<kind_context,58>(self,reinterpret_cast<std::uintptr_t>(list));return;
+    }
+    if(self->deferred) {
+        try {
+            self->recording.insert(self->recording.end(),list->commands.begin(),list->commands.end());
+            self->recorded_references.insert(self->recorded_references.end(),list->references.begin(),list->references.end());
+        }
+        catch(const std::bad_alloc&) {self->recording_error=E_OUTOFMEMORY;default_trap("command list recording",58);}
+        return;
+    }
+    std::lock_guard lock(self->device->list_execution);
+    for(SIZE_T i=0;i<list->commands.size();++i) {
+        auto& command=*list->commands[i];
+        HRESULT hr=E_OUTOFMEMORY;
+        try {
+            if(command.kind==RecordedCommand::draw || command.kind==RecordedCommand::draw_indexed) {
+                // Reuse the immediate submission objects; every operation retires before reuse.
+                struct Submission {
+                    Context* immediate;Context* recorded;
+                    void swap() {
+                        immediate->command_allocator.Swap(recorded->command_allocator);
+                        immediate->command_list.Swap(recorded->command_list);
+                        immediate->submission_fence.Swap(recorded->submission_fence);
+                        std::swap(immediate->submission_value,recorded->submission_value);
+                        std::swap(immediate->completed_draws,recorded->completed_draws);
+                    }
+                    Submission(Context* a,Context* b):immediate(a),recorded(b) {swap();}
+                    ~Submission() {swap();}
+                } submission(self,command.state.get());
+                hr=execute_draw(command.state.get(),command.count,command.first,command.base,command.kind==RecordedCommand::draw_indexed);
+            } else hr=clear_view(self,command.view,command.kind==RecordedCommand::clear_color ? command.color.data() : nullptr,command.depth);
+        } catch(const std::bad_alloc&) {}
+        if(FAILED(hr)) {
+            std::fprintf(stderr,"xone-era: ExecuteCommandList command=%zu kind=%u failed 0x%08lX\n",i,command.kind,hr);
+            default_trap("command list submission",58);return;
+        }
+    }
+    // 18000b510 ignores RestoreContextState: normal lists call 1800466e0(...,0),
+    // clearing tracked state; Draw Bundles preserve bindings and invalidate GPU caches.
+    if(!(list->context_flags&0x20000)) context_clear_state(self);
+    context_state<UINT,0x168>(self,context_state<UINT,0x168>(self)|0x3f7fc0);
+    context_state<UINT,0x198>(self,UINT_MAX);
+    context_state<UINT8,0x1f8>(self,context_state<UINT8,0x1f8>(self)|1);
+    if(graphics_diagnostics.load()) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<8) std::fprintf(stderr,"xone-era: ExecuteCommandList commands=%zu flags=0x%X completed after fences\n",list->commands.size(),list->context_flags);
+    }
+}
+void STDMETHODCALLTYPE context_flush(Context* self) {
+    if(self->deferred) return; // Original deferred slot 111, 180001810, is RET.
+    // 18000d080 submits without a CPU wait. Draws/clears already submit through this queue.
+    HRESULT hr=S_OK;
+    if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
+    if(SUCCEEDED(hr)) hr=self->device->queue->Signal(self->submission_fence.Get(),++self->submission_value);
+    if(FAILED(hr)) default_trap("graphics flush submission",111);
+}
 HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
         D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* out) {
     if (!out) return E_INVALIDARG;
@@ -3583,6 +3779,9 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[112] = reinterpret_cast<const void*>(&context_get_type);
         t[113] = reinterpret_cast<const void*>(&context_get_flags);
         t[110] = reinterpret_cast<const void*>(&context_clear_state);
+        t[111] = reinterpret_cast<const void*>(&context_flush);
+        t[114] = reinterpret_cast<const void*>(&context_finish_list); // 11295 18000ff00 -> 18004acb0.
+        t[58] = reinterpret_cast<const void*>(&context_execute_list); // 11295 1800154e0.
         t[196] = reinterpret_cast<const void*>(&context_automatic_gpu_flush);
         t[209] = reinterpret_cast<const void*>(&context_fast_resources); // 11295 180019f00.
         t[25] = reinterpret_cast<const void*>(&context_resources<0,25>); // 11295 180010860 -> 18001f6a0.
@@ -3591,8 +3790,10 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[23] = reinterpret_cast<const void*>(&context_constants<2,23>); // 11295 180011350, GS constant buffers.
         t[71] = reinterpret_cast<const void*>(&context_constants<3,71>); // 11295 180011ef0, CS constant buffers.
         t[19] = reinterpret_cast<const void*>(&legacy_context_vertices); // 11295 180010580 -> 18001ee50.
+        t[20] = reinterpret_cast<const void*>(&context_indices); // 11295 1800107a0, format/buffer/offset.
         t[11] = reinterpret_cast<const void*>(&context_pixel_samplers); // 11295 180009230 -> 18001b900.
         t[14] = reinterpret_cast<const void*>(&legacy_context_draw); // 11295 180009480, Draw(vertex count, first vertex).
+        t[13] = reinterpret_cast<const void*>(&context_draw_indexed); // 11295 180009350, packed start/count and base vertex.
         return t;
     }();
     return table;

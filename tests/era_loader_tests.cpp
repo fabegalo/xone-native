@@ -4,6 +4,7 @@
 #include "../src/era_winrt_classes.h"
 #include "../src/era_winrt_object.h"
 #include "../src/era_memory.h"
+#include "../src/era_display.h"
 #include "xboxone_native/appmodel.h"
 #include "xboxone_native/inventory.h"
 
@@ -15,6 +16,7 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cmath>
+#include <limits>
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -3275,6 +3277,10 @@ int main(int argc, char** argv) {
               "host class forwarded to Windows");
         void* missing = &missing;
         {
+            const auto previous_input_root = title_storage_root();
+            wchar_t input_temp[MAX_PATH]{}; GetTempPathW(MAX_PATH, input_temp);
+            const auto input_root = std::filesystem::path(input_temp) / (L"xone-input-profile-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+            set_title_storage_root(input_root.wstring());
             constexpr GUID controller_statics{0x7400624f,0x144b,0x47fc,{0x9f,0x3b,0x1d,0xca,0xfb,0x48,0x28,0x73}};
             constexpr GUID gamepad_statics{0x8c4c1bcd,0xfdab,0x4bf8,{0xbd,0xe9,0xab,0xb2,0xb1,0xd6,0xfd,0xd3}};
             IInspectable* input = nullptr;
@@ -3301,11 +3307,79 @@ int main(int argc, char** argv) {
                         check(item->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&identity)) == S_OK && identity == item,
                             "controller COM identity is preserved");
                         if (identity) identity->Release();
+                        using GetUser = HRESULT(STDMETHODCALLTYPE*)(void*, IInspectable**);
+                        const auto get_user = reinterpret_cast<GetUser>((*reinterpret_cast<void***>(item))[8]);
+                        IInspectable* paired = nullptr; IInspectable* selected = nullptr;
+                        check(get_user(item, nullptr) == E_POINTER, "Controller.User validates its output");
+                        check(get_user(item, &paired) == S_OK && paired && title_local_user(reinterpret_cast<void**>(&selected)) == S_OK && paired == selected,
+                            "physical controller retains the same local profile identity as users and saves");
+                        if (paired) {
+                            UINT id = 0; GUID profile{}; std::uint32_t expected = 0;
+                            const auto user_id = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, UINT*)>((*reinterpret_cast<void***>(paired))[6]);
+                            check(title_local_user_identity(&profile, &expected) == S_OK && user_id(paired, &id) == S_OK && id == expected,
+                                "Controller.User exposes the persisted local user ID without an online identity");
+                            stop_title_input();
+                            IInspectable* retained_user = nullptr;
+                            check(user_id(paired, &id) == S_OK && id == expected && get_user(item, &retained_user) == S_OK && retained_user == paired,
+                                "retained controller and user snapshots survive input registry teardown");
+                            if (retained_user) retained_user->Release();
+                            paired->Release();
+                        }
+                        if (selected) selected->Release();
                         constexpr GUID gamepad_iid{0x082e402c,0x07df,0x45e1,{0xa5,0xab,0xa3,0x12,0x7a,0xf1,0x97,0xb5}};
                         IUnknown* gamepad=nullptr;
                         check(item->QueryInterface(gamepad_iid,reinterpret_cast<void**>(&gamepad))==S_OK && gamepad,
                             "host controller shares its gamepad identity");
                         if (gamepad) {
+                            using Vibrate = HRESULT(STDMETHODCALLTYPE*)(void*, const std::array<float,4>*);
+                            const auto vibrate = reinterpret_cast<Vibrate>((*reinterpret_cast<void***>(gamepad))[6]);
+                            std::array<float,4> vibration{};
+                            check(vibrate(gamepad,nullptr) == E_INVALIDARG && vibrate(gamepad,reinterpret_cast<const std::array<float,4>*>(1)) == E_INVALIDARG,
+                                  "vibration validates its four-float x64 ABI input");
+                            const HRESULT stopped = vibrate(gamepad,&vibration);
+                            check(stopped == S_OK || stopped == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED), "zero vibration reaches the real XInput device");
+                            for (float invalid : {-1.f, 1.01f, std::numeric_limits<float>::infinity(), std::numeric_limits<float>::quiet_NaN()}) {
+                                vibration[0] = invalid;
+                                check(vibrate(gamepad,&vibration) == E_INVALIDARG, "invalid motor levels cannot reach the physical controller");
+                            }
+                            vibration = {0,0,1,0};
+                            check(vibrate(gamepad,&vibration) == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), "trigger motors remain explicit when the host transport cannot execute them");
+                            using ReadObject = HRESULT(STDMETHODCALLTYPE*)(void*, IInspectable**);
+                            const auto current_reading = reinterpret_cast<ReadObject>((*reinterpret_cast<void***>(gamepad))[7]);
+                            IInspectable* snapshot = nullptr;
+                            FILETIME before_time{}, after_time{}; GetSystemTimePreciseAsFileTime(&before_time);
+                            check(current_reading(gamepad, nullptr) == E_POINTER, "Gamepad.GetCurrentReading validates its output");
+                            const HRESULT snapshot_hr = current_reading(gamepad, &snapshot);
+                            GetSystemTimePreciseAsFileTime(&after_time);
+                            check(snapshot_hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) || (snapshot_hr == S_OK && snapshot),
+                                "connected physical gamepad returns a real reading snapshot or its disconnection error");
+                            if (snapshot) {
+                                auto** reading_table = *reinterpret_cast<void***>(snapshot);
+                                UINT64 timestamp = 0; UINT buttons = 0;
+                                check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT64*)>(reading_table[6])(snapshot,&timestamp) == S_OK &&
+                                      timestamp >= ((UINT64(before_time.dwHighDateTime)<<32)|before_time.dwLowDateTime) &&
+                                      timestamp <= ((UINT64(after_time.dwHighDateTime)<<32)|after_time.dwLowDateTime), "reading DateTime uses the actual UTC FILETIME clock");
+                                check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT*)>(reading_table[7])(snapshot,&buttons) == S_OK,
+                                      "reading snapshot exposes its captured buttons");
+                                const UINT masks[]{0x100,0x200,0x400,0x800,4,8,0x4000,0x8000,0x1000,0x2000,0x10,0x20,0x40,0x80};
+                                for (UINT i = 0; i < std::size(masks); ++i) {
+                                    struct { boolean value = false; BYTE guard = 0xa5; } pressed;
+                                    const auto get = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>(reading_table[8+i]);
+                                    check(get(snapshot,nullptr) == E_POINTER && get(snapshot,&pressed.value) == S_OK && bool(pressed.value) == bool(buttons & masks[i]) && pressed.guard == 0xa5,
+                                          "reading button getter matches the same snapshot and preserves its one-byte ABI");
+                                }
+                                for (UINT i = 0; i < 6; ++i) {
+                                    float value = 9, repeated = 10;
+                                    const auto get = reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,float*)>(reading_table[22+i]);
+                                    check(get(snapshot,nullptr) == E_POINTER && get(snapshot,&value) == S_OK && get(snapshot,&repeated) == S_OK &&
+                                          value == repeated && value >= (i < 2 ? 0.f : -1.f) && value <= 1.f, "reading axes preserve normalized immutable values");
+                                }
+                                IUnknown* canonical = nullptr;
+                                check(snapshot->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&canonical)) == S_OK && canonical == snapshot,
+                                      "reading snapshot retains canonical COM identity");
+                                if (canonical) canonical->Release();
+                                snapshot->Release();
+                            }
                             using Read=HRESULT(STDMETHODCALLTYPE*)(void*,RawGamepadReading*);
                             const auto read=reinterpret_cast<Read>((*reinterpret_cast<void***>(gamepad))[8]);
                             struct { RawGamepadReading value; UINT64 guard=0x1122334455667788ull; } sample{};
@@ -3364,6 +3438,9 @@ int main(int argc, char** argv) {
             check(activate(L"Windows.Xbox.Input.Gamepad",gamepad_statics,reinterpret_cast<void**>(&pads)) == S_OK && pads,
                 "Gamepad statics use the same host-backed controller registry");
             if (pads) pads->Release();
+            stop_title_input();
+            set_title_storage_root(previous_input_root);
+            std::filesystem::remove_all(input_root);
         }
         check(activate(L"Windows.Xbox.Input.BodyController", __uuidof(IActivationFactory), &missing) == REGDB_E_CLASSNOTREG && !missing,
               "unimplemented Xbox class keeps the real host error");

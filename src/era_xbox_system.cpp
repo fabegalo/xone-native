@@ -307,5 +307,13 @@ HRESULT title_local_user_identity(GUID* identity,std::uint32_t* local_id) try {
     const HRESULT hr=acquire_user(&user);if (FAILED(hr)) return hr;
     *identity=user->profile.identity;*local_id=user->profile.local_id;release(user);return S_OK;
 } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+HRESULT title_local_user(void** out) try {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    LocalUser* user = nullptr;
+    const HRESULT hr = acquire_user(&user);
+    if (SUCCEEDED(hr)) *out = user;
+    return hr;
+} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 
 } // namespace xboxone::era

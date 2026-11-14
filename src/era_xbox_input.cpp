@@ -8,6 +8,7 @@
 #include <memory>
 #include <new>
 #include <cstdio>
+#include <cmath>
 
 namespace xboxone::era {
 namespace {
@@ -29,6 +30,7 @@ std::array<bool, XUSER_MAX_COUNT> connected{};
 struct HostInput {
     HMODULE module = LoadLibraryExW(L"xinput1_4.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     decltype(&XInputGetState) get = module ? reinterpret_cast<decltype(get)>(GetProcAddress(module, "XInputGetState")) : nullptr;
+    decltype(&XInputSetState) set = module ? reinterpret_cast<decltype(set)>(GetProcAddress(module, "XInputSetState")) : nullptr;
     ~HostInput() { if (module) FreeLibrary(module); }
 };
 HostInput& host() { static HostInput input; return input; }
@@ -46,7 +48,19 @@ template<class T> HRESULT STDMETHODCALLTYPE dynamic_query(T* self, REFIID iid, v
 }
 struct Controller;
 struct Gamepad : WinrtObject { Controller* owner = nullptr; };
-struct Controller : WinrtObject { std::atomic<ULONG> refs{1}; DWORD index = 0; Gamepad gamepad; };
+struct Controller : WinrtObject {
+    std::atomic<ULONG> refs{1}; DWORD index = 0; Gamepad gamepad;
+    IInspectable* user = nullptr;
+    bool vibrating = false;
+    void stop_vibration() {
+        if (vibrating && host().set) {
+            XINPUT_VIBRATION off{}; const DWORD error = host().set(index, &off);
+            if (!error || error == ERROR_DEVICE_NOT_CONNECTED) vibrating = false;
+            else std::fprintf(stderr, "xone-era: controller %lu vibration teardown failed Win32 %lu\n", index, error);
+        }
+    }
+    ~Controller() { stop_vibration(); if (user) user->Release(); }
+};
 std::array<Controller*, XUSER_MAX_COUNT> controller_objects{};
 HRESULT controller_query(WinrtObject* self, REFIID iid, void** out) {
     if (iid == iid_gamepad) {
@@ -68,6 +82,27 @@ HRESULT STDMETHODCALLTYPE controller_id(Controller* self, UINT64* out) {
 HRESULT STDMETHODCALLTYPE controller_type(Controller*, HSTRING* out) {
     if (!out) return E_POINTER;
     return WindowsCreateString(L"Windows.Xbox.Input.Gamepad", 26, out);
+}
+HRESULT STDMETHODCALLTYPE controller_user(Controller* self, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = self->user;
+    self->user->AddRef();
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE gamepad_vibration(Gamepad* self, const std::array<float, 4>* input) {
+    std::array<float, 4> value{}; SIZE_T read = 0;
+    if (!input || !ReadProcessMemory(GetCurrentProcess(), input, value.data(), sizeof value, &read) || read != sizeof value)
+        return E_INVALIDARG;
+    for (float level : value) if (!std::isfinite(level) || level < 0 || level > 1) return E_INVALIDARG;
+    // XInput exposes two motors; never pretend that trigger-motor commands were executed.
+    if (value[2] || value[3]) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    if (!host().set) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+    XINPUT_VIBRATION vibration{WORD(std::lround(value[0] * 65535.f)), WORD(std::lround(value[1] * 65535.f))};
+    std::lock_guard lock(input_mutex);
+    const DWORD error = host().set(self->owner->index, &vibration);
+    if (error) return HRESULT_FROM_WIN32(error);
+    self->owner->vibrating = vibration.wLeftMotorSpeed || vibration.wRightMotorSpeed;
+    return S_OK;
 }
 HRESULT STDMETHODCALLTYPE raw_gamepad_reading(Gamepad* self,RawGamepadReading* out) {
     if (!out) return E_POINTER;
@@ -93,29 +128,90 @@ HRESULT STDMETHODCALLTYPE raw_gamepad_reading(Gamepad* self,RawGamepadReading* o
     *out=value;
     return S_OK;
 }
-Controller* make_controller(DWORD index) {
+struct GamepadReading : WinrtObject {
+    std::atomic<ULONG> refs{1};
+    RawGamepadReading value{};
+    UINT64 timestamp = 0; // Foundation.DateTime: UTC FILETIME units, unlike the raw monotonic timestamp.
+};
+HRESULT reading_query(WinrtObject* self, REFIID iid, void** out) {
+    if (iid != __uuidof(IUnknown) && iid != __uuidof(IInspectable)) return E_NOINTERFACE;
+    *out = self; retain(static_cast<GamepadReading*>(self)); return S_OK;
+}
+HRESULT STDMETHODCALLTYPE reading_iids(GamepadReading*, ULONG* count, IID** iids) {
+    if (!count || !iids) return E_POINTER;
+    *count = 0; *iids = nullptr; return S_OK; // Reference 14019a0a0; private reading IID remains unaudited.
+}
+HRESULT STDMETHODCALLTYPE reading_time(GamepadReading* self, UINT64* out) {
+    if (!out) return E_POINTER; *out = self->timestamp; return S_OK;
+}
+HRESULT STDMETHODCALLTYPE reading_buttons(GamepadReading* self, UINT* out) {
+    if (!out) return E_POINTER; *out = self->value.buttons; return S_OK;
+}
+template<UINT Mask> HRESULT STDMETHODCALLTYPE reading_button(GamepadReading* self, boolean* out) {
+    if (!out) return E_POINTER; *out = (self->value.buttons & Mask) != 0; return S_OK;
+}
+template<float RawGamepadReading::*Member> HRESULT STDMETHODCALLTYPE reading_axis(GamepadReading* self, float* out) {
+    if (!out) return E_POINTER; *out = self->value.*Member; return S_OK;
+}
+HRESULT STDMETHODCALLTYPE gamepad_reading(Gamepad* self, GamepadReading** out) try {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    auto reading = std::make_unique<GamepadReading>();
+    const HRESULT hr = raw_gamepad_reading(self, &reading->value);
+    if (FAILED(hr)) return hr;
+    FILETIME time{}; GetSystemTimePreciseAsFileTime(&time);
+    reading->timestamp = (UINT64(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+    static const auto table = [] {
+        auto t = winrt_vtable();
+        t[0] = reinterpret_cast<const void*>(&dynamic_query<GamepadReading>);
+        t[1] = reinterpret_cast<const void*>(&retain<GamepadReading>); t[2] = reinterpret_cast<const void*>(&release<GamepadReading>);
+        t[3] = reinterpret_cast<const void*>(&reading_iids);
+        t[6] = reinterpret_cast<const void*>(&reading_time); t[7] = reinterpret_cast<const void*>(&reading_buttons);
+        t[8] = reinterpret_cast<const void*>(&reading_button<0x100>); t[9] = reinterpret_cast<const void*>(&reading_button<0x200>);
+        t[10] = reinterpret_cast<const void*>(&reading_button<0x400>); t[11] = reinterpret_cast<const void*>(&reading_button<0x800>);
+        t[12] = reinterpret_cast<const void*>(&reading_button<0x4>); t[13] = reinterpret_cast<const void*>(&reading_button<0x8>);
+        t[14] = reinterpret_cast<const void*>(&reading_button<0x4000>); t[15] = reinterpret_cast<const void*>(&reading_button<0x8000>);
+        t[16] = reinterpret_cast<const void*>(&reading_button<0x1000>); t[17] = reinterpret_cast<const void*>(&reading_button<0x2000>);
+        t[18] = reinterpret_cast<const void*>(&reading_button<0x10>); t[19] = reinterpret_cast<const void*>(&reading_button<0x20>);
+        t[20] = reinterpret_cast<const void*>(&reading_button<0x40>); t[21] = reinterpret_cast<const void*>(&reading_button<0x80>);
+        t[22] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::left_trigger>);
+        t[23] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::right_trigger>);
+        t[24] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::left_x>);
+        t[25] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::left_y>);
+        t[26] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::right_x>);
+        t[27] = reinterpret_cast<const void*>(&reading_axis<&RawGamepadReading::right_y>);
+        return t;
+    }();
+    static_cast<WinrtObject&>(*reading) = {table.data(), L"Windows.Xbox.Input.GamepadReading", __uuidof(IInspectable), &reading_query};
+    *out = reading.release(); return S_OK;
+} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+HRESULT make_controller(DWORD index, Controller** out) {
     static const auto table = [] {
         auto t = winrt_vtable();
         t[0] = reinterpret_cast<const void*>(&dynamic_query<Controller>);
         t[1] = reinterpret_cast<const void*>(&retain<Controller>); t[2] = reinterpret_cast<const void*>(&release<Controller>);
         t[6] = reinterpret_cast<const void*>(&controller_id); t[7] = reinterpret_cast<const void*>(&controller_type);
+        t[8] = reinterpret_cast<const void*>(&controller_user); // IController.User, shared local session profile.
         return t;
     }();
-    auto* object = new (std::nothrow) Controller;
-    if (object) {
-        static_cast<WinrtObject&>(*object) = {table.data(), controller_class, iid_controller, &controller_query};
-        object->index = index;
-        static const auto pad_table = [] {
-            auto t = winrt_vtable();
-            t[0] = reinterpret_cast<const void*>(&dynamic_query<Gamepad>);
-            t[1] = reinterpret_cast<const void*>(&gamepad_retain); t[2] = reinterpret_cast<const void*>(&gamepad_release);
-            t[8] = reinterpret_cast<const void*>(&raw_gamepad_reading); // Reference 14019a690 copies exactly 40 bytes.
-            return t;
-        }();
-        static_cast<WinrtObject&>(object->gamepad) = {pad_table.data(), gamepad_class, iid_gamepad, &gamepad_query};
-        object->gamepad.owner = object;
-    }
-    return object;
+    auto object = std::make_unique<Controller>();
+    const HRESULT hr = title_local_user(reinterpret_cast<void**>(&object->user));
+    if (FAILED(hr)) return hr;
+    static_cast<WinrtObject&>(*object) = {table.data(), controller_class, iid_controller, &controller_query};
+    object->index = index;
+    static const auto pad_table = [] {
+        auto t = winrt_vtable();
+        t[0] = reinterpret_cast<const void*>(&dynamic_query<Gamepad>);
+        t[1] = reinterpret_cast<const void*>(&gamepad_retain); t[2] = reinterpret_cast<const void*>(&gamepad_release);
+        t[6] = reinterpret_cast<const void*>(&gamepad_vibration); // Reference 14019a500: four floats, by address on x64.
+        t[7] = reinterpret_cast<const void*>(&gamepad_reading); // Reference 14019a5c0 returns an immutable reading object.
+        t[8] = reinterpret_cast<const void*>(&raw_gamepad_reading); // Reference 14019a690 copies exactly 40 bytes.
+        return t;
+    }();
+    static_cast<WinrtObject&>(object->gamepad) = {pad_table.data(), gamepad_class, iid_gamepad, &gamepad_query};
+    object->gamepad.owner = object.get();
+    *out = object.release();
+    return S_OK;
 }
 
 struct ControllerView : WinrtObject {
@@ -180,8 +276,7 @@ HRESULT STDMETHODCALLTYPE controllers(WinrtObject* self, void** out) try {
         if (error == ERROR_DEVICE_NOT_CONNECTED) continue;
         if (error) return HRESULT_FROM_WIN32(error);
         auto*& controller = controller_objects[index];
-        if (!controller) controller = make_controller(index);
-        if (!controller) return E_OUTOFMEMORY;
+        if (!controller) { const HRESULT hr = make_controller(index, &controller); if (FAILED(hr)) return hr; }
         auto* item = reinterpret_cast<IUnknown*>(pads ? static_cast<WinrtObject*>(&controller->gamepad) : static_cast<WinrtObject*>(controller));
         view->items.push_back(item); item->AddRef();
     }
@@ -284,8 +379,8 @@ HRESULT poll_title_input() try {
             if (error && error != ERROR_DEVICE_NOT_CONNECTED) return HRESULT_FROM_WIN32(error);
             current[index] = error == ERROR_SUCCESS;
             if (initialized && current[index] != connected[index]) {
-                if (!controller_objects[index]) controller_objects[index] = make_controller(index);
-                if (!(changed[index] = controller_objects[index])) return E_OUTOFMEMORY;
+                if (!controller_objects[index]) { const HRESULT hr = make_controller(index, &controller_objects[index]); if (FAILED(hr)) return hr; }
+                changed[index] = controller_objects[index];
             }
         }
         connected = current; initialized = true;
@@ -312,6 +407,9 @@ void stop_title_input() {
     if (input_timer && event_thread == GetCurrentThreadId()) KillTimer(nullptr,input_timer);
     input_timer = 0; event_thread = 0; initialized = false;
     added.clear(); removed.clear(); gamepad_added.clear(); gamepad_removed.clear(); pairing_changed.clear();
+    std::lock_guard lock(input_mutex);
+    for (auto*& controller : controller_objects) { if (controller) { controller->stop_vibration(); release(controller); } controller = nullptr; }
+    connected = {};
 }
 
 HRESULT xbox_controller_factory(REFIID iid, void** out) {

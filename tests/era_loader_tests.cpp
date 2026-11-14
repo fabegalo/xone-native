@@ -96,9 +96,11 @@ int main(int argc, char** argv) {
         std::cout<<"package metadata HRESULT 0x"<<std::hex<<static_cast<UINT>(hr)<<" name "<<manifest.name<<" revision "<<revision<<'\n';
         return FAILED(hr) ? 1 : 0;
     }
-    if (argc == 4 && (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa" || std::string(argv[1]) == "--xg-depth")) {
+    if ((argc == 4 || (argc == 5 && std::string(argv[4]) == "--warp")) &&
+        (std::string(argv[1]) == "--xg-layout" || std::string(argv[1]) == "--xg-graphics" || std::string(argv[1]) == "--xg-msaa" || std::string(argv[1]) == "--xg-depth")) {
         const bool graphics = std::string(argv[1]) == "--xg-graphics";
         set_stop_on_missing_activation(true);
+        set_graphics_diagnostics(false, argc == 5);
         HRESULT hr = bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
         if (SUCCEEDED(hr)) hr = bind_xg_module(std::filesystem::path(argv[3]).wstring());
         if (SUCCEEDED(hr)) hr = initialize_xg_module();
@@ -1153,15 +1155,16 @@ int main(int argc, char** argv) {
                                     "float4 main(uint id:SV_VertexID):SV_Position {float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),0,1);}",
                                     "float4 main():SV_Target{return float4(.25,0,0,1);}",
                                     "float4 main():SV_Target{return float4(.75,0,0,1);}",
-                                    "float4 main(float2 p:POSITION,float2 u:TEXCOORD0):SV_Position{return float4(p+u,0,1);}"};
-                                void* shaders[4]{};void* empty_layout=nullptr;void* vertex_layout=nullptr;void* vertex_buffer=nullptr;bool ready=compile!=nullptr;
+                                    "float4 main(float2 p:POSITION,float2 u:TEXCOORD0):SV_Position{return float4(p+u,0,1);}",
+                                    "float4 main(float2 p:POSITION,uint id:SV_VertexID):SV_Position{return float4(float2(id&1,id>>1)*float2(2,-2)+float2(-1,1)+p,0,1);}"};
+                                void* shaders[5]{};void* empty_layout=nullptr;void* vertex_layout=nullptr;void* vertex_buffer=nullptr;bool ready=compile!=nullptr;
                                 using CreateShader=HRESULT(STDMETHODCALLTYPE*)(void*,const void*,SIZE_T,void*,void**);
-                                for(UINT i=0;i<4 && ready;++i) {
+                                for(UINT i=0;i<5 && ready;++i) {
                                     Microsoft::WRL::ComPtr<ID3DBlob> code;
-                                    const bool vertex=i==0 || i==3;
+                                    const bool vertex=i==0 || i==3 || i==4;
                                     ready=SUCCEEDED(compile(sources[i],std::strlen(sources[i]),nullptr,nullptr,nullptr,"main",vertex ? "vs_5_0" : "ps_5_0",0,0,&code,nullptr));
                                     if(ready) ready=reinterpret_cast<CreateShader>(vt(device)[vertex ? 12 : 15])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shaders[i])==S_OK;
-                                    if(ready && vertex) {
+                                    if(ready && vertex && i != 4) {
                                         using CreateLayout=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_INPUT_ELEMENT_DESC*,UINT,const void*,SIZE_T,void**);
                                         const D3D12_INPUT_ELEMENT_DESC elements[]{{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0},
                                             {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,D3D12_APPEND_ALIGNED_ELEMENT,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}};
@@ -1207,6 +1210,19 @@ int main(int argc, char** argv) {
                                     check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
                                         std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                         "non-indexed draw preserves first vertex, stride, appended input elements and inline layout changes");
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                    void* null_vertex = nullptr; const UINT zero = 0;
+                                    bind_vertices(context,0,1,&null_vertex,&zero,&zero);
+                                    std::memcpy(static_cast<char*>(context)+0x180,&shaders[4],sizeof(void*));
+                                    const UINT64 strip = 0x00000dffc0009e00ull;
+                                    std::memcpy(static_cast<char*>(context)+0x170,&strip,sizeof strip);
+                                    draw(context,4,0);
+                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
+                                        "four-vertex strip covers both triangles and null vertex input reads native zeroes after its fence");
+                                    std::memcpy(static_cast<char*>(context)+0x180,&shaders[3],sizeof(void*));
+                                    std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);
+                                    bind_vertices(context,0,1,&vertex_buffer,&stride,&offset);
                                     void* vertex_bytes=nullptr;std::memcpy(&vertex_bytes,static_cast<char*>(vertex_buffer)+48,sizeof vertex_bytes);
                                     check(vertex_bytes && !std::memcmp(vertex_bytes,vertices,sizeof vertices),"non-indexed draw preserves its canonical vertex bytes");
                                     const std::vector<unsigned char> before(static_cast<unsigned char*>(alias),static_cast<unsigned char*>(alias)+pixels.bytes);

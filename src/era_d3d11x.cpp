@@ -368,6 +368,14 @@ void diagnose_shader(std::uintptr_t address, SIZE_T bytes, bool instructions = f
 template <unsigned K, unsigned Slot>
 std::uintptr_t trap_slot(void* object, std::uintptr_t a = 0, std::uintptr_t b = 0, std::uintptr_t c = 0, std::uintptr_t d = 0) {
     if (auto handler = trap_handler.load()) return handler(kind_names[K], Slot);
+    if (graphics_diagnostics.load()) {
+        const auto caller = reinterpret_cast<ULONG_PTR>(_ReturnAddress());
+        MEMORY_BASIC_INFORMATION region{}; VirtualQuery(reinterpret_cast<void*>(caller), &region, sizeof region);
+        std::fprintf(stderr, "xone-era: graphics stop caller=%p allocation+0x%llX slot=%u\n", reinterpret_cast<void*>(caller),
+            caller - reinterpret_cast<ULONG_PTR>(region.AllocationBase), Slot);
+        if constexpr (K == kind_context && Slot == 114)
+            std::fprintf(stderr, "xone-era: FinishCommandList deferred=%u raw args 0x%llX 0x%llX\n", static_cast<Context*>(object)->deferred, UINT64(a), UINT64(b));
+    }
     if constexpr (K == kind_context && Slot == 14) {
         const auto* self=static_cast<Context*>(object);
         void* vertex=nullptr;void* pixel=nullptr;UINT64 topology=0;
@@ -3112,8 +3120,10 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     const HRESULT refreshed=refresh_graphics_bindings(self);
     if(FAILED(refreshed)) return refreshed;
     UINT64 topology=0;std::memcpy(&topology,self->inline_state.data()+0x170-32,sizeof topology);
+    const auto primitive = topology == 0x000009ffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST :
+        topology == 0x00000dffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     if((indexed && !self->index_buffer) ||
-        !self->render_targets[0] || !self->viewport_count || topology!=0x000009ffc0009e00ull) return DXGI_ERROR_UNSUPPORTED;
+        !self->render_targets[0] || !self->viewport_count || primitive == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED) return DXGI_ERROR_UNSUPPORTED;
     if(self->raster_state && self->raster_state->desc.ScissorEnable) return DXGI_ERROR_UNSUPPORTED;
     const UINT index_bytes=self->index_format==DXGI_FORMAT_R16_UINT ? 2 : 4;
     if(indexed && UINT64(first)+count>(self->index_buffer->desc.standard.ByteWidth-self->index_offset)/index_bytes) return E_INVALIDARG;
@@ -3160,6 +3170,8 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     pipeline.PS={self->shaders[0]->code.data(),self->shaders[0]->code.size()};
     if(self->input_layout) pipeline.InputLayout={self->input_layout->elements.data(),UINT(self->input_layout->elements.size())};
     pipeline.SampleMask=self->sample_mask;pipeline.SampleDesc={1,0};pipeline.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    if(indexed && primitive == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+        pipeline.IBStripCutValue = self->index_format == DXGI_FORMAT_R16_UINT ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     for(auto& target : pipeline.BlendState.RenderTarget) target={FALSE,FALSE,D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,
         D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,D3D12_LOGIC_OP_NOOP,D3D12_COLOR_WRITE_ENABLE_ALL};
     if(self->blend_state) pipeline.BlendState=self->blend_state->host;
@@ -3238,7 +3250,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         // Native IA bounds use the logical buffer extent, including its original layout/stride.
         vertices[i]={buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset+self->vertex_offsets[i],buffer->desc.standard.ByteWidth-self->vertex_offsets[i],self->vertex_strides[i]};
     }
-    if(self->input_layout) for(const auto& element : self->input_layout->elements) if(!self->vertex_buffers[element.InputSlot]) return DXGI_ERROR_UNSUPPORTED;
+    // Zero-size VBVs preserve native null bindings (DirectX Resource Binding spec, transparent descriptors).
     if (graphics_diagnostics.load() && self->completed_draws < 2) {
         std::fprintf(stderr,"xone-era: draw state indexed=%u count=%u first=%u mask=0x%X targets=%u layout=%zu cull=%u blend=%u write=0x%X depth=%u\n",
             indexed,count,first,pipeline.SampleMask,pipeline.NumRenderTargets,self->input_layout ? self->input_layout->elements.size() : 0,
@@ -3306,7 +3318,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     const D3D12_RECT scissor{0,0,LONG(extent.Width),LONG(extent.Height)};
     self->command_list->RSSetScissorRects(1,&scissor);
     self->command_list->OMSetBlendFactor(self->blend_factor.data());self->command_list->OMSetStencilRef(self->stencil_reference);
-    self->command_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    self->command_list->IASetPrimitiveTopology(primitive);
     self->command_list->IASetVertexBuffers(0,UINT(vertices.size()),vertices.data());self->command_list->IASetIndexBuffer(indexed ? &index : nullptr);
     if(indexed) self->command_list->DrawIndexedInstanced(count,1,first,base,0);
     else self->command_list->DrawInstanced(count,1,first,0);

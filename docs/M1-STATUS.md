@@ -2,6 +2,24 @@
 
 Data: **2026-11-04**. Estágio máximo demonstrado: um **componente sintético próprio** foi criado como processo Windows AMD64, executou código de memória/threads/imports e terminou com código 0. **Nenhum componente original do SystemOS foi carregado ou inicializado; zero frames autênticos.**
 
+## 2026-11-14 — busca além dos OSUs e validação de assets AppModel
+
+Pesquisa pública de XboxUI/shell/Guide, recoveries de desenvolvimento e dumps já extraídos, partindo de `35dec31`: **nenhum conjunto executável Xbox One com conteúdo, revisão e procedência verificáveis foi obtido**. Isso limita esta busca, não prova inexistência na internet. Não houve download de firmware/SDK, montagem, deployment ou execução de scripts externos.
+
+| Fonte | Resultado e limite para obter uma entrada |
+| --- | --- |
+| [Microsoft — recoveries de desenvolvimento](https://learn.microsoft.com/en-us/gaming/gdk/docs/gdk-dev/console-dev/dev-kits/settings/dev-kit-os) e [downloads](https://learn.microsoft.com/en-us/gaming/gdk/docs/gdk-dev/development-downloads/development-downloads-overview) | Canal oficial inclui recoveries, mas exige programa de desenvolvedor/NDA; não foi obtida imagem nem comprovada legibilidade dos componentes. |
+| [XboxSeries — pesquisa do autor](https://github.com/Coolaid003/XboxSeries) | Documenta XboxUI.exe, Guide.exe e Xbox.Shell.Api.dll em Series S, builds 26100.7010/8561; publica texto, não os binários. Não certifica contratos, assets ou compatibilidade de Xbox One. |
+| [XboxDevModeBatchScripts](https://github.com/xboxoneresearch/XboxDevModeBatchScripts/blob/main/dumpsystemos.bat) | Fonte pública copia arquivos dos volumes montados C/X/Y/S/J/M/N para diretório por versão. É uma rota de aquisição em console acessível, não um acervo disponível para download. Script não executado; não foi fornecido console. |
+| [QuantumTunnel](https://github.com/TitleOS/QuantumTunnel) | Dumper de flash que requer shell SYSTEM; o próprio autor informa que arquivos montados/em uso não podem ser lidos. Não fornece XboxUI/Guide prontos nem extrai automaticamente seu pacote legível. |
+| [xvdtool](https://github.com/emoose/xvdtool) | Ferramenta de formato, sem conjunto SystemOS; suporte a pacotes dev não comprova que uma recovery pública seja legível. Nenhuma chave extraída/usada. |
+
+A pista histórica 8422 apareceu como XDK pré-lançamento vazado nos resultados, não como conjunto XboxUI retail validado; não foi obtida ou usada. Catálogos de firmware e referências a dumps/processos também não substituem arquivos verificáveis. Próximo passo original continua sendo localizar um conjunto efetivamente legível com manifesto, EXE/DLLs e assets coerentes, antes de escolher contratos WinRT/composição ou propor isolamento por uma dependência concreta.
+
+Incremento independente `d10b66f`: `AppxManifest.xml` com `<Logo><![CDATA[absent.png]]></Logo>` era aceito por `prepare` sem aresta de recurso. O parser agora usa `IAppxManifestProperties::GetStringValue("Logo")` sobre o mesmo snapshot verificado, preservando texto dividido/CDATA antes das checagens existentes de caminho, hash, revisão e procedência. O novo teste falhou na base (quatro subcasos) e passou após a correção; cobre texto simples/CDATA/comentário, asset ausente, traversal e ADS. Nenhum contrato Xbox foi liberado.
+
+Windows x64/MSVC Release, build incremental reutilizada `build-checked`: oito grupos focados passaram (`appmodel_path_contracts`, `bootstrap_regressions`, `pe_dependency_regressions`, `appmodel_activation_failure`, `appmodel_process_observation`, `appmodel_manifest_regressions`, `bootstrap_native_execution`, `bootstrap_cli_regressions`). A primeira rodada teve quatro falhas por EXEs de fixtures/inspetor ainda ausentes; após compilar esses alvos, os quatro grupos passaram. Um teste de symlink AppModel permanece ignorado por privilégio local. São fixtures próprias, incluindo memória/threads e falhas reais de registro/ativação; **zero execução XboxUI e zero frames autênticos**. Sem nova build raiz, captura ou arquivo de evidência dedicado; temporários de teste removidos pelos próprios testes, produtos incrementais reutilizados e logs pequenos mantidos no diretório existente. Linux/macOS/ARM64, pacote positivo, composição e integração ERA/SystemOS não validados.
+
 ## 2026-11-14 — XVDs locais e AppModel em VM GitHub descartável
 
 Leitura de 0x400 bytes dos 62 XVDs em `build-osu` (OSU1 46, OSU2 8, OSU3 8): todos `msft-xvd`, tipo 1, flags `0x1`/`0x9`, **sem `EncryptionDisabled` (0x2) em nenhum**. Content types: `system.xvd` 0x2, `uERA.xvd` 0x3, `host`/`ScarlettHost` 0x7, firmware/updater 0xc, templates/sosinit 0xd, `systemtools` 0x13, `systemaux*`/idiomas 0x14. Não existe componente original legível localmente; `0x80070570` não foi repetido. O Device Portal oficial expõe pastas de app/desenvolvedor, não volumes SystemOS.

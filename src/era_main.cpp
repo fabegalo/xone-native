@@ -200,7 +200,10 @@ int wmain(int argc, wchar_t** argv) {
     const std::filesystem::path title = std::filesystem::absolute(argv[2]);
     const HRESULT acp_binding = xboxone::era::bind_acp_module((title.parent_path().parent_path() /
         L"EmbeddedXvd/Windows/System32/AcpHal.dll").wstring());
-    if (FAILED(acp_binding) && acp_binding != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
+    // An unverified revision stays unbound: its AcpHal imports remain unresolved.
+    if (acp_binding == HRESULT_FROM_WIN32(ERROR_CRC))
+        std::fprintf(stderr, "xone-era: unverified AcpHal revision left unbound\n");
+    else if (FAILED(acp_binding) && acp_binding != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) &&
         acp_binding != HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND)) {
         std::cerr << "ACP ABI binding failed: " << std::hex << acp_binding << '\n';
         return 1;

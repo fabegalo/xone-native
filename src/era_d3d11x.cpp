@@ -4579,7 +4579,12 @@ struct XgTextureContext {
     void* computer = nullptr;
     UINT width = 0, height = 0, mips = 0, arrays = 0, block = 0, bytes_per_block = 0, samples = 1;
     SIZE_T bytes = 0;
-    bool modern = false;
+    bool modern = false, volume = false;
+    // Per-subresource byte offsets from the original texel-address getter,
+    // verified once against the original copy; empty means use XG copy.
+    std::mutex offsets_mutex;
+    std::vector<std::vector<UINT32>> offsets;
+    std::vector<unsigned char> offsets_state; // 0 unseen, 1 seen once, 2 verified, 3 refused
     struct Plane { UINT64 offset = 0, bytes = 0; } htile, depth, stencil;
     std::array<void*,2> typed_computers{};
     ~XgTextureContext() {
@@ -4650,6 +4655,66 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
     using Copy = HRESULT (*)(void*, void*, UINT, UINT, const void*, UINT, UINT);
     const auto functions = *static_cast<void***>(context->computer);
     const auto copy = reinterpret_cast<Copy>(functions[context->modern ? (into_tiled ? 8 : 9) : (into_tiled ? 5 : 6)]);
+    // Repeated copies (render targets refreshed every submission) use the same
+    // XG mapping memoized per texel; one-shot uploads keep the original copy.
+    const std::vector<UINT32>* table = nullptr;
+    if (context->block == 1 && !context->volume && context->bytes <= UINT32_MAX) {
+        std::lock_guard lock(context->offsets_mutex);
+        try {
+            if (context->offsets_state.empty()) {
+                context->offsets_state.assign(SIZE_T(context->mips) * context->arrays, 0);
+                context->offsets.resize(context->offsets_state.size());
+            }
+            auto& state = context->offsets_state[subresource];
+            if (state == 1) {
+                // Second use: derive offsets, then prove them against the original copy.
+                using Address = UINT64 (*)(void*, UINT, UINT, UINT64, UINT, UINT, UINT);
+                const auto address = reinterpret_cast<Address>(functions[context->modern ? 6 : 4]);
+                const UINT element = context->bytes_per_block;
+                std::vector<UINT32> offsets(SIZE_T(width) * height);
+                bool valid = true;
+                for (UINT y = 0; valid && y < height; ++y) for (UINT x = 0; x < width; ++x) {
+                    const UINT64 offset = address(context->computer, 0, mip, x, y, subresource / context->mips, 0);
+                    if (offset > context->bytes || context->bytes - offset < element) { valid = false; break; }
+                    offsets[SIZE_T(y) * width + x] = UINT32(offset);
+                }
+                if (valid) {
+                    std::vector<unsigned char> pattern(context->bytes), expected(SIZE_T(width) * element * height), actual(expected.size());
+                    for (SIZE_T i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<unsigned char>((i * 2654435761ull) >> 13);
+                    const UINT pitch = width * element;
+                    valid = SUCCEEDED(reinterpret_cast<Copy>(functions[context->modern ? 9 : 6])(context->computer, expected.data(), 0,
+                        subresource, pattern.data(), pitch, pitch * height));
+                    for (SIZE_T i = 0; valid && i < offsets.size(); ++i) std::memcpy(actual.data() + i * element, pattern.data() + offsets[i], element);
+                    valid = valid && expected == actual;
+                }
+                if (valid) context->offsets[subresource] = std::move(offsets);
+                state = valid ? 2 : 3;
+                if (!valid && graphics_diagnostics.load())
+                    std::fprintf(stderr, "xone-era: XG offset table refused for subresource %u; using original copy\n", subresource);
+            } else if (state == 0) state = 1;
+            if (state == 2) table = &context->offsets[subresource];
+        } catch (const std::bad_alloc&) {}
+    }
+    if (table) {
+        const UINT element = context->bytes_per_block;
+        auto* t = static_cast<unsigned char*>(tiled);
+        for (UINT y = 0; y < height; ++y) {
+            auto* row = static_cast<unsigned char*>(linear) + SIZE_T(y) * row_pitch;
+            const UINT32* o = table->data() + SIZE_T(y) * width;
+            switch (element) {
+            case 4:
+                for (UINT x = 0; x < width; ++x) into_tiled ? std::memcpy(t + o[x], row + x * 4, 4) : std::memcpy(row + x * 4, t + o[x], 4);
+                break;
+            case 2:
+                for (UINT x = 0; x < width; ++x) into_tiled ? std::memcpy(t + o[x], row + x * 2, 2) : std::memcpy(row + x * 2, t + o[x], 2);
+                break;
+            default:
+                for (UINT x = 0; x < width; ++x) into_tiled ? std::memcpy(t + o[x], row + SIZE_T(x) * element, element)
+                                                            : std::memcpy(row + SIZE_T(x) * element, t + o[x], element);
+            }
+        }
+        return S_OK;
+    }
     return copy(context->computer, into_tiled ? tiled : linear, 0, subresource,
                 into_tiled ? linear : tiled, row_pitch, slice_pitch);
 }
@@ -4690,7 +4755,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
         if (format == DXGI_FORMAT_R16_TYPELESS || format==DXGI_FORMAT_R16_UNORM) context->bytes_per_block=2;
         if (format == DXGI_FORMAT_R32G8X24_TYPELESS) context->bytes_per_block = 8;
         if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) context->bytes_per_block = 8;
-        context->samples = samples;
+        context->samples = samples; context->volume = depth != 0;
         // 180052210 constructs the 60-byte XG descriptor independently of the
         // 52-byte public texture descriptor. Single-sample, default SRV storage.
         if (!depth && tile_mode == UINT_MAX) {

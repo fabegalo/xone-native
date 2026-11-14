@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -22,3 +23,43 @@ jobs:
         env:
           XBOXONE_REQUIRE_SYMLINKS: '1'
         run: ctest --test-dir build -C Release --output-on-failure
+
+  appmodel-disposable:
+    # Opt-in only: registers an owned fixture package on an ephemeral GitHub VM, never on a user host.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build bootstrap and owned component
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target xboxone-systemos appmodel_component --parallel 2
+      - name: Report prerequisites
+        shell: pwsh
+        run: |
+          $lua = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System).EnableLUA
+          $dev = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
+          "EnableLUA=$lua AllowDevelopmentWithoutDevLicense=$dev OS=$([Environment]::OSVersion.VersionString)"
+      - name: Run disposable test as a standard user
+        shell: pwsh
+        run: |
+          # The runner account is elevated; the test requires a non-elevated account on this throwaway VM.
+          $bytes = [byte[]]::new(24); [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $plain = [Convert]::ToBase64String($bytes) + 'a1!'
+          Write-Output "::add-mask::$plain"
+          $secret = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name xontest -Password $secret -AccountNeverExpires | Out-Null
+          $out = Join-Path $env:RUNNER_TEMP 'appmodel'
+          New-Item -ItemType Directory -Force $out | Out-Null
+          icacls $out /grant 'xontest:(OI)(CI)M' | Out-Null
+          $python = (Get-Command python).Source
+          $cmd = Join-Path $out 'run.cmd'
+          @(
+            'set GITHUB_ACTIONS=true', 'set RUNNER_ENVIRONMENT=github-hosted',
+            "`"$python`" `"$PWD\tests\appmodel_disposable_test.py`" --disposable --bootstrap `"$PWD\build\Release\xboxone-systemos.exe`" --component `"$PWD\build\Release\appmodel_component.exe`" --evidence `"$out\evidence.json`" > `"$out\stdout.txt`" 2> `"$out\stderr.txt`"",
+            "echo %ERRORLEVEL% > `"$out\exit.txt`""
+          ) | Set-Content -Encoding ascii $cmd
+          $credential = [pscredential]::new('xontest', $secret)
+          Start-Process cmd.exe -ArgumentList '/c', "`"$cmd`"" -Credential $credential -LoadUserProfile -Wait -WorkingDirectory $out
+          Get-Content "$out\stderr.txt", "$out\evidence.json" -ErrorAction Continue
+          if ((Get-Content "$out\exit.txt").Trim() -ne '0') { exit 1 }

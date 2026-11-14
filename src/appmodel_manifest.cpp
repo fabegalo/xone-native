@@ -75,7 +75,6 @@ void xml_contracts(IStream* stream, Manifest& manifest) {
     XmlNodeType type{};
     HRESULT hr;
     unsigned nodes = 0;
-    bool logo_text = false;
     while ((hr = xml->Read(&type)) == S_OK) {
         if (++nodes > 8192) throw std::runtime_error("XML node limit exceeded");
         if (type == XmlNodeType_ProcessingInstruction || type == XmlNodeType_DocumentType)
@@ -88,7 +87,6 @@ void xml_contracts(IStream* stream, Manifest& manifest) {
             if (!((uri == foundation && ordinary.count(local)) || (uri == uap && local == L"VisualElements") ||
                   (uri == restricted && local == L"Capability")))
                 manifest.unsupported_contracts.push_back(utf8(uri.c_str()) + ":" + utf8(local.c_str()));
-            logo_text = local == L"Logo" && uri == foundation;
             unsigned count = 0;
             auto attr = xml->MoveToFirstAttribute();
             while (attr == S_OK) {
@@ -108,11 +106,7 @@ void xml_contracts(IStream* stream, Manifest& manifest) {
             }
             require(attr, "XML attributes");
             xml->MoveToElement();
-        } else if (type == XmlNodeType_Text && logo_text) {
-            LPCWSTR value = nullptr;
-            require(xml->GetValue(&value, nullptr), "Logo text");
-            manifest.resource_paths.push_back(utf8(value));
-        } else if (type == XmlNodeType_EndElement) logo_text = false;
+        }
     }
     require(hr, "XML parse");
     LARGE_INTEGER zero{};
@@ -151,6 +145,10 @@ bool read_manifest(const std::filesystem::path& path, const std::string& sha256,
         require(CoCreateInstance(__uuidof(AppxFactory), nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory)), "AppxFactory");
         Com<IAppxManifestReader> reader;
         require(factory->CreateManifestReader(stream.Get(), &reader), "CreateManifestReader");
+        // Use the SDK's complete property value, including split text and CDATA.
+        Com<IAppxManifestProperties> properties;
+        require(reader->GetProperties(&properties), "GetProperties");
+        candidate.resource_paths.push_back(string_value([&](auto p) { return properties->GetStringValue(L"Logo", p); }));
         Com<IAppxManifestPackageId> id;
         require(reader->GetPackageId(&id), "GetPackageId");
         candidate.name = string_value([&](auto p) { return id->GetName(p); });

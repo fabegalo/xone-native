@@ -218,6 +218,22 @@ class AppModel(unittest.TestCase):
         self.rejected('package_identity_mismatch', packages=[('dep', p)], extra=[
             'package_bind "appx" "XboxOneNative.Dependency" "dep" "explicit provider"'])
 
+    def test_logo_xml_text_forms_preserve_resource_binding(self):
+        for text in ('logo.png', '<![CDATA[logo.png]]>', 'lo<![CDATA[go]]>.png', 'lo<!--split-->go.png'):
+            with self.subTest(text=text):
+                self.manifest.write_text(TEMPLATE.read_text(encoding='utf-8').replace(
+                    '<Logo>logo.png</Logo>', '<Logo>' + text + '</Logo>'), encoding='utf-8')
+                status, report = self.prepare()
+                self.assertEqual(status, 0, report)
+                self.assertTrue(any(d['kind'] == 'appx_resource' and d['library'] == 'logo.png'
+                                    and d['provider'] == 'logo' and d['status'] == 'pinned_resource_verified'
+                                    for d in report['dependencies']), report)
+        for path in ('absent.png', '../logo.png', 'logo.png:stream'):
+            with self.subTest(path=path):
+                self.manifest.write_text(TEMPLATE.read_text(encoding='utf-8').replace(
+                    '<Logo>logo.png</Logo>', '<Logo><![CDATA[' + path + ']]></Logo>'), encoding='utf-8')
+                self.rejected('missing_pinned_resource' if path == 'absent.png' else 'appx_manifest_rejected')
+
     def test_utf16_and_unicode_package_root(self):
         text = self.manifest.read_text(encoding='utf-8').replace('encoding="utf-8"', 'encoding="utf-16"')
         self.manifest.write_bytes(text.encode('utf-16'))

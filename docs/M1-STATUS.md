@@ -2,6 +2,12 @@
 
 Data: **2026-11-04**. Estágio máximo demonstrado: um **componente sintético próprio** foi criado como processo Windows AMD64, executou código de memória/threads/imports e terminou com código 0. **Nenhum componente original do SystemOS foi carregado ou inicializado; zero frames autênticos.**
 
+## 2026-11-14 — XVDs locais e AppModel em VM GitHub descartável
+
+Leitura de 0x400 bytes dos 62 XVDs em `build-osu` (OSU1 46, OSU2 8, OSU3 8): todos `msft-xvd`, tipo 1, flags `0x1`/`0x9`, **sem `EncryptionDisabled` (0x2) em nenhum**. Content types: `system.xvd` 0x2, `uERA.xvd` 0x3, `host`/`ScarlettHost` 0x7, firmware/updater 0xc, templates/sosinit 0xd, `systemtools` 0x13, `systemaux*`/idiomas 0x14. Não existe componente original legível localmente; `0x80070570` não foi repetido. O Device Portal oficial expõe pastas de app/desenvolvedor, não volumes SystemOS.
+
+Job `appmodel-disposable` (`workflow_dispatch`, windows-latest, build 26100, `EnableLUA=1`, Developer Mode ativo). Run [43576784274](https://github.com/fabegalo/xone-native/actions/runs/43576784274), usuário local padrão criado na VM: registro oficial do fixture próprio exit 0, remoção `cleanup_verified=true`, mas `CoCreateInstance(ApplicationActivationManager)` = `0x80070005`; causa suspeita: logon sem desktop interativo. Run [43577104088](https://github.com/fabegalo/xone-native/actions/runs/43577104088), tarefa `RunLevel Limited` da conta do runner: token continua elevado (sem token dividido) e o guard recusou antes do registro. **Ativação positiva continua não demonstrada**; requer guest com sessão interativa não elevada (Windows Sandbox, não instalado neste host).
+
 ## 2026-11-07 — AppModel sem handshake obrigatório e transporte gráfico entre processos
 
 O backend AppModel distingue agora **observação normal de processo** e **protocolo da fixture própria**. A nova linha opcional do manifesto v1 é `appmodel_lifecycle process_exit` (padrão quando ausente) ou `appmodel_lifecycle owned_fixture`. Valores desconhecidos, linhas duplicadas e seleção sem `appmodel` são recusados. As fixtures e o runner descartável selecionam o handshake explicitamente; manifestos antigos que dependiam dele precisam acrescentar a linha `owned_fixture`.

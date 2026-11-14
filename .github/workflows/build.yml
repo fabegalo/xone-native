@@ -40,12 +40,19 @@ jobs:
           $lua = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System).EnableLUA
           $dev = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock -ErrorAction SilentlyContinue).AllowDevelopmentWithoutDevLicense
           "EnableLUA=$lua AllowDevelopmentWithoutDevLicense=$dev OS=$([Environment]::OSVersion.VersionString)"
-      - name: Run disposable test with a filtered interactive token
+      - name: Run disposable test as a standard user
         shell: pwsh
         run: |
-          # The runner token is elevated; a Limited scheduled task gets the same interactive user's non-elevated token.
+          # The runner account is elevated; the test requires a non-elevated account on this throwaway VM.
+          # Known limit (run 43576784274): ActivationManager returns 0x80070005 here; suspected cause: no interactive desktop for this logon.
+          $bytes = [byte[]]::new(24); [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $plain = [Convert]::ToBase64String($bytes) + 'a1!'
+          Write-Output "::add-mask::$plain"
+          $secret = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name xontest -Password $secret -AccountNeverExpires | Out-Null
           $out = Join-Path $env:RUNNER_TEMP 'appmodel'
           New-Item -ItemType Directory -Force $out | Out-Null
+          icacls $out /grant 'xontest:(OI)(CI)M' | Out-Null
           $python = (Get-Command python).Source
           $cmd = Join-Path $out 'run.cmd'
           @(
@@ -53,13 +60,7 @@ jobs:
             "`"$python`" `"$PWD\tests\appmodel_disposable_test.py`" --disposable --bootstrap `"$PWD\build\Release\xboxone-systemos.exe`" --component `"$PWD\build\Release\appmodel_component.exe`" --evidence `"$out\evidence.json`" > `"$out\stdout.txt`" 2> `"$out\stderr.txt`"",
             "echo %ERRORLEVEL% > `"$out\exit.txt`""
           ) | Set-Content -Encoding ascii $cmd
-          $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-          $action = New-ScheduledTaskAction -Execute cmd.exe -Argument "/c `"$cmd`"" -WorkingDirectory $out
-          Register-ScheduledTask -TaskName xon-appmodel -Action $action -Principal $principal | Out-Null
-          Start-ScheduledTask -TaskName xon-appmodel
-          $deadline = (Get-Date).AddSeconds(240)
-          while (-not (Test-Path "$out\exit.txt") -and (Get-Date) -lt $deadline) { Start-Sleep 2 }
-          Get-ScheduledTaskInfo -TaskName xon-appmodel | Format-List LastRunTime, LastTaskResult
-          Unregister-ScheduledTask -TaskName xon-appmodel -Confirm:$false
+          $credential = [pscredential]::new('xontest', $secret)
+          Start-Process cmd.exe -ArgumentList '/c', "`"$cmd`"" -Credential $credential -LoadUserProfile -Wait -WorkingDirectory $out
           Get-Content "$out\stderr.txt", "$out\evidence.json" -ErrorAction Continue
-          if (-not (Test-Path "$out\exit.txt") -or (Get-Content "$out\exit.txt").Trim() -ne '0') { exit 1 }
+          if ((Get-Content "$out\exit.txt").Trim() -ne '0') { exit 1 }

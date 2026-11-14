@@ -604,8 +604,46 @@ bool writable_handle(HANDLE handle) {
     return writable_path(path.c_str());
 }
 
+// The guest temporary volume belongs to the session, never the host's T: drive.
+std::wstring title_path(LPCWSTR path) {
+    if (!path || !*path) { SetLastError(ERROR_INVALID_PARAMETER); return {}; }
+    std::wstring guest = path;
+    if (guest.starts_with(L"\\\\?\\")) guest.erase(0, 4);
+    if (guest.size() < 2 || (guest[0] != L'T' && guest[0] != L't') || guest[1] != L':') return path;
+    if (guest.size() < 3 || (guest[2] != L'\\' && guest[2] != L'/')) {
+        SetLastError(ERROR_INVALID_NAME); return {};
+    }
+    std::wstring root;
+    { std::lock_guard lock(storage_mutex); root = storage_root; }
+    if (root.empty()) { SetLastError(ERROR_ACCESS_DENIED); return {}; }
+    const auto volume = root + L"temp";
+    const auto candidate = volume + L"\\" + guest.substr(3);
+    std::wstring full;
+    const auto wildcard = candidate.find_first_of(L"*?");
+    if (wildcard != std::wstring::npos) {
+        const auto separator = candidate.find_last_of(L"\\/");
+        if (wildcard < separator) { SetLastError(ERROR_INVALID_NAME); return {}; }
+        full = full_path(candidate.substr(0, separator).c_str());
+        if (!full.empty()) full += L"\\" + candidate.substr(separator + 1);
+    } else full = full_path(candidate.c_str());
+    if (full.empty()) return {};
+    while (full.size() > volume.size() && full.back() == L'\\') full.pop_back();
+    if (full.size() < volume.size() ||
+        CompareStringOrdinal(full.c_str(), static_cast<int>(volume.size()), volume.c_str(),
+                             static_cast<int>(volume.size()), TRUE) != CSTR_EQUAL ||
+        (full.size() > volume.size() && full[volume.size()] != L'\\') || !inside_storage(volume)) {
+        SetLastError(ERROR_ACCESS_DENIED); return {};
+    }
+    if (!CreateDirectoryW(volume.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return {};
+    if (!inside_storage(full)) { SetLastError(ERROR_ACCESS_DENIED); return {}; }
+    return full;
+}
+
 HANDLE WINAPI era_CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
                               DWORD disposition, DWORD flags, HANDLE template_file) {
+    const auto translated = title_path(path);
+    if (translated.empty()) return INVALID_HANDLE_VALUE;
+    path = translated.c_str();
     constexpr DWORD mutation = GENERIC_WRITE | GENERIC_ALL | MAXIMUM_ALLOWED | DELETE | WRITE_DAC | WRITE_OWNER |
                                FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES;
     if (((access & mutation) || disposition != OPEN_EXISTING || (flags & FILE_FLAG_DELETE_ON_CLOSE)) &&
@@ -655,7 +693,8 @@ BOOL WINAPI era_SetEndOfFile(HANDLE file) {
 }
 
 BOOL WINAPI era_CreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES security) {
-    return writable_path(path) ? CreateDirectoryW(path, security) : FALSE;
+    const auto translated = title_path(path);
+    return !translated.empty() && writable_path(translated.c_str()) && CreateDirectoryW(translated.c_str(), security);
 }
 
 BOOL WINAPI era_CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES security) {
@@ -665,10 +704,16 @@ BOOL WINAPI era_CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES security) {
 
 BOOL WINAPI era_RemoveDirectoryA(LPCSTR path) {
     const auto wide = wide_path(path);
-    return !wide.empty() && writable_path(wide.c_str()) && RemoveDirectoryW(wide.c_str());
+    const auto translated = wide.empty() ? std::wstring{} : title_path(wide.c_str());
+    return !translated.empty() && writable_path(translated.c_str()) && RemoveDirectoryW(translated.c_str());
 }
 
 BOOL WINAPI era_MoveFileExW(LPCWSTR source, LPCWSTR destination, DWORD flags) {
+    const auto from = title_path(source);
+    if (from.empty()) return FALSE;
+    const auto to = title_path(destination);
+    if (to.empty()) return FALSE;
+    source = from.c_str(); destination = to.c_str();
     if (!writable_path(source) || !writable_path(destination)) return FALSE;
     // Deferred moves escape the session's storage lifetime.
     if (flags & MOVEFILE_DELAY_UNTIL_REBOOT) { SetLastError(ERROR_NOT_SUPPORTED); return FALSE; }
@@ -677,7 +722,9 @@ BOOL WINAPI era_MoveFileExW(LPCWSTR source, LPCWSTR destination, DWORD flags) {
 
 BOOL WINAPI era_DeleteFileW(LPCWSTR path) {
     if (!path || !*path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-    const std::wstring full = full_path(path);
+    const auto translated = title_path(path);
+    if (translated.empty()) return FALSE;
+    const std::wstring full = full_path(translated.c_str());
     if (full.empty()) return FALSE; // GetFullPathNameW set the error.
     if (!inside_storage(full)) { SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
     return DeleteFileW(full.c_str());
@@ -686,6 +733,43 @@ BOOL WINAPI era_DeleteFileW(LPCWSTR path) {
 BOOL WINAPI era_DeleteFileA(LPCSTR path) {
     const auto wide = wide_path(path);
     return !wide.empty() && era_DeleteFileW(wide.c_str());
+}
+
+BOOL WINAPI era_GetFileAttributesExW(LPCWSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID data) {
+    const auto translated = title_path(path);
+    return !translated.empty() && GetFileAttributesExW(translated.c_str(), level, data);
+}
+BOOL WINAPI era_GetFileAttributesExA(LPCSTR path, GET_FILEEX_INFO_LEVELS level, LPVOID data) {
+    const auto wide = wide_path(path);
+    return !wide.empty() && era_GetFileAttributesExW(wide.c_str(), level, data);
+}
+BOOL WINAPI era_GetDiskFreeSpaceExW(LPCWSTR path, PULARGE_INTEGER available, PULARGE_INTEGER total, PULARGE_INTEGER free) {
+    if (!path) return GetDiskFreeSpaceExW(path, available, total, free);
+    const auto translated = title_path(path);
+    return !translated.empty() && GetDiskFreeSpaceExW(translated.c_str(), available, total, free);
+}
+HANDLE WINAPI era_FindFirstFileExA(LPCSTR path, FINDEX_INFO_LEVELS level, LPVOID data,
+                                  FINDEX_SEARCH_OPS search, LPVOID filter, DWORD flags) {
+    const auto wide = wide_path(path);
+    const auto translated = wide.empty() ? std::wstring{} : title_path(wide.c_str());
+    if (translated.empty()) return INVALID_HANDLE_VALUE;
+    if (!data || (level != FindExInfoStandard && level != FindExInfoBasic)) {
+        SetLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE;
+    }
+    WIN32_FIND_DATAW found{};
+    const HANDLE handle = FindFirstFileExW(translated.c_str(), level, &found, search, filter, flags);
+    if (handle == INVALID_HANDLE_VALUE) return handle;
+    const DWORD error = GetLastError();
+    auto* result = static_cast<WIN32_FIND_DATAA*>(data);
+    static_assert(offsetof(WIN32_FIND_DATAA, cFileName) == offsetof(WIN32_FIND_DATAW, cFileName));
+    std::memcpy(result, &found, offsetof(WIN32_FIND_DATAA, cFileName));
+    if (!WideCharToMultiByte(CP_ACP, 0, found.cFileName, -1, result->cFileName, MAX_PATH, nullptr, nullptr) ||
+        !WideCharToMultiByte(CP_ACP, 0, found.cAlternateFileName, -1, result->cAlternateFileName, 14, nullptr, nullptr)) {
+        const DWORD conversion_error = GetLastError(); FindClose(handle); SetLastError(conversion_error);
+        return INVALID_HANDLE_VALUE;
+    }
+    SetLastError(error);
+    return handle;
 }
 
 // ERA semantics: the title is the process image, so NULL names the title, not
@@ -1491,6 +1575,10 @@ std::wstring title_storage_root() { std::lock_guard lock(storage_mutex); return 
 
 void* resolve_kernelx(const ImportRequest& request) {
     if (!same_library(request.library, "kernelx.dll") || request.name.empty()) return nullptr;
+    if (request.name == "GetFileAttributesExA") return reinterpret_cast<void*>(&era_GetFileAttributesExA);
+    if (request.name == "GetFileAttributesExW") return reinterpret_cast<void*>(&era_GetFileAttributesExW);
+    if (request.name == "GetDiskFreeSpaceExW") return reinterpret_cast<void*>(&era_GetDiskFreeSpaceExW);
+    if (request.name == "FindFirstFileExA") return reinterpret_cast<void*>(&era_FindFirstFileExA);
     if (request.name == "GetModuleHandleW") return reinterpret_cast<void*>(&era_GetModuleHandleW);
     if (request.name == "VirtualAlloc") return reinterpret_cast<void*>(&era_VirtualAlloc);
     if (request.name == "TitleMemoryStatus") return reinterpret_cast<void*>(&era_TitleMemoryStatus);

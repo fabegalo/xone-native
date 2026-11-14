@@ -1897,6 +1897,52 @@ int main(int argc, char** argv) {
             check(open(inside.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) == INVALID_HANDLE_VALUE &&
                       GetLastError() == ERROR_ACCESS_DENIED, "no storage: destructive open denied");
             set_title_storage_root(root);
+            const auto mkdir = reinterpret_cast<decltype(&CreateDirectoryW)>(resolve_kernelx({"kernelx.dll", "CreateDirectoryW", 0}));
+            const auto attributes = reinterpret_cast<decltype(&GetFileAttributesExA)>(resolve_kernelx({"kernelx.dll", "GetFileAttributesExA", 0}));
+            const auto enumerate = reinterpret_cast<decltype(&FindFirstFileExA)>(resolve_kernelx({"kernelx.dll", "FindFirstFileExA", 0}));
+            const auto move = reinterpret_cast<decltype(&MoveFileExW)>(resolve_kernelx({"kernelx.dll", "MoveFileExW", 0}));
+            check(mkdir && attributes && enumerate && move, "temporary volume uses shared filesystem APIs");
+            if (mkdir && attributes && enumerate && move) {
+                check(mkdir(L"T:\\cache\\", nullptr), "temporary directory created inside session storage");
+                HANDLE temporary = open(L"t:\\cache\\data.bin", GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr);
+                check(temporary != INVALID_HANDLE_VALUE, "temporary volume open shares directory translation");
+                if (temporary != INVALID_HANDLE_VALUE) {
+                    DWORD written = 0;
+                    check(write(temporary, "temp", 4, &written, nullptr) && written == 4, "temporary handle passes storage write policy");
+                    CloseHandle(temporary);
+                }
+                WIN32_FILE_ATTRIBUTE_DATA info{};
+                check(attributes("T:\\cache\\data.bin", GetFileExInfoStandard, &info) && info.nFileSizeLow == 4,
+                      "temporary attributes query observes actual bytes");
+                WIN32_FIND_DATAA found{};
+                HANDLE search = enumerate("T:\\cache\\*.bin", FindExInfoStandard, &found, FindExSearchNameMatch, nullptr, 0);
+                check(search != INVALID_HANDLE_VALUE && std::string(found.cFileName) == "data.bin", "temporary enumeration shares namespace");
+                if (search != INVALID_HANDLE_VALUE) FindClose(search);
+                check(move(L"T:\\cache\\data.bin", L"T:\\cache\\moved.bin", 0), "temporary rename shares namespace");
+                check(remove(L"T:\\cache\\moved.bin"), "temporary delete shares namespace");
+                check(!mkdir(L"T:\\..\\escape", nullptr) && GetLastError() == ERROR_ACCESS_DENIED,
+                      "temporary traversal cannot reach saves or host paths");
+                check(open(L"T:relative", GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr) == INVALID_HANDLE_VALUE &&
+                      GetLastError() == ERROR_INVALID_NAME, "temporary drive-relative paths are explicit errors");
+                set_title_storage_root({});
+                check(!mkdir(L"T:\\unbound", nullptr) && GetLastError() == ERROR_ACCESS_DENIED, "temporary volume requires session storage");
+                set_title_storage_root(root);
+                const auto unicode_root = base + L"\\\u7f13\u5b58";
+                check(CreateDirectoryW(unicode_root.c_str(), nullptr), "Unicode storage root created");
+                set_title_storage_root(unicode_root);
+                check(mkdir(L"T:\\root-test", nullptr), "temporary root rebind supports Unicode host paths");
+                check(attributes("T:\\root-test", GetFileExInfoStandard, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY),
+                      "ANSI guest queries preserve Unicode host root");
+                search = enumerate("T:\\root-*", FindExInfoStandard, &found, FindExSearchNameMatch, nullptr, 0);
+                check(search != INVALID_HANDLE_VALUE && std::string(found.cFileName) == "root-test", "ANSI enumeration supports Unicode host root");
+                if (search != INVALID_HANDLE_VALUE) FindClose(search);
+                RemoveDirectoryW((unicode_root + L"\\temp\\root-test").c_str());
+                RemoveDirectoryW((unicode_root + L"\\temp").c_str());
+                RemoveDirectoryW(unicode_root.c_str());
+                set_title_storage_root(root);
+                RemoveDirectoryW((root + L"\\temp\\cache").c_str());
+                RemoveDirectoryW((root + L"\\temp").c_str());
+            }
             std::wstring short_root(32768, L'\0');
             const DWORD short_length = GetShortPathNameW(root.c_str(), short_root.data(), static_cast<DWORD>(short_root.size()));
             check(short_length && short_length < short_root.size(), "storage root resolves its short-name alias");

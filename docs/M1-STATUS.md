@@ -2,6 +2,38 @@
 
 Data: **2026-11-04**. Estágio máximo demonstrado: um **componente sintético próprio** foi criado como processo Windows AMD64, executou código de memória/threads/imports e terminou com código 0. **Nenhum componente original do SystemOS foi carregado ou inicializado; zero frames autênticos.**
 
+## 2026-11-14 — experimento B: GamingServices e XVD retail dos OSUs
+
+**Resultado: nenhum filesystem/PE retail acessível e nenhuma inicialização do SystemOS.** Investigação sobre `a660cbf`, com quatro cópias temporárias autorizadas em VM Hyper-V Windows Enterprise Evaluation `10.0.26300.0`, armazenada em D:, e GamingServices `39.118.30001.0` instalado pela Store. Os hashes completos de `system.xvd`/`systemaux.xvd` dos três OSUs coincidiram com `build-osu/extraction-evidence.json`; OSU2/3 têm os mesmos volumes alvo. Originais permaneceram no lugar; cada cópia para a VM foi conferida por SHA-256 e marcada somente leitura.
+
+Ghidra **12.1.4** analisou os módulos Windows efetivamente usados na VM, com assinatura Authenticode válida e hashes iguais aos módulos lidos no host:
+
+| Módulo | Versão de arquivo | SHA-256 |
+| --- | --- | --- |
+| `xsapi.dll` | `10.0.26100.9656` | `c00c7c5552e562dfd5945aea78ea01d584d356eb99d7c2536256fec69c443e64` |
+| `xvdd.sys` | `10.0.26100.9632` | `e4aa632230f6a78bcd14b55198ecd8b6549befee807c4cda2da70390bd7a60ac` |
+
+O caminho identificado é **API `xsapi.dll` → adaptador SCSI → miniport `xvdd.sys`**, não uma chamada RPC demonstrada para `GamingServices.exe`. `XvdOpenAdapter` (RVA `0xee60`) procura `\\.\ScsiN:`. `XvdMount` (`0xede0`) passa por `0xb9dc`, prepara o pedido `0x78000004` e usa o wrapper `0x123a8`, que chama `NtDeviceIoControlFile` com IOCTL **`0x4d008`**. Não foi demonstrado que serviços auxiliares sejam dispensáveis para licenciamento.
+
+**Observado dinamicamente no `system.xvd` OSU2:** breakpoint de hardware em `xsapi.dll + 0x123ee`, sem alterar código/validações, registrou `ioctl_ntstatus=0` e **status interno do pedido em `+0x14` igual a `0xc0000102`**. O wrapper seleciona esse status e a rotina `0xadc4` usa `RtlNtStatusToDosErrorNoTeb`: `STATUS_FILE_CORRUPT_ERROR` → Win32 1392 → **`0x80070570`**. Portanto, o transporte do IOCTL funcionou; a recusa veio no pedido processado pelo driver.
+
+ETW `Microsoft.Gaming.Xvdd`, GUID `d199ce5c-7548-4d05-ad81-ef5287a93328`, registrou, para **cada um dos quatro volumes retail**, `XvdLicenseLoadFailure`/`0xc000000d` e depois `XvdCorruption`/**`0xc0000290` (`STATUS_NO_USER_KEYS`)**, nestes offsets de BAT:
+
+| Volume | Offset da leitura recusada |
+| --- | --- |
+| OSU1 `system.xvd` | `0x3455000` |
+| OSU1 `systemaux.xvd` | `0xc24000` |
+| OSU2 `system.xvd` | `0x1ac1000` |
+| OSU2 `systemaux.xvd` | `0x11c5000` |
+
+**Correlação estática, sem breakpoint de kernel:** `xvdd.sys + 0x734ac` lê/valida a BAT pelo caminho de I/O do volume; `0x737ac` chama essa rotina e, em **`0x73802`**, converte retorno negativo em `0xc0000102`. A rotina `0x3690`, em `0x3731`, retorna `0xc0000290` quando o identificador de provedor criptográfico não corresponde às entradas registradas; `0x74b8c` contém a emissão de falha de licença. Esses endereços e nomes `FUN_*` vêm da análise do binário identificado, não de símbolos privados. A pilha exata entre o evento de chave e a conversão final não foi capturada. O nome genérico do NTSTATUS não estabelece participação do EFS.
+
+**Limites da conclusão:** foi atingida uma leitura protegida da BAT que falhou no contrato de licença/chave; não há prova de transformação AES executada, assinatura Microsoft do XVD autenticada, bloco descriptografado ou NTFS exposto. O motivo interno de `XvdLicenseLoadFailure` e o material/provedor exato necessário permanecem indeterminados; não foram extraídos segredos nem procuradas chaves. Isso não comprova incompatibilidade universal do formato nem existência de chaves retail no GamingServices. [xvdtool](https://github.com/emoose/xvdtool) distingue ODKs dev/retail e não fornece prova de leitura retail neste PC.
+
+Os sete ensaios (quatro retail e três fixtures NTFS próprias, plaintext, geradas pelo helper existente de xvdtool) retornaram `0x80070570`, disco `-1`, fechamento do adaptador e ausência de `Q:`. As fixtures **não são um controle positivo assinado/criptografado compatível com o driver** e sua recusa não demonstra falta de chave retail. ETW circular limitado a 8 MiB, sem eventos/buffers perdidos. Nenhum byte do filesystem retail foi verificado, nenhum PE retail recuperado e nenhuma integração de XboxUI/Dashboard/Guide executada. O pré-requisito ainda não satisfeito é um caminho autorizado de licença/chave aceito pelo driver para essa leitura, ou conteúdo retail já legível com proveniência; este resultado não escolhe outra arquitetura.
+
+O ensaio também revelou que o probe dependia de DLLs VC ausentes na VM limpa. `cmake/SystemOS.cmake` agora usa CRT estático **somente no target diagnóstico**, preservando runtime/launcher. Build incremental Release do target e `xvd_probe_safety` (quatro recusas sem montagem) passaram em `build-checked`; imports do executável limitados a `ADVAPI32.dll`/`KERNEL32.dll`. A variante estática compilada diretamente carregou o provedor e foi usada nos ensaios; a verificação adicional da saída CMake na VM teve UAC cancelado e não foi repetida. Evidência compacta local: `build-xvd-probes/experiment-b-20261114/evidence.json` e trace/recibo da tentativa OSU2. Nenhum teste gráfico, CI, outro host ou execução de original retail foi realizado.
+
 ## 2026-11-14 — código de sistema Alpha 8422 efetivamente legível e decompilado
 
 Foi acessada a [recovery de sistema de outubro de 2012](https://archive.org/details/6.2.8422.0.fbl_fun_embedded_xos_devs.120920-1700_XOS_AMD64Fre_en-US_RecoveryTool), separadamente de compiladores/SDKs. Leituras HTTPS Range localizaram XDVDFS externo, `Recovery.gdf` e seu `XOSSYS/Durango.vhd`: offset absoluto **1345536**, comprimento **853326848**, capacidade virtual **4 GiB**, uma partição NTFS. Não se baixou o contêiner/VHD inteiro, montou volume ou executou seu instalador. Biblioteca VHD instalada era incompatível com Core/Streams; um leitor diagnóstico limitado a leitura interpretou footer/BAT/bitmap, verificando os checksums do footer/header, e reutilizou DiscUtils NTFS. Três leituras progressivas de NTFS receberam aproximadamente **15/17/18 MiB**; cada execução tinha teto de 64 MiB/180 s. Esses checksums e a identidade por componente **não autenticam o editor nem o SHA-1 integral publicado pelo acervo**.

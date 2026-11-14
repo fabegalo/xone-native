@@ -31,6 +31,9 @@ if(WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND
    CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
     add_executable(xboxone_xvd_mount_probe WIN32 ${PROJECT_SOURCE_DIR}/tools/xvd_mount_probe.cpp)
     target_compile_features(xboxone_xvd_mount_probe PRIVATE cxx_std_20)
+    # Disposable Windows diagnostics must not require an extra VC runtime install.
+    set_property(TARGET xboxone_xvd_mount_probe PROPERTY
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     target_compile_options(xboxone_xvd_mount_probe PRIVATE /W4 /permissive-)
     target_link_libraries(xboxone_xvd_mount_probe PRIVATE advapi32)
     target_link_options(xboxone_xvd_mount_probe PRIVATE /ENTRY:wmainCRTStartup)

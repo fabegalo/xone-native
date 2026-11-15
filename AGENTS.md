@@ -8,15 +8,17 @@ Single policy for Claude, Codex and other agents. `CLAUDE.md` is only a pointer 
 
 | Module | Common responsibility |
 | --- | --- |
-| Management launcher | Import, configure, prepare and start content; never imitate the original console interface. |
+| Management launcher | Import, configure, prepare and start content; separate management UI from the approved local dashboard front-end. |
 | Content/catalog | Identify originals, revisions, hashes, modules and dependencies without needless copies. |
 | Preparation and native execution | Generic AOT/native execution backend; verified reusable outputs, module loading and explicit unsupported cases. |
 | Compatibility runtime + HLE | Explicit service/API compatibility boundary: kernel/system services, users, storage, audio and input; shared ownership of memory, threads, timing and devices. |
 | Original GPU / Native GPU | Fidelity path and PC-enhanced path, sharing guest contracts; neither may drop effects or change game logic. |
-| Original system and games | Authentic dashboard/Browser, local state and generic game support, not individual game ports or a mock shell. |
-| Session supervisor / host adapters | Original system <-> game lifecycle, each console's real menu/return behavior, shutdown and recovery; OS-specific implementation behind shared interfaces. |
+| System UI and games | Approved interim Xbox One-style local dashboard; original retail SystemOS remains a separate future backend. Generic games and one persistent console state, not individual ports. |
+| Session supervisor / host adapters | Active system UI (local or original) <-> game lifecycle with launch, Guide/Home, shutdown and return; OS-specific adapters behind shared interfaces. |
 
 **Universal compatibility rule:** A newly tested title is evidence about shared CPU/AOT, GPU, kernel/HLE, devices and session behavior, not a separate game port. Fix the demonstrated root cause in the shared component and add a reusable regression; use title/revision-specific metadata or behavior only where an original difference is verified. Never treat an imported or compiled title as playable without end-to-end evidence.
+
+**Maintainer-approved xone exception (2026-11-15):** While authentic SystemOS retail remains unreadable, implement a functional **locally recreated Xbox One-style dashboard** as the system UI, rather than block the product on original shell extraction. It is a separate UI/front-end within the existing system/session boundary, **not** a second console runtime or a replacement for kernel/HLE/GameOS/ERA. Home, My Games & Apps, local profiles, settings, Guide, input, title launch and return must operate on shared real state. Explicitly label its output `local_recreation` (or an equivalent distinct provenance), never `systemos_component` or authentic retail; no fake Xbox Live, entitlements, achievements, friends or gameplay. Use original-inspired styling with independently created/licensed assets and no claim of Microsoft affiliation. Original SystemOS remains an optional, version-verified future UI backend sharing catalog, saves and session contracts. This decision is approved; do not ask for renewed permission or apply the old mock-shell prohibition to this scoped local UI.
 
 Instruction sets, firmware and API implementations differ inside these boundaries; that is not permission to omit HLE, invent another architecture or duplicate runtimes. One logical console state serves both GPU paths. Windows x64/ARM64, Linux x64/ARM64 and macOS Intel/Apple Silicon are targets; Steam Deck uses Linux. Builds/packages are not runtime certification. Missing modules remain explicit implementation gaps, not claims of existing functionality.
 
@@ -32,7 +34,7 @@ The common architecture above is already requested. Its unvalidated internal cho
 
 - Execution/runtime: current Windows x64 route uses original x86-64 execution where ABI/dependencies are demonstrated, not ReXGlue/PPC. Treat direct execution, cross-ISA translation and any VM requirement as execution-backend choices to validate, not automatic constraints. HostOS, SystemOS, GameOS/ERA and GameCore retain distinct contracts inside the common architecture.
 - Content/session: `src/inspection.cpp`, `src/inventory.cpp`, `src/bootstrap.cpp` and their headers; AppModel in `src/appmodel*.cpp`; existing CLI/CMake and presentation interfaces. Reuse these boundaries for an explicit HLE/API-service layer; inspection, Windows loading and frame transport are not an already complete Xbox runtime.
-- Original SystemOS dashboard, Guide, profiles, library, games and return are the product flow. Xbox fidelity and Native enhancement share runtime contracts; do not claim implemented GPU modes without code/evidence. A desktop fixture, parsed export, PID or present call is not original SystemOS execution.
+- The approved local dashboard is now the primary near-term **system UI** target: Home, Library/My Games & Apps, Guide, offline profiles, settings, controller/keyboard navigation, real title launch and return. Preserve SystemOS retail as a distinct optional future backend. Xbox fidelity and Native enhancement share runtime contracts; local UI frames are never evidence of original SystemOS execution or game rendering. A fixture, parsed export, PID or present call is not original SystemOS execution.
 - Preserve version/hash/provenance, explicit dependency/activation bindings, long-path and traversal checks; no silent Win32 fallback after AppModel failure. AppModel registration/certificates/policies require permission and an authorized disposable environment, not fallback deployment on the user's host. Respect protected content. Consult only relevant sections of `STATUS.md`, `docs/NEXT-TASK.md`, `docs/M0.md` and existing subsystem reports; license-review WinDurango reuse and do not assume Azimuth source access.
 
 ## 4. Implementation, correctness and validation

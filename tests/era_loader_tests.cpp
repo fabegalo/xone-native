@@ -1579,6 +1579,24 @@ int main(int argc, char** argv) {
                                             check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                 std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),"unbinding GS restores original VS/PS pixels");
                                             reinterpret_cast<BindConstants>(vt(context)[23])(context,2,1,nullptr);
+                                            const char* point_source="struct V{float4 p:SV_Position;}; [maxvertexcount(3)] void main(point V input[1],inout TriangleStream<V> output){for(uint i=0;i<3;i++){float2 p=float2((i<<1)&2,i&2);V v;v.p=float4(p*float2(2,-2)+float2(-1,1),0,1);output.Append(v);}}";
+                                            Microsoft::WRL::ComPtr<ID3DBlob> point_code;void* point_geometry=nullptr;
+                                            const bool point_ready=SUCCEEDED(compile(point_source,std::strlen(point_source),nullptr,nullptr,nullptr,"main","gs_5_0",0,0,&point_code,nullptr)) &&
+                                                reinterpret_cast<CreateShader>(vt(device)[13])(device,point_code->GetBufferPointer(),point_code->GetBufferSize(),nullptr,&point_geometry)==S_OK;
+                                            check(point_ready,"point-list regression creates a real point-input geometry shader");
+                                            if(point_ready) {
+                                                const UINT64 point_topology=0x000003ffc0009e00ull;
+                                                std::memcpy(static_cast<char*>(context)+0x170,&point_topology,sizeof point_topology);
+                                                reinterpret_cast<BindShader>(vt(context)[24])(context,point_geometry);
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                draw(context,1,0);
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
+                                                    std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
+                                                    "original point topology reaches native Draw and GS expansion with exact expected pixels");
+                                                reinterpret_cast<BindShader>(vt(context)[24])(context,nullptr);
+                                                std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);
+                                            }
+                                            if(point_geometry)reinterpret_cast<Count>(vt(point_geometry)[2])(point_geometry);
                                         }
                                         if(geometry) reinterpret_cast<Count>(vt(geometry)[2])(geometry);
                                         if(constants) reinterpret_cast<Count>(vt(constants)[2])(constants);
@@ -1648,6 +1666,9 @@ int main(int argc, char** argv) {
                                         std::memcpy(data+0x188,&shaders[1],sizeof(void*));
                                         draw(deferred_draw,3,0);
                                         clear(deferred_draw,view,white);
+                                        bind_targets(deferred_draw,0,nullptr,nullptr);
+                                        draw(deferred_draw,3,0);
+                                        bind_targets(deferred_draw,1,targets,nullptr);
                                         std::memcpy(data+0x188,&shaders[2],sizeof(void*));
                                         draw(deferred_draw,3,0);
                                         const UINT16 indices[]{99,0,1,2};
@@ -2565,6 +2586,17 @@ int main(int argc, char** argv) {
         const auto flush = reinterpret_cast<decltype(&FlushFileBuffers)>(resolve_kernelx({"kernelx.dll", "FlushFileBuffers", 0}));
         check(open && write && truncate && flush, "storage handle APIs bound");
         if (open && write && truncate && flush) {
+            set_title_package_root(root);
+            HANDLE content=open(L"/save.bin",GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,0,nullptr);
+            check(content!=INVALID_HANDLE_VALUE,"package-rooted content opens from the bound package, not the host drive root");
+            if(content!=INVALID_HANDLE_VALUE)CloseHandle(content);
+            check(open(L"/../outside.bin",GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr)==INVALID_HANDLE_VALUE && GetLastError()==ERROR_INVALID_NAME,
+                "package-rooted content rejects traversal instead of escaping to the host");
+            check(open(L"/save.bin:stream",GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr)==INVALID_HANDLE_VALUE && GetLastError()==ERROR_INVALID_NAME,
+                "package-rooted content rejects alternate streams");
+            set_title_package_root({});
+            check(open(L"/save.bin",GENERIC_READ,0,nullptr,OPEN_EXISTING,0,nullptr)==INVALID_HANDLE_VALUE && GetLastError()==ERROR_ACCESS_DENIED,
+                "unbound package-rooted content has no host fallback");
             set_title_storage_root({});
             check(open(inside.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr) == INVALID_HANDLE_VALUE &&
                       GetLastError() == ERROR_ACCESS_DENIED, "no storage: destructive open denied");
@@ -4485,6 +4517,56 @@ int main(int argc, char** argv) {
             static std::wstring loaded;
             static bool fail_load = false;
             static HWND owned_window = nullptr;
+            static IInspectable* runtime_window=nullptr;
+            static UINT visibility_changes=0;
+            static bool last_visibility=false;
+            static IInspectable* retained_visibility=nullptr;
+            static INT32 activation_state=-1;
+            static UINT key_events=0;
+            static bool expected_key_up=false;
+            struct WindowActivationHandler : IUnknown {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override {*out=this;return S_OK;}
+                ULONG STDMETHODCALLTYPE AddRef() override {return 2;}
+                ULONG STDMETHODCALLTYPE Release() override {return 1;}
+                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable* args) {
+                    const auto get=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,INT32*)>((*reinterpret_cast<void***>(args))[6]);
+                    check(get(args,nullptr)==E_POINTER && get(args,&activation_state)==S_OK,"window activation args expose the native activation state");
+                    return S_OK;
+                }
+            };
+            static WindowActivationHandler window_activation_handler;
+            struct KeyHandler : IUnknown {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override {*out=this;return S_OK;}
+                ULONG STDMETHODCALLTYPE AddRef() override {return 2;}
+                ULONG STDMETHODCALLTYPE Release() override {return 1;}
+                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable* args) {
+                    const auto table=*reinterpret_cast<void***>(args);
+                    INT32 key=0;
+                    struct Status {UINT32 repeat,scan;boolean extended,menu,was_down,released;} status{};
+                    const auto get_key=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,INT32*)>(table[6]);
+                    const auto get_status=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,Status*)>(table[7]);
+                    check(get_key(args,nullptr)==E_POINTER && get_status(args,nullptr)==E_POINTER && get_key(args,&key)==S_OK &&
+                        get_status(args,&status)==S_OK && key=='A' && status.scan==0x1e && status.was_down &&
+                        status.repeat==(expected_key_up ? 1u : 2u) && bool(status.released)==expected_key_up,
+                        "CoreWindow keyboard events preserve virtual key, scan code, repetition and release bits");
+                    ++key_events;return S_OK;
+                }
+            };
+            static KeyHandler key_handler;
+            struct VisibilityHandler : IUnknown {
+                HRESULT STDMETHODCALLTYPE QueryInterface(REFIID,void** out) override {*out=this;return S_OK;}
+                ULONG STDMETHODCALLTYPE AddRef() override {return 2;}
+                ULONG STDMETHODCALLTYPE Release() override {return 1;}
+                virtual HRESULT STDMETHODCALLTYPE Invoke(IInspectable*,IInspectable* args) {
+                    boolean value=FALSE;
+                    const auto get=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>((*reinterpret_cast<void***>(args))[6]);
+                    check(get(args,nullptr)==E_POINTER && get(args,&value)==S_OK,"visibility event exposes its real snapshot");
+                    last_visibility=value!=FALSE;++visibility_changes;
+                    if(value && visibility_changes==1){retained_visibility=args;args->AddRef();}
+                    return S_OK;
+                }
+            };
+            static VisibilityHandler visibility_handler;
             struct Handler : IUnknown {
                 HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = this; return S_OK; }
                 ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
@@ -4497,6 +4579,27 @@ int main(int argc, char** argv) {
                         INT32 value = -1;
                         check(kind(args, nullptr) == E_POINTER, "activation kind validates its output");
                         check(kind(args, &value) == S_OK && value == 0, "Run dispatches an actual Launch activation");
+                        check(reinterpret_cast<Kind>((*reinterpret_cast<void***>(args))[7])(args,&value)==S_OK && value==0,
+                              "fresh process reports NotRunning rather than a fabricated resumed state");
+                        constexpr GUID launch_iid{0xfbc93e26,0xa14a,0x4b4f,{0x82,0xb0,0x33,0xbe,0xd9,0x20,0xaf,0x52}};
+                        IInspectable* launch=nullptr;
+                        check(args->QueryInterface(launch_iid,reinterpret_cast<void**>(&launch))==S_OK && launch,
+                              "LaunchActivatedEventArgs exposes its standard launch interface");
+                        if(launch) {
+                            IUnknown *first=nullptr,*second=nullptr;
+                            args->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&first));
+                            launch->QueryInterface(__uuidof(IUnknown),reinterpret_cast<void**>(&second));
+                            check(first && first==second,"launch interfaces share one COM identity");
+                            if(first)first->Release();if(second)second->Release();
+                            for(UINT slot:{6u,7u}) {
+                                const auto get=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*)>((*reinterpret_cast<void***>(launch))[slot]);
+                                HSTRING text=nullptr;
+                                check(get(launch,nullptr)==E_POINTER && get(launch,&text)==S_OK && WindowsGetStringLen(text)==0,
+                                      "ordinary launch has no extra guest arguments or pinned-tile ID");
+                                WindowsDeleteString(text);
+                            }
+                            launch->Release();
+                        }
                     }
                     return S_OK;
                 }
@@ -4516,7 +4619,18 @@ int main(int argc, char** argv) {
                     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(view, &handler, &token);
                 }
                 virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
+                    runtime_window=window;
                     owned_window = core_window_hwnd(window);
+                    visibility_changes=0;last_visibility=false;
+                    std::int64_t visibility_token=0;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*,std::int64_t*)>((*reinterpret_cast<void***>(window))[35])(
+                        window,&visibility_handler,&visibility_token)==S_OK,"CoreWindow visibility registration uses the Xbox slots");
+                    const auto table=*reinterpret_cast<void***>(window);
+                    using AddWindowEvent=HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*,std::int64_t*);
+                    check(reinterpret_cast<AddWindowEvent>(table[15])(window,&window_activation_handler,&visibility_token)==S_OK &&
+                        reinterpret_cast<AddWindowEvent>(table[23])(window,&key_handler,&visibility_token)==S_OK &&
+                        reinterpret_cast<AddWindowEvent>(table[25])(window,&key_handler,&visibility_token)==S_OK,
+                        "activation and keyboard event registrations use their observed Xbox slots");
                     check(!IsWindowVisible(core_window_hwnd(window)), "window stays hidden during view setup");
                     IAgileObject* agile=nullptr;
                     check(window->QueryInterface(__uuidof(IAgileObject),reinterpret_cast<void**>(&agile))==S_OK && agile,
@@ -4589,8 +4703,6 @@ int main(int argc, char** argv) {
                               "process one leaves the second message pending");
                         check(pump(dispatcher, 0) == S_OK && !PeekMessageW(&pending, nullptr, WM_APP, WM_APP, PM_NOREMOVE),
                               "process one and remaining queued messages");
-                        PostQuitMessage(0);
-                        check(pump(dispatcher, 2) == S_OK, "process until quit consumes real quit event");
                         dispatcher->Release();
                     }
                     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[19])(window, &handler, &token);
@@ -4602,7 +4714,37 @@ int main(int argc, char** argv) {
                     return S_OK;
                 }
                 virtual HRESULT STDMETHODCALLTYPE Run() {
+                    IInspectable* dispatcher=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,IInspectable**)>(
+                        (*reinterpret_cast<void***>(runtime_window))[7])(runtime_window,&dispatcher)==S_OK && dispatcher,
+                        "Run uses the same window dispatcher");
+                    const auto pump=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,INT32)>(
+                        (*reinterpret_cast<void***>(dispatcher))[7]);
                     check(IsWindowVisible(core_window_hwnd(nullptr)), "session shows the title before Run without a guest Activate call");
+                    check(visibility_changes==0,"showing the window does not reenter title initialization");
+                    check(pump(dispatcher,3)==S_OK && visibility_changes==1 && last_visibility,"dispatcher publishes the real initial visibility");
+                    ShowWindow(owned_window,SW_HIDE);
+                    check(visibility_changes==1 && pump(dispatcher,3)==S_OK && visibility_changes==2 && !last_visibility,"hiding the real CoreWindow queues its visibility snapshot");
+                    if(retained_visibility) {
+                        boolean value=FALSE;
+                        const auto get=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>((*reinterpret_cast<void***>(retained_visibility))[6]);
+                        check(get(retained_visibility,&value)==S_OK && value,"retained visibility args preserve their earlier snapshot after Hide");
+                        retained_visibility->Release();retained_visibility=nullptr;
+                    }
+                    ShowWindow(owned_window,SW_SHOW);
+                    check(pump(dispatcher,3)==S_OK,"show notification retires before activation checks");
+                    SendMessageW(owned_window,WM_ACTIVATE,WA_INACTIVE,0);
+                    check(pump(dispatcher,3)==S_OK && activation_state==1,"native deactivation message reaches CoreWindow through its dispatcher");
+                    SendMessageW(owned_window,WM_ACTIVATE,WA_ACTIVE,0);
+                    check(pump(dispatcher,3)==S_OK && activation_state==0,"native activation message reaches CoreWindow through its dispatcher");
+                    key_events=0;expected_key_up=false;
+                    SendMessageW(owned_window,WM_KEYDOWN,'A',2|(0x1eLL<<16)|(1LL<<30));
+                    expected_key_up=true;
+                    SendMessageW(owned_window,WM_KEYUP,'A',1|(0x1eLL<<16)|(1LL<<30)|(1LL<<31));
+                    check(key_events==2,"both native key messages reach the registered title handlers");
+                    PostQuitMessage(0);
+                    check(pump(dispatcher,2)==S_OK,"process until quit consumes real quit event");
+                    dispatcher->Release();
                     lifecycle += "R"; return S_OK;
                 }
                 virtual HRESULT STDMETHODCALLTYPE Uninitialize() { lifecycle += "U"; return S_OK; }
@@ -4627,6 +4769,20 @@ int main(int argc, char** argv) {
             IInspectable* app = nullptr;
             IInspectable* resources = nullptr;
             if (core) {
+                constexpr GUID iid_gpu_policy{0x42a6a529,0x3cc6,0x4867,{0xb5,0xb7,0x6d,0x1f,0xaf,0x53,0x25,0xf9}};
+                IInspectable* policy=nullptr;
+                check(core->QueryInterface(iid_gpu_policy,reinterpret_cast<void**>(&policy))==S_OK && policy,
+                      "CoreApplication exposes the requested GPU reservation policy");
+                if(policy) {
+                    const auto table=*reinterpret_cast<void***>(policy);
+                    const auto get=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean*)>(table[6]);
+                    const auto set=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,boolean)>(table[7]);
+                    boolean disabled=FALSE;
+                    check(get(policy,nullptr)==E_POINTER && set(policy,TRUE)==S_OK && get(policy,&disabled)==S_OK && disabled &&
+                        set(policy,FALSE)==S_OK && get(policy,&disabled)==S_OK && !disabled,
+                        "Kinect reservation policy retains both requested values without asserting physical processing");
+                    policy->Release();
+                }
                 check(core->QueryInterface(iid_core_application, reinterpret_cast<void**>(&app)) == S_OK && app, "ICoreApplication");
                 check(core->QueryInterface(iid_resources, reinterpret_cast<void**>(&resources)) == S_OK && resources,
                       "Xbox resource availability interface");

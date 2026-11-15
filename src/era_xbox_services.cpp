@@ -163,6 +163,11 @@ private:
 
 } // namespace
 
+std::wstring title_package_root() {
+    std::lock_guard lock(package_mutex);
+    return package_root;
+}
+
 void set_title_package_root(const std::wstring& root, const std::string& executable, const std::string& sha256) {
     std::lock_guard lock(package_mutex);
     package_root = root;

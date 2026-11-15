@@ -2556,6 +2556,11 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary
         if(FAILED(hr)) {std::fprintf(stderr,"xone-era: frame pixel verification failed 0x%08lX\n",hr);return;}
         const UINT mask=packed11 ? UINT_MAX : packed10 ? 0x3fffffff : 0x00ffffff;
         const auto nonblack=std::count_if(pixels.begin(),pixels.end(),[&](UINT value){return (value&mask)!=0;});
+        if(desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format==DXGI_FORMAT_B8G8R8A8_UNORM) {
+            const auto transparent=std::count_if(pixels.begin(),pixels.end(),[](UINT value){return (value>>24)==0;});
+            const auto opaque=std::count_if(pixels.begin(),pixels.end(),[](UINT value){return (value>>24)==255;});
+            std::fprintf(stderr,"xone-era: %s alpha zero=%llu full=%llu first=0x%08X\n",boundary,UINT64(transparent),UINT64(opaque),pixels[0]);
+        }
         detail::Sha256 hash;
         hash.update(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()),pixels.size()*4));
         std::fprintf(stderr,"xone-era: %s pixels %ux%u format %u sequence=%llu samples=%u nonblack %llu/%llu SHA256 %s resource=%p backing=%p thread=%lu\n",boundary,desc.Width,desc.Height,desc.Format,frame,desc.SampleDesc.Count,
@@ -3487,9 +3492,14 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     const auto started=timed ? timing_tick() : 0;
     UINT64 topology=0;std::memcpy(&topology,self->inline_state.data()+0x170-32,sizeof topology);
     const auto primitive = topology == 0x000009ffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST :
-        topology == 0x00000dffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+        topology == 0x00000dffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP :
+        topology == 0x000003ffc0009e00ull ? D3D_PRIMITIVE_TOPOLOGY_POINTLIST : D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
     if((indexed && !self->index_buffer) ||
-        !self->render_targets[0] || !self->viewport_count || primitive == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED) return unsupported(__LINE__);
+        !self->viewport_count || primitive == D3D_PRIMITIVE_TOPOLOGY_UNDEFINED) {
+        std::fprintf(stderr,"xone-era: draw incomplete indexed=%u count=%u index=%p target=%p viewports=%u topology=0x%llX\n",
+            indexed,count,self->index_buffer,self->render_targets[0],self->viewport_count,topology);
+        return unsupported(__LINE__);
+    }
     if(self->raster_state && self->raster_state->desc.ScissorEnable) {
         if(graphics_diagnostics.load()) std::fputs("xone-era: draw requires unsupported scissor state\n",stderr);
         return unsupported(__LINE__);
@@ -3557,7 +3567,8 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     pipeline.PS={self->shaders[0]->code.data(),self->shaders[0]->code.size()};
     if(self->shaders[2]) pipeline.GS={self->shaders[2]->code.data(),self->shaders[2]->code.size()};
     if(self->input_layout) pipeline.InputLayout={self->input_layout->elements.data(),UINT(self->input_layout->elements.size())};
-    pipeline.SampleMask=self->sample_mask;pipeline.SampleDesc={1,0};pipeline.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline.SampleMask=self->sample_mask;pipeline.SampleDesc={1,0};
+    pipeline.PrimitiveTopologyType=primitive==D3D_PRIMITIVE_TOPOLOGY_POINTLIST ? D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     if(indexed && primitive == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
         pipeline.IBStripCutValue = self->index_format == DXGI_FORMAT_R16_UINT ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF;
     for(auto& target : pipeline.BlendState.RenderTarget) target={FALSE,FALSE,D3D12_BLEND_ONE,D3D12_BLEND_ZERO,D3D12_BLEND_OP_ADD,
@@ -3724,9 +3735,9 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         const bool read_only=!(entry.state&(D3D12_RESOURCE_STATE_RENDER_TARGET|D3D12_RESOURCE_STATE_DEPTH_WRITE|D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
         hr=entry.texture ? begin_title_gpu_texture(*entry.gpu,self->command_list.Get(),entry.state,false,nullptr,read_only) : begin_title_gpu_buffer(*entry.gpu,self->command_list.Get(),entry.state,read_only);
         if(FAILED(hr)) {
-            if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw resource ingress failed backing=%p format=%u samples=%u state=0x%X\n",
+            std::fprintf(stderr,"xone-era: draw resource ingress failed backing=%p format=%u samples=%u state=0x%X\n",
                 static_cast<std::uint8_t*>(entry.gpu->allocation)+entry.gpu->canonical_offset,entry.gpu->resource->GetDesc().Format,entry.gpu->resource->GetDesc().SampleDesc.Count,entry.state);
-            if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw depth enabled=%u stencil=%u write=%u resource flags=0x%X %llux%u\n",
+            std::fprintf(stderr,"xone-era: draw depth enabled=%u stencil=%u write=%u resource flags=0x%X %llux%u\n",
                 pipeline.DepthStencilState.DepthEnable,pipeline.DepthStencilState.StencilEnable,pipeline.DepthStencilState.DepthWriteMask,
                 entry.gpu->resource->GetDesc().Flags,entry.gpu->resource->GetDesc().Width,entry.gpu->resource->GetDesc().Height);
             return failed(hr,__LINE__);
@@ -3750,8 +3761,13 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     std::array<D3D12_VIEWPORT,D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports{};
     for(UINT i=0;i<self->viewport_count;++i) {const auto& v=self->viewports[i];viewports[i]={v.TopLeftX,v.TopLeftY,v.Width,v.Height,v.MinDepth,v.MaxDepth};}
     self->command_list->RSSetViewports(self->viewport_count,viewports.data());
-    const auto& extent=static_cast<Texture*>(self->render_targets[0]->resource)->desc.standard;
-    const D3D12_RECT scissor{0,0,LONG(extent.Width),LONG(extent.Height)};
+    // Draws without color/depth attachments are valid; their shader outputs are discarded by the native pipeline.
+    auto* attachment=self->render_targets[0] ? self->render_targets[0] : self->depth_target;
+    D3D12_RECT scissor{LONG(D3D12_VIEWPORT_BOUNDS_MIN),LONG(D3D12_VIEWPORT_BOUNDS_MIN),LONG(D3D12_VIEWPORT_BOUNDS_MAX),LONG(D3D12_VIEWPORT_BOUNDS_MAX)};
+    if(attachment) {
+        const auto& extent=static_cast<Texture*>(attachment->resource)->desc.standard;
+        scissor={0,0,LONG(extent.Width),LONG(extent.Height)};
+    }
     self->command_list->RSSetScissorRects(1,&scissor);
     self->command_list->OMSetBlendFactor(self->blend_factor.data());self->command_list->OMSetStencilRef(self->stencil_reference);
     self->command_list->IASetPrimitiveTopology(primitive);
@@ -3786,7 +3802,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
                 diagnose_presented_pixels(texture,self->completed_draws+1,"draw sampled");
             }
         }
-        diagnose_presented_pixels(static_cast<Texture*>(self->render_targets[0]->resource),self->completed_draws+1,"draw target");
+        if(self->render_targets[0]) diagnose_presented_pixels(static_cast<Texture*>(self->render_targets[0]->resource),self->completed_draws+1,"draw target");
     }
     ++self->completed_draws;
     if((stop_on_missing_service() || self->device->legacy) && self->completed_draws<=2)

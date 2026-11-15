@@ -17,10 +17,13 @@
 
 #include <activation.h>
 #include <winstring.h>
+#include <windows.ui.core.h>
+#include <wrl.h>
 
 #include <cstdio>
 #include <cwchar>
 #include <atomic>
+#include <deque>
 #include <iterator>
 #include <new>
 
@@ -36,11 +39,13 @@ constexpr GUID iid_core_application{0x0aacf7a4, 0x5e1d, 0x49df, {0x80, 0x34, 0xf
 // Xbox extension of CoreApplication: 6 get_ResourceAvailability,
 // 7/8 ResourceAvailabilityChanged (layout per WinDurango's public headers).
 constexpr GUID iid_resource_availability{0x9ff3799e, 0x6e83, 0x468c, {0xa5, 0xb0, 0x50, 0x1c, 0xe6, 0xbb, 0x0f, 0xa1}};
+constexpr GUID iid_gpu_policy{0x42a6a529,0x3cc6,0x4867,{0xb5,0xb7,0x6d,0x1f,0xaf,0x53,0x25,0xf9}};
 constexpr GUID iid_view{0x638bb2db, 0x451d, 0x4661, {0xb0, 0x99, 0x41, 0x4f, 0x34, 0xff, 0xb9, 0xf1}};
 constexpr GUID iid_view_source{0xcd770614, 0x65c4, 0x426c, {0x94, 0x94, 0x34, 0xfc, 0x43, 0x55, 0x48, 0x62}};
 constexpr GUID iid_framework_view{0xfaab5cd0, 0x8924, 0x45ac, {0xad, 0x0f, 0xa0, 0x8f, 0xae, 0x5d, 0x03, 0x24}};
 constexpr GUID iid_core_window{0x79b9d5f2, 0x879e, 0x4b89, {0xb7, 0x98, 0x79, 0xe4, 0x75, 0x98, 0x03, 0x0c}};
 constexpr GUID iid_activated_args{0xcf651713, 0xcd08, 0x4fd8, {0xb6, 0x97, 0xa2, 0x81, 0xb6, 0x54, 0x4e, 0x2e}};
+constexpr GUID iid_launch_args{0xfbc93e26,0xa14a,0x4b4f,{0x82,0xb0,0x33,0xbe,0xd9,0x20,0xaf,0x52}};
 
 // Window client size: the 1080p output Xbox One titles render for.
 constexpr int window_width = 1920;
@@ -88,9 +93,88 @@ WinrtObject& view() {
 // KeyDown, KeyUp, PointerMoved, PointerEntered, PointerExited, SizeChanged
 // (33/34), VisibilityChanged (35/36).
 HWND window = nullptr;
+WinrtObject& core_window();
 std::atomic<DWORD> window_thread{0};
 bool dispatcher_quit = false; // Accessed only by the window thread.
 WinrtEvent window_closed;
+WinrtEvent window_visibility;
+WinrtEvent window_activated;
+WinrtEvent window_key_down,window_key_up;
+bool last_visible=false;
+HRESULT window_event_error=S_OK;
+struct PendingWindowEvent {WinrtEvent* event;Microsoft::WRL::ComPtr<IInspectable> args;};
+std::deque<PendingWindowEvent> pending_window_events;
+class VisibilityArgs final : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::WinRt>,ABI::Windows::UI::Core::IVisibilityChangedEventArgs> {
+    InspectableClass(L"Windows.UI.Core.VisibilityChangedEventArgs",BaseTrust);
+    const boolean visible_;
+public:
+    explicit VisibilityArgs(boolean visible):visible_(visible) {}
+    HRESULT STDMETHODCALLTYPE get_Visible(boolean* value) override {
+        if(!value)return E_POINTER;*value=visible_;return S_OK;
+    }
+};
+class WindowActivationArgs final : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::WinRt>,ABI::Windows::UI::Core::IWindowActivatedEventArgs> {
+    InspectableClass(L"Windows.UI.Core.WindowActivatedEventArgs",BaseTrust);
+    const ABI::Windows::UI::Core::CoreWindowActivationState state_;
+public:
+    explicit WindowActivationArgs(ABI::Windows::UI::Core::CoreWindowActivationState state):state_(state) {}
+    HRESULT STDMETHODCALLTYPE get_WindowActivationState(ABI::Windows::UI::Core::CoreWindowActivationState* value) override {
+        if(!value)return E_POINTER;*value=state_;return S_OK;
+    }
+};
+class KeyArgs final : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::WinRt>,ABI::Windows::UI::Core::IKeyEventArgs,ABI::Windows::UI::Core::ICoreWindowEventArgs> {
+    InspectableClass(L"Windows.UI.Core.KeyEventArgs",BaseTrust);
+    const ABI::Windows::System::VirtualKey key_;
+    const ABI::Windows::UI::Core::CorePhysicalKeyStatus status_;
+    std::atomic<boolean> handled_{false};
+public:
+    KeyArgs(WPARAM key,LPARAM status):key_(static_cast<ABI::Windows::System::VirtualKey>(key)),status_{
+        UINT32(status&0xffff),UINT32((status>>16)&255),boolean((status>>24)&1),boolean((status>>29)&1),boolean((status>>30)&1),boolean((status>>31)&1)} {}
+    HRESULT STDMETHODCALLTYPE get_VirtualKey(ABI::Windows::System::VirtualKey* value) override {if(!value)return E_POINTER;*value=key_;return S_OK;}
+    HRESULT STDMETHODCALLTYPE get_KeyStatus(ABI::Windows::UI::Core::CorePhysicalKeyStatus* value) override {if(!value)return E_POINTER;*value=status_;return S_OK;}
+    HRESULT STDMETHODCALLTYPE get_Handled(boolean* value) override {if(!value)return E_POINTER;*value=handled_.load();return S_OK;}
+    HRESULT STDMETHODCALLTYPE put_Handled(boolean value) override {handled_=value!=FALSE;return S_OK;}
+    bool handled() const {return handled_.load()!=FALSE;}
+};
+void dispatch_window_event(WinrtEvent& event,IInspectable* args) {
+    for(auto* handler:event.snapshot()) {
+        const auto hr=call<HRESULT>(handler,3,&core_window(),args);
+        handler->Release();
+        if(FAILED(hr) && SUCCEEDED(window_event_error))window_event_error=hr;
+    }
+}
+void queue_window_event(WinrtEvent& event,IInspectable* args) {
+    try {pending_window_events.push_back({&event,args});}
+    catch(const std::bad_alloc&) {window_event_error=E_OUTOFMEMORY;}
+}
+void drain_window_events() {
+    // Reference 14006d860/14006f190: window notifications reach the title at dispatcher boundaries.
+    while(!pending_window_events.empty() && SUCCEEDED(window_event_error)) {
+        auto event=std::move(pending_window_events.front());pending_window_events.pop_front();
+        dispatch_window_event(*event.event,event.args.Get());
+    }
+}
+HRESULT STDMETHODCALLTYPE get_visible(WinrtObject*,boolean* value) {
+    if(!value)return E_POINTER;
+    if(!window)return RO_E_CLOSED;
+    *value=IsWindowVisible(window)!=FALSE;return S_OK;
+}
+HRESULT STDMETHODCALLTYPE add_visibility(WinrtObject*,IUnknown* handler,std::int64_t* token) {return window_visibility.add(handler,token);}
+HRESULT STDMETHODCALLTYPE remove_visibility(WinrtObject*,std::int64_t token) {return window_visibility.remove(token);}
+HRESULT STDMETHODCALLTYPE add_window_activated(WinrtObject*,IUnknown* handler,std::int64_t* token) {return window_activated.add(handler,token);}
+HRESULT STDMETHODCALLTYPE remove_window_activated(WinrtObject*,std::int64_t token) {return window_activated.remove(token);}
+HRESULT STDMETHODCALLTYPE add_key_down(WinrtObject*,IUnknown* handler,std::int64_t* token) {return window_key_down.add(handler,token);}
+HRESULT STDMETHODCALLTYPE remove_key_down(WinrtObject*,std::int64_t token) {return window_key_down.remove(token);}
+HRESULT STDMETHODCALLTYPE add_key_up(WinrtObject*,IUnknown* handler,std::int64_t* token) {return window_key_up.add(handler,token);}
+HRESULT STDMETHODCALLTYPE remove_key_up(WinrtObject*,std::int64_t token) {return window_key_up.remove(token);}
+void notify_visibility(HWND hwnd) {
+    const boolean visible=IsWindowVisible(hwnd)!=FALSE;
+    if((visible!=FALSE)==last_visible)return;
+    last_visible=visible!=FALSE;
+    auto args=Microsoft::WRL::Make<VisibilityArgs>(visible);
+    if(!args){window_event_error=E_OUTOFMEMORY;return;}
+    queue_window_event(window_visibility,static_cast<ABI::Windows::UI::Core::IVisibilityChangedEventArgs*>(args.Get()));
+}
 
 HRESULT STDMETHODCALLTYPE thread_access(WinrtObject*, boolean* value) {
     if (!value) return E_POINTER;
@@ -101,8 +185,12 @@ HRESULT STDMETHODCALLTYPE process_events(WinrtObject*, INT32 option) {
     if (option < 0 || option > 3) return E_INVALIDARG;
     if (!window_thread || GetCurrentThreadId() != window_thread) return RPC_E_WRONG_THREAD;
     if (dispatcher_quit) return S_OK;
+    const bool had_pending=!pending_window_events.empty();
+    drain_window_events();
+    if(FAILED(window_event_error))return window_event_error;
+    if(had_pending && option==1)return S_OK;
     MSG message{};
-    bool wait = option == 0 || option == 2;
+    bool wait = (option == 0 && !had_pending) || option == 2;
     do {
         const HRESULT input = poll_title_input();
         if (FAILED(input)) return input;
@@ -114,6 +202,8 @@ HRESULT STDMETHODCALLTYPE process_events(WinrtObject*, INT32 option) {
         if (message.message == WM_QUIT) { dispatcher_quit = true; return S_OK; }
         TranslateMessage(&message);
         DispatchMessageW(&message);
+        drain_window_events();
+        if(FAILED(window_event_error))return window_event_error;
         if (option == 1) return S_OK;
         wait = option == 2;
     } while (!dispatcher_quit);
@@ -147,8 +237,8 @@ HRESULT STDMETHODCALLTYPE activate_window(WinrtObject*) {
     if (GetCurrentThreadId() != window_thread) return RPC_E_WRONG_THREAD;
     ShowWindow(window, SW_SHOW);
     if (auto parent = session_parent()) { SetForegroundWindow(parent); SetFocus(window); }
-    else SetForegroundWindow(window);
-    return S_OK;
+    else {SetForegroundWindow(window);SetFocus(window);}
+    return window_event_error;
 }
 HRESULT core_window_query(WinrtObject* self,REFIID iid,void** out) {
     // Reference Window QI accepts the standard COM agility marker; methods keep their thread checks.
@@ -170,10 +260,29 @@ LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lpar
         if ((message >= WM_KEYFIRST && message <= WM_KEYLAST) && !session_title_input()) return 0;
     }
     if (message == WM_DESTROY && window_thread == GetCurrentThreadId()) PostQuitMessage(0);
-    return DefWindowProcW(hwnd, message, wparam, lparam);
+    if(message==WM_KEYDOWN || message==WM_SYSKEYDOWN || message==WM_KEYUP || message==WM_SYSKEYUP) {
+        auto args=Microsoft::WRL::Make<KeyArgs>(wparam,lparam);
+        if(!args){window_event_error=E_OUTOFMEMORY;return 0;}
+        dispatch_window_event(message==WM_KEYDOWN || message==WM_SYSKEYDOWN ? window_key_down : window_key_up,
+            static_cast<ABI::Windows::UI::Core::IKeyEventArgs*>(args.Get()));
+        if(args->handled())return 0;
+    }
+    const auto result=DefWindowProcW(hwnd, message, wparam, lparam);
+    if(message==WM_WINDOWPOSCHANGED)notify_visibility(hwnd);
+    if(message==WM_ACTIVATE) {
+        using namespace ABI::Windows::UI::Core;
+        const auto state=LOWORD(wparam)==WA_INACTIVE ? CoreWindowActivationState_Deactivated :
+            LOWORD(wparam)==WA_CLICKACTIVE ? CoreWindowActivationState_PointerActivated : CoreWindowActivationState_CodeActivated;
+        auto args=Microsoft::WRL::Make<WindowActivationArgs>(state);
+        if(args)queue_window_event(window_activated,static_cast<IWindowActivatedEventArgs*>(args.Get()));
+        else window_event_error=E_OUTOFMEMORY;
+    }
+    return result;
 }
 
 HRESULT create_window() {
+    pending_window_events.clear();
+    last_visible=false;window_event_error=S_OK;
     WNDCLASSEXW wc{sizeof wc};
     wc.lpfnWndProc = window_proc;
     wc.hInstance = GetModuleHandleW(nullptr);
@@ -197,10 +306,19 @@ HRESULT create_window() {
 WinrtObject& core_window() {
     static const auto vt = [] {
         auto t = winrt_vtable();
+        t[10] = reinterpret_cast<const void*>(&get_visible);
         t[7] = reinterpret_cast<const void*>(&get_dispatcher);
         t[11] = reinterpret_cast<const void*>(&activate_window);
+        t[15] = reinterpret_cast<const void*>(&add_window_activated);
+        t[16] = reinterpret_cast<const void*>(&remove_window_activated);
+        t[23] = reinterpret_cast<const void*>(&add_key_down);
+        t[24] = reinterpret_cast<const void*>(&remove_key_down);
+        t[25] = reinterpret_cast<const void*>(&add_key_up);
+        t[26] = reinterpret_cast<const void*>(&remove_key_up);
         t[19] = reinterpret_cast<const void*>(&add_closed);
         t[20] = reinterpret_cast<const void*>(&remove_closed);
+        t[35] = reinterpret_cast<const void*>(&add_visibility);
+        t[36] = reinterpret_cast<const void*>(&remove_visibility);
         return t;
     }();
     static WinrtObject object{vt.data(), window_class, iid_core_window, &core_window_query};
@@ -208,19 +326,45 @@ WinrtObject& core_window() {
 }
 
 // --- Launch activation arguments --------------------------------------------
+WinrtObject& launch_args();
+WinrtObject& launch_options();
+HRESULT launch_query(WinrtObject*,REFIID iid,void** out) {
+    if(iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==iid_activated_args) {*out=&launch_args();return S_OK;}
+    if(iid==iid_launch_args) {*out=&launch_options();return S_OK;}
+    return E_NOINTERFACE;
+}
+HRESULT STDMETHODCALLTYPE empty_launch_string(WinrtObject*,HSTRING* value) {
+    if(!value)return E_POINTER;
+    return WindowsCreateString(L"",0,value); // This session has no guest arguments or pinned-tile activation.
+}
+WinrtObject& launch_options() {
+    static const auto vt=[] {auto t=winrt_vtable();t[6]=reinterpret_cast<const void*>(&empty_launch_string);t[7]=t[6];return t;}();
+    static WinrtObject object{vt.data(),args_class,iid_launch_args,&launch_query};
+    return object;
+}
 HRESULT STDMETHODCALLTYPE activation_kind(WinrtObject*, INT32* kind) {
     if (!kind) return E_POINTER;
     *kind = 0; // ActivationKind::Launch: this event is dispatched by CoreApplication::Run.
     return S_OK;
+}
+HRESULT STDMETHODCALLTYPE previous_execution_state(WinrtObject*,INT32* value) {
+    if(!value)return E_POINTER;
+    *value=0;return S_OK; // NotRunning: this is a new title process, not a resumed session.
+}
+HRESULT STDMETHODCALLTYPE activation_splash(WinrtObject*,IInspectable** value) {
+    if(!value)return E_POINTER;
+    *value=nullptr;return S_OK; // This local activation has no SystemOS splash-screen object.
 }
 
 WinrtObject& launch_args() {
     static const auto vt = [] {
         auto t = winrt_vtable();
         t[6] = reinterpret_cast<const void*>(&activation_kind);
+        t[7] = reinterpret_cast<const void*>(&previous_execution_state);
+        t[8] = reinterpret_cast<const void*>(&activation_splash);
         return t;
     }();
-    static WinrtObject object{vt.data(), args_class, iid_activated_args, &self_query};
+    static WinrtObject object{vt.data(), args_class, iid_activated_args, &launch_query};
     return object;
 }
 
@@ -270,6 +414,10 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
         const HRESULT un = call<HRESULT>(fv, 10);
         if (SUCCEEDED(hr)) hr = un;
     }
+    window_visibility.clear();
+    pending_window_events.clear();
+    window_activated.clear();
+    window_key_down.clear();window_key_up.clear();
     static_cast<IUnknown*>(fv)->Release();
     stop_title_input();
     suspend_window = nullptr;
@@ -362,6 +510,22 @@ HRESULT STDMETHODCALLTYPE remove_resuming(WinrtObject*, std::int64_t t) { return
 
 // --- Factory -------------------------------------------------------------------
 HRESULT query(WinrtObject*, REFIID iid, void** out);
+std::atomic<boolean> kinect_gpu_reservation_disabled{false}; // Requested policy only; no physical Kinect reservation or processing is implemented.
+HRESULT STDMETHODCALLTYPE get_kinect_reservation_disabled(WinrtObject*,boolean* value) {
+    if(!value)return E_POINTER;
+    *value=kinect_gpu_reservation_disabled.load();return S_OK;
+}
+HRESULT STDMETHODCALLTYPE set_kinect_reservation_disabled(WinrtObject*,boolean value) {
+    static std::atomic<UINT> observations{0};
+    if(observations.fetch_add(1)<8)std::fprintf(stderr,"xone-era: Kinect GPU reservation disable request=%u\n",UINT(value));
+    kinect_gpu_reservation_disabled=value!=FALSE;
+    return S_OK;
+}
+WinrtObject& gpu_policy() {
+    static const auto vt=[] {auto t=winrt_vtable();t[6]=reinterpret_cast<const void*>(&get_kinect_reservation_disabled);
+        t[7]=reinterpret_cast<const void*>(&set_kinect_reservation_disabled);return t;}();
+    static WinrtObject object{vt.data(),class_name,iid_gpu_policy,&query};return object;
+}
 
 WinrtObject& activation() {
     static const auto vt = winrt_vtable();
@@ -407,6 +571,7 @@ HRESULT query(WinrtObject*, REFIID iid, void** out) {
         *out = &statics();
     else if (iid == iid_resource_availability)
         *out = &resource_availability();
+    else if(iid==iid_gpu_policy)*out=&gpu_policy();
     else
         return E_NOINTERFACE;
     return S_OK;

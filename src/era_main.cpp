@@ -107,8 +107,9 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH; // Debug print and thread naming are not faults.
     // Handled C++ failures must not exhaust the evidence budget for the first
     // actual memory fault. Both categories remain independently bounded.
+    static const LONG exception_limit=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TRACE_EXCEPTIONS",value,2)==1 && value[0]==L'1' ? 128L : 16L;}();
     if (code==EXCEPTION_ACCESS_VIOLATION ? InterlockedIncrement(&reported_access_violations)>2 :
-        InterlockedIncrement(&reported)>16) return EXCEPTION_CONTINUE_SEARCH;
+        InterlockedIncrement(&reported)>exception_limit) return EXCEPTION_CONTINUE_SEARCH;
     const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
     char line[256];
     if (at >= title_base && at < title_end)

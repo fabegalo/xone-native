@@ -4,6 +4,8 @@
 #include "era_audio.h"
 #include "era_display.h"
 #include "era_winrt_classes.h"
+#include "xboxone_native/appmodel.h"
+#include "file_path.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -647,6 +649,28 @@ bool writable_handle(HANDLE handle) {
 std::wstring title_path(LPCWSTR path) {
     if (!path || !*path) { SetLastError(ERROR_INVALID_PARAMETER); return {}; }
     std::wstring guest = path;
+    // XAML content URIs such as /Media/UI/Videos/... are package-rooted,
+    // not paths at the root of the host's current drive.
+    if(guest.front()==L'/' && !guest.starts_with(L"//")) {
+        const auto root=title_package_root();
+        if(root.empty()){SetLastError(ERROR_ACCESS_DENIED);return {};}
+        try {
+            const auto name=std::filesystem::path(guest.substr(1)).generic_u8string();
+            std::filesystem::path relative;
+            if(!appmodel::package_relative_path(std::string(name.begin(),name.end()),relative)) {
+                SetLastError(ERROR_INVALID_NAME);return {};
+            }
+            auto full=std::filesystem::path(root);
+            for(const auto& component:relative) {
+                full/=component;
+                const auto attributes=GetFileAttributesW(detail::file_path(full).c_str());
+                if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) {
+                    SetLastError(ERROR_ACCESS_DENIED);return {};
+                }
+            }
+            return detail::file_path(full).wstring();
+        } catch(const std::filesystem::filesystem_error&) {SetLastError(ERROR_INVALID_NAME);return {};}
+    }
     if (guest.starts_with(L"\\\\?\\")) guest.erase(0, 4);
     if (guest.size() < 2 || (guest[0] != L'T' && guest[0] != L't') || guest[1] != L':') return path;
     if (guest.size() < 3 || (guest[2] != L'\\' && guest[2] != L'/')) {
@@ -680,6 +704,19 @@ std::wstring title_path(LPCWSTR path) {
 
 HANDLE WINAPI era_CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
                               DWORD disposition, DWORD flags, HANDLE template_file) {
+    struct OpenTrace {
+        LPCWSTR path; DWORD access,disposition; void* caller; HANDLE file=INVALID_HANDLE_VALUE;
+        ~OpenTrace() {
+            const DWORD error=GetLastError();
+            static const bool enabled=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TRACE_IO",value,2)==1 && value[0]==L'1';}();
+            static std::atomic<UINT> observations{0};
+            static std::atomic<UINT> late_observations{0};
+            if(enabled && (observations.fetch_add(1)<256 ||
+                ((file==INVALID_HANDLE_VALUE || (path && std::wstring_view(path).ends_with(L".bk2"))) && late_observations.fetch_add(1)<64)))
+                std::fprintf(stderr,"xone-era: content open caller=%p access=0x%lX disposition=%lu handle=%p error=%lu path=%ls\n",caller,access,disposition,file,error,path ? path : L"<null>");
+            SetLastError(error);
+        }
+    } trace{path,access,disposition,_ReturnAddress()};
     const auto translated = title_path(path);
     if (translated.empty()) return INVALID_HANDLE_VALUE;
     path = translated.c_str();
@@ -688,6 +725,7 @@ HANDLE WINAPI era_CreateFileW(LPCWSTR path, DWORD access, DWORD share, LPSECURIT
     if (((access & mutation) || disposition != OPEN_EXISTING || (flags & FILE_FLAG_DELETE_ON_CLOSE)) &&
         !writable_path(path)) return INVALID_HANDLE_VALUE;
     const HANDLE file=CreateFileW(path, access, share, security, disposition, flags, template_file);
+    trace.file=file;
     const DWORD error=GetLastError();
     if(file==INVALID_HANDLE_VALUE && stop_on_missing_service() && (error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND)) {
         static std::atomic<UINT> missing_files{0};
@@ -1350,13 +1388,20 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     HRESULT hr = list->GetDevice(IID_PPV_ARGS(&device));
     if (FAILED(hr)) return hr;
     if (device.Get() != backing->device.Get()) return DXGI_ERROR_INVALID_CALL;
+    const auto busy=[&](const char* reason,SIZE_T offset,SIZE_T bytes,const GpuWindow* alias) {
+        static std::atomic<UINT> observations{0};
+        if(observations.fetch_add(1)<64)std::fprintf(stderr,"xone-era: GPU claim busy reason=%s request=%p+0x%llX bytes=0x%llX native=%p list=%p owner_offset=0x%llX owner_bytes=0x%llX active=%p cpu=%u owner_native=%p owner_list=%p\n",
+            reason,buffer.allocation,UINT64(buffer.canonical_offset),UINT64(buffer.size),buffer.resource,list,UINT64(offset),UINT64(bytes),
+            alias ? alias->active : nullptr,alias ? UINT(alias->cpu != nullptr) : 0,alias ? alias->resource.Get() : nullptr,alias ? alias->list.Get() : nullptr);
+        return HRESULT_FROM_WIN32(ERROR_BUSY);
+    };
     for (const auto& [range, alias] : backing->windows) {
-        if (alias.cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (alias.cpu) return busy("CPU",range.first,range.second,&alias);
         // The canonical parent has one D3D12 state. Independent queues/lists
         // must finish their fence before another list can transition it.
-        if (alias.active && alias.list.Get() != list) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (alias.active && alias.list.Get() != list) return busy("other list",range.first,range.second,&alias);
         if (alias.active && buffer.canonical_offset < range.first + range.second &&
-            range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
+            range.first < buffer.canonical_offset + buffer.size) return busy("overlap",range.first,range.second,&alias);
     }
     if ((state & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) &&
         !(window->resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) return DXGI_ERROR_UNSUPPORTED;
@@ -1371,7 +1416,10 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     hr = physical_pages(buffer, window->physical_pages, true);
     if (FAILED(hr)) return hr;
     for (UINT page = 0; page < window->physical_pages.size(); ++page)
-        if (window->physical_pages[page] && (esram.pages[page].gpu || esram.pages[page].cpu)) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        if (window->physical_pages[page] && (esram.pages[page].gpu || esram.pages[page].cpu)) {
+            std::fprintf(stderr,"xone-era: ESRAM claim busy page=%u request=%p owner=%p cpu=%u\n",page,&buffer,esram.pages[page].gpu,UINT(esram.pages[page].cpu != nullptr));
+            return busy("ESRAM page",page,esram_page_bytes,nullptr);
+        }
     for (UINT page = 0; page < window->physical_pages.size(); ++page)
         if (window->physical_pages[page]) esram.pages[page].gpu = &buffer;
     window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;

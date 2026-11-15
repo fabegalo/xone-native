@@ -21,6 +21,7 @@ HRESULT title_entry_point(std::wstring& entry_point);
 HRESULT title_chunk_installed(std::uint32_t chunk, bool& installed);
 HRESULT title_installed_chunks(std::vector<std::uint32_t>& chunks);
 HRESULT title_package_metadata(appmodel::Manifest& manifest, std::wstring& root, std::string& revision);
+std::wstring title_package_root();
 HRESULT package_factory(REFIID iid, void** factory);
 // HWND behind a CoreWindow handed to the title, or null if `window` is not ours.
 HWND core_window_hwnd(const void* window);

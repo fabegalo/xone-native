@@ -14,6 +14,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "session_surface_windows.h"
 #endif
 
 namespace xboxone::session {
@@ -133,6 +134,7 @@ public:
         if (request.mode == Mode::run) {
             command += L" --storage " + quote(request.storage.wstring());
             command += request.time_limit_ms ? L" --timeout-ms " + std::to_wstring(request.time_limit_ms) : L" --no-deadline";
+            if (request.session_window) command += L" --session-window " + std::to_wstring(request.session_window);
         }
         job_.reset(CreateJobObjectW(nullptr, nullptr));
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -155,6 +157,16 @@ public:
         thread.reset(info.hThread);
         process_.reset(info.hProcess);
         pid_ = info.dwProcessId;
+        surface_.reset();
+        parent_ = reinterpret_cast<HWND>(request.session_window);
+        child_ = nullptr;
+        mode_ = SurfaceMode::title;
+        if (parent_ && !surface_.connect(pid_, parent_, true)) {
+            TerminateProcess(process_.value, 1);
+            process_.reset();
+            error = "cannot bind the session presentation surface";
+            return false;
+        }
         // Opened by xone-era's suspend watch (era_core_application.cpp) under this name.
         suspend_.reset(request.mode == Mode::run ?
             CreateEventW(nullptr, TRUE, FALSE, (L"Local\\xone-era-suspend-" + std::to_wstring(pid_)).c_str()) : nullptr);
@@ -177,6 +189,7 @@ public:
 
     bool poll(Result& result) override {
         if (!active()) return false;
+        sync_window();
         if (kill_at_ && std::chrono::steady_clock::now() >= *kill_at_) { TerminateJobObject(job_.value, 1); kill_at_.reset(); }
         if (WaitForSingleObject(process_.value, 0) != WAIT_OBJECT_0) return false;
         DWORD code = 0;
@@ -185,6 +198,8 @@ public:
         job_.reset();
         suspend_.reset();
         kill_at_.reset();
+        surface_.reset();
+        parent_ = child_ = nullptr;
         result = interpret(static_cast<int>(code), terminated_, read_tail(log_));
         result.duration_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started_).count());
@@ -204,6 +219,13 @@ public:
 
     bool focus_title() override {
         if (!active()) return false;
+        if (parent_) {
+            mode_ = SurfaceMode::title;
+            sync_window();
+            if (!child_) return false;
+            SetForegroundWindow(parent_);
+            return SetFocus(child_) != nullptr || GetFocus() == child_;
+        }
         struct Search { DWORD pid; HWND found; } search{pid_, nullptr};
         EnumWindows([](HWND window, LPARAM data) -> BOOL {
             auto& s = *reinterpret_cast<Search*>(data);
@@ -218,7 +240,40 @@ public:
         return SetForegroundWindow(search.found) != FALSE;
     }
 
+    bool present_system_ui(const SystemUiFrame& frame) override {
+        if (!parent_ || !surface_.publish(frame)) return false;
+        mode_ = frame.mode;
+        sync_window();
+        return true;
+    }
+
 private:
+    void sync_window() {
+        if (!parent_ || !IsWindow(parent_)) return;
+        if (!IsWindow(child_)) {
+            struct Search { DWORD pid; HWND child = nullptr; } search{pid_};
+            EnumChildWindows(parent_, [](HWND window, LPARAM context) -> BOOL {
+                auto& s = *reinterpret_cast<Search*>(context);
+                DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+                if (pid == s.pid) { s.child = window; return FALSE; }
+                return TRUE;
+            }, reinterpret_cast<LPARAM>(&search));
+            child_ = search.child;
+        }
+        if (!child_) return;
+        RECT area{}, current{}; GetClientRect(parent_, &area); GetClientRect(child_, &current);
+        if (area.right != current.right || area.bottom != current.bottom)
+            SetWindowPos(child_, nullptr, 0, 0, area.right, area.bottom, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+        const bool visible = mode_ != SurfaceMode::system_ui;
+        if (bool(IsWindowVisible(child_)) != visible) ShowWindow(child_, visible ? SW_SHOWNA : SW_HIDE);
+        if (GetForegroundWindow() == parent_ && !IsIconic(parent_)) {
+            if (mode_ == SurfaceMode::title && GetFocus() == parent_) SetFocus(child_);
+            else if (mode_ != SurfaceMode::title && GetFocus() == child_) SetFocus(parent_);
+        }
+    }
+    SurfaceChannel surface_;
+    HWND parent_ = nullptr, child_ = nullptr;
+    SurfaceMode mode_ = SurfaceMode::title;
     Handle process_, job_, suspend_;
     std::chrono::milliseconds grace_{0};
     std::optional<std::chrono::steady_clock::time_point> kill_at_;

@@ -349,15 +349,7 @@ std::vector<Item> Dashboard::page_items(Page which) const {
         for (auto& item : out) item.color = item.kind == Kind::key ? 0xFF333333 : item.color;
         break;
     }
-    case Page::session: {
-        const auto* t = title(session_title);
-        out.push_back(action("session:return", Kind::button, {730, 760, 460, 64}, translate("Return to game"), 0xE768, [self] {
-            if (!self->session_.focus_title()) self->notify(self->translate("Starting") + "...");
-        }));
-        out.push_back(action("session:quit", Kind::button, {730, 832, 460, 64}, translate("Quit game"), 0xE711, [self] { self->quit_title(); }));
-        if (t) out.front().detail = t->name;
-        break;
-    }
+    case Page::session: break; // The title owns this surface; system actions live in the Guide.
     }
     return out;
 }
@@ -558,7 +550,8 @@ std::vector<Item> Dashboard::guide_items() const {
     if (const auto* t = title(session_title)) {
         y += 16;
         entry("guide:return", translate("Return to game") + ": " + t->name, 0xE768, [self] {
-            if (!self->session_.focus_title()) { self->go(Page::session); }
+            self->go(Page::session);
+            self->session_.focus_title();
         });
         entry("guide:quit", translate("Quit game") + ": " + t->name, 0xE711, [self] { self->quit_title(); });
         y += 16;
@@ -682,7 +675,8 @@ void Dashboard::launch(const std::string& id) {
     const auto* p = profile();
     if (!t || !p) return;
     if (id == session_title) {
-        if (!session_.focus_title()) go(Page::session);
+        go(Page::session);
+        session_.focus_title();
         return;
     }
     if (!session_title.empty()) {
@@ -707,6 +701,7 @@ void Dashboard::launch(const std::string& id) {
     const auto storage = console::title_storage(root_, *p, *t);
     session::Request request;
     request.mode = session::Mode::run;
+    request.session_window = platform_.session_window();
     request.runtime = runtime_;
     request.title = to_path(t->executable);
     request.storage = storage;
@@ -908,11 +903,18 @@ void Dashboard::input(Button b) {
         if (!signed_in) return;
         guide_open = !guide_open;
         if (guide_open) { guide_focus.clear(); platform_.focus_dashboard(); }
+        else if (page == Page::session && !session_title.empty()) session_.focus_title();
         platform_.play(guide_open ? Sound::open : Sound::back);
         ++serial;
         return;
     }
-    if (guide_open && b == Button::b) { guide_open = false; platform_.play(Sound::back); ++serial; return; }
+    if (guide_open && b == Button::b) {
+        guide_open = false;
+        if (page == Page::session && !session_title.empty()) session_.focus_title();
+        platform_.play(Sound::back);
+        ++serial;
+        return;
+    }
     switch (b) {
         case Button::up: case Button::down: case Button::left: case Button::right: move(b); return;
         default: break;

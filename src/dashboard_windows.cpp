@@ -92,6 +92,10 @@ void GdiSurface::text(Canvas&, const std::string& utf8, int x, int y, int w, int
     flags |= align == Align::center ? DT_CENTER : align == Align::right ? DT_RIGHT : DT_LEFT;
     DrawTextW(dc_, text.c_str(), static_cast<int>(text.size()), &r, flags);
     GdiFlush();
+    // GDI clears glyph alpha. Text is drawn on opaque UI panels, including Guide.
+    for (int row = std::max(0, y); row < std::min(height_, y + h); ++row)
+        for (int col = std::max(0, x); col < std::min(width_, x + w); ++col)
+            bits_[std::size_t(row) * width_ + col] |= 0xFF000000u;
 }
 
 const Image* GdiSurface::image(const std::string& utf8_path) {
@@ -243,11 +247,11 @@ public:
         MONITORINFO monitor{sizeof monitor};
         GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &monitor);
         if (fullscreen) {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN);
             const auto& m = monitor.rcMonitor;
             SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
         } else {
-            SetWindowLongPtrW(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+            SetWindowLongPtrW(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN);
             const auto& work = monitor.rcWork;
             // Client area keeps the frame aspect and fits the work area (DXGI scales the swapchain).
             int cw = static_cast<int>(width), ch = static_cast<int>(height);
@@ -272,7 +276,9 @@ public:
         if (!hwnd) return;
         if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
         if (!SetForegroundWindow(hwnd)) SwitchToThisWindow(hwnd, TRUE);
+        SetFocus(hwnd);
     }
+    std::uintptr_t session_window() override { return reinterpret_cast<std::uintptr_t>(window()); }
 
     bool open_folder(const std::filesystem::path& folder) override {
         std::error_code ec;
@@ -312,8 +318,8 @@ public:
             const WORD pressed = buttons & ~pads.held[i];
             pads.held[i] = buttons;
             if (!ui) continue;
-            if (pressed & guide_button) { ui->controller_hints = true; ui->input(Button::guide); }
-            if (!foreground) continue; // a running title owns the controller; only the Guide reaches the dashboard
+            if ((pressed & guide_button) && foreground) { ui->controller_hints = true; ui->input(Button::guide); }
+            if (!foreground || ui->active_surface() == session::SurfaceMode::title) continue;
             static constexpr std::pair<int, Button> map[] = {
                 {XINPUT_GAMEPAD_A, Button::a}, {XINPUT_GAMEPAD_B, Button::b}, {XINPUT_GAMEPAD_X, Button::x},
                 {XINPUT_GAMEPAD_Y, Button::y}, {XINPUT_GAMEPAD_START, Button::menu}, {XINPUT_GAMEPAD_BACK, Button::view},
@@ -332,6 +338,7 @@ public:
 
     void key(std::uint32_t vk) {
         if (!ui) return;
+        if (ui->active_surface() == session::SurfaceMode::title && vk != VK_HOME && vk != VK_F1) return;
         ui->controller_hints = false;
         const bool typing = ui->page == Page::keyboard && ui->dialogs.empty() && !ui->guide_open;
         switch (vk) {
@@ -401,7 +408,9 @@ int run_host() {
     }
     SetForegroundWindow(host.window());
 
-    Renderer renderer;
+    Renderer renderer, overlay_renderer;
+    GdiSurface overlay_surface;
+    if (!overlay_surface.resize(1920, 1080)) return 1;
     std::vector<presentation::WindowInputEvent> events;
     std::uint64_t drawn = ~0ULL;
     bool animating = true, hotkey = false;
@@ -414,7 +423,8 @@ int run_host() {
             if (e.kind == presentation::WindowInputEvent::Kind::key_down) host.key(e.code);
             else if (e.kind == presentation::WindowInputEvent::Kind::character && e.code >= 0x20 && !(e.code >= 0xD800 && e.code <= 0xDFFF))
                 ui.text(static_cast<char32_t>(e.code));
-            else if (e.kind == presentation::WindowInputEvent::Kind::hotkey && e.code == hotkey_guide) ui.input(Button::guide);
+            else if (e.kind == presentation::WindowInputEvent::Kind::hotkey && e.code == hotkey_guide &&
+                     GetForegroundWindow() == host.window()) ui.input(Button::guide);
         }
         host.poll_pads(GetForegroundWindow() == host.window());
         host.stop_rumble();
@@ -431,6 +441,17 @@ int run_host() {
             hotkey = want_hotkey;
         }
         if (drawn != ui.serial || animating || now - last_clock > 1.0) {
+            if (!ui.session_title.empty()) {
+                const auto mode = ui.active_surface();
+                auto overlay = overlay_surface.canvas();
+                if (mode == session::SurfaceMode::guide) overlay_renderer.draw(ui, overlay, overlay_surface, dt, true);
+                GdiFlush();
+                if (!session->present_system_ui({mode, 1920, 1080,
+                        std::span<const std::uint32_t>(overlay_surface.bits(), 1920 * 1080)})) {
+                    MessageBoxW(host.window(), L"Cannot publish the session system UI surface", L"xone-native", MB_ICONERROR);
+                    break;
+                }
+            }
             auto canvas = surface.canvas();
             animating = renderer.draw(ui, canvas, surface, dt);
             GdiFlush();

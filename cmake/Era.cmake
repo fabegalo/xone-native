@@ -11,7 +11,8 @@ add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJEC
             ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_display.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_input.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_deployment.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp)
+            ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp
+            ${PROJECT_SOURCE_DIR}/src/era_session.cpp)
 target_link_libraries(xboxone_era PRIVATE xboxone_inspection d3d12 dxgi dxguid runtimeobject oleaut32 xmllite shlwapi ole32 bcrypt version)
 target_link_libraries(xboxone_era PRIVATE xboxone_systemos)
 # Diagnostic vtable thunks need /bigobj to stay within COFF section limits.

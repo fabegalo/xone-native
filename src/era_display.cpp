@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "era_display.h"
+#include "era_session.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #include <climits>
@@ -11,7 +12,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
         const char* source, const D3D_SHADER_MACRO* macros,
         Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline,
         bool depth_target = false, UINT srv_count = 1, UINT stencil_bit = UINT_MAX,
-        DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+        DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, bool overlay = false) {
     if (!device) return E_INVALIDARG;
     struct CompilerModule {
         HMODULE handle;
@@ -50,6 +51,10 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
     auto& blend = desc.BlendState.RenderTarget[0];
     blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
     blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_ZERO;
+    if (overlay) {
+        blend.BlendEnable = TRUE;
+        blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    }
     blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     blend.LogicOp = D3D12_LOGIC_OP_NOOP; blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     desc.SampleMask = UINT_MAX;
@@ -95,7 +100,7 @@ static HRESULT fullscreen(ID3D12GraphicsCommandList* list, ID3D12RootSignature* 
     return S_OK;
 }
 
-HRESULT DisplayTransfer::initialize(ID3D12Device* device, DXGI_FORMAT output_format) {
+HRESULT DisplayTransfer::initialize(ID3D12Device* device, DXGI_FORMAT output_format, bool overlay) {
     // Independent standard sRGB decoding and BT.709 encoding, selected by Xbox
     // flag 0x200000. BT.709-6 table 1: https://www.itu.int/rec/R-REC-BT.709/en
     static constexpr char source[] = R"(
@@ -118,13 +123,77 @@ float4 ps_main(Vertex v) : SV_Target {
     }
     return float4(rgb, pixel.a);
 })";
-    return graphics_pipeline(device, output_format, 1, source, nullptr, root_, pipeline_);
+    return graphics_pipeline(device, output_format, 1, source, nullptr, root_, pipeline_, false, 1, UINT_MAX,
+                             DXGI_FORMAT_D32_FLOAT_S8X24_UINT, overlay);
 }
 HRESULT DisplayTransfer::record(ID3D12GraphicsCommandList* list, ID3D12DescriptorHeap* heap,
         D3D12_GPU_DESCRIPTOR_HANDLE source, D3D12_CPU_DESCRIPTOR_HANDLE target,
         UINT width, UINT height, bool srgb_to_709) const {
     return fullscreen(list, root_.Get(), pipeline_.Get(), heap, source, target, width, height, srgb_to_709 ? 1 : 0);
 }
+HRESULT GuideComposition::record(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* output) {
+    active_ = false;
+    UINT width = 0, height = 0;
+    if (!session_guide_frame(pixels_, width, height)) return S_OK;
+    const auto out = output->GetDesc();
+    HRESULT hr = S_OK;
+    if (format_ != out.Format) {
+        hr = transfer_.initialize(device, out.Format, true);
+        if (FAILED(hr)) return hr;
+        format_ = out.Format;
+    }
+    if (!image_ || width != width_ || height != height_) {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width; desc.Height = height; desc.DepthOrArraySize = 1; desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1;
+        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        image_.Reset(); upload_.Reset();
+        hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&image_));
+        UINT64 bytes = 0; device->GetCopyableFootprints(&desc, 0, 1, 0, nullptr, nullptr, nullptr, &bytes);
+        desc = {}; desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; desc.Width = bytes;
+        desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1; desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (SUCCEEDED(hr)) hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload_));
+        const D3D12_DESCRIPTOR_HEAP_DESC srv{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        const D3D12_DESCRIPTOR_HEAP_DESC rtv{D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+        if (SUCCEEDED(hr) && !source_) hr = device->CreateDescriptorHeap(&srv, IID_PPV_ARGS(&source_));
+        if (SUCCEEDED(hr) && !target_) hr = device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&target_));
+        if (FAILED(hr)) { image_.Reset(); return hr; }
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{}; view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(image_.Get(), &view, source_->GetCPUDescriptorHandleForHeapStart());
+        width_ = width; height_ = height;
+    }
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    const auto desc = image_->GetDesc();
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+    void* mapped = nullptr; const D3D12_RANGE no_read{0, 0};
+    hr = upload_->Map(0, &no_read, &mapped);
+    if (FAILED(hr)) return hr;
+    for (UINT y = 0; y < height; ++y)
+        std::memcpy(static_cast<char*>(mapped) + footprint.Offset + SIZE_T(y) * footprint.Footprint.RowPitch,
+                    pixels_.data() + SIZE_T(y) * width, SIZE_T(width) * 4);
+    upload_->Unmap(0, nullptr);
+    D3D12_RESOURCE_BARRIER barrier{}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {image_.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION from{}; from.pResource = upload_.Get(); from.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    from.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION to{}; to.pResource = image_.Get(); to.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&to, 0, 0, 0, &from, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter); list->ResourceBarrier(1, &barrier);
+    device->CreateRenderTargetView(output, nullptr, target_->GetCPUDescriptorHandleForHeapStart());
+    hr = transfer_.record(list, source_.Get(), source_->GetGPUDescriptorHandleForHeapStart(),
+        target_->GetCPUDescriptorHandleForHeapStart(), UINT(out.Width), out.Height, false);
+    active_ = SUCCEEDED(hr);
+    return hr;
+}
+
 HRESULT SampleTransfer::initialize(ID3D12Device* device, DXGI_FORMAT format, UINT samples) {
     if (samples < 2 || samples > 8 || (samples & (samples - 1))) return E_INVALIDARG;
     const bool depth_stencil = format==DXGI_FORMAT_R32G8X24_TYPELESS;

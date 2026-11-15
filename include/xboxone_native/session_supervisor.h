@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "session_surface.h"
 
 namespace xboxone::session {
 
@@ -21,6 +22,7 @@ struct Request {
     std::filesystem::path log;      // child stdout+stderr, replaced per session
     std::uint32_t time_limit_ms = 0; // 0: no ERA deadline, the supervisor owns shutdown
     std::uint32_t suspend_grace_ms = 8000; // run: terminate() waits this long for Suspending, then kills
+    std::uintptr_t session_window = 0; // Native persistent frame supplied by the host adapter.
 };
 
 struct Result {
@@ -49,6 +51,8 @@ public:
     virtual void terminate() = 0;
     // Brings the title's window to the foreground; false when it has none.
     virtual bool focus_title() = 0;
+    // System UI pixels and input ownership follow the same supervised session.
+    virtual bool present_system_ui(const SystemUiFrame&) { return false; }
 };
 
 // Windows x64: process + kill-on-close job. Other hosts: start() fails explicitly.

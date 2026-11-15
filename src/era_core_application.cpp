@@ -13,6 +13,7 @@
 // ICoreApplicationView 7 add_Activated.
 #include "era_winrt_classes.h"
 #include "era_winrt_object.h"
+#include "era_session.h"
 
 #include <activation.h>
 #include <winstring.h>
@@ -145,7 +146,8 @@ HRESULT STDMETHODCALLTYPE activate_window(WinrtObject*) {
     if (!window) return RO_E_CLOSED;
     if (GetCurrentThreadId() != window_thread) return RPC_E_WRONG_THREAD;
     ShowWindow(window, SW_SHOW);
-    SetForegroundWindow(window);
+    if (auto parent = session_parent()) { SetForegroundWindow(parent); SetFocus(window); }
+    else SetForegroundWindow(window);
     return S_OK;
 }
 
@@ -155,6 +157,13 @@ std::atomic<HWND> suspend_window{nullptr};
 
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == suspend_message) { raise_suspending(); return 0; }
+    if (auto parent = session_parent()) {
+        if (message == WM_KEYDOWN && (wparam == VK_HOME || wparam == VK_F1)) {
+            if (!(lparam & (1LL << 30))) PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
+            return 0;
+        }
+        if ((message >= WM_KEYFIRST && message <= WM_KEYLAST) && !session_title_input()) return 0;
+    }
     if (message == WM_DESTROY && window_thread == GetCurrentThreadId()) PostQuitMessage(0);
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
@@ -167,10 +176,13 @@ HRESULT create_window() {
     wc.lpszClassName = L"xone-era-core-window";
     if (!RegisterClassExW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return HRESULT_FROM_WIN32(GetLastError());
     RECT r{0, 0, window_width, window_height};
-    const DWORD style = WS_OVERLAPPEDWINDOW;
-    AdjustWindowRect(&r, style, FALSE);
+    const auto parent = session_parent();
+    const DWORD style = parent ? WS_CHILD : WS_OVERLAPPEDWINDOW;
+    if (parent) GetClientRect(parent, &r);
+    else AdjustWindowRect(&r, style, FALSE);
     window = CreateWindowExW(0, wc.lpszClassName, L"xone-era", style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
-                             r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
+                             r.bottom - r.top, parent, nullptr, wc.hInstance, nullptr);
+    if (window && parent) SetWindowPos(window, nullptr, 0, 0, r.right, r.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
     window_thread = window ? GetCurrentThreadId() : 0;
     suspend_window = window;
     dispatcher_quit = false;

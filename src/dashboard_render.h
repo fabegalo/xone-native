@@ -45,7 +45,7 @@ public:
 class Renderer {
 public:
     // Returns true while an animation still needs frames.
-    bool draw(const Dashboard&, Canvas&, Resources&, double seconds);
+    bool draw(const Dashboard&, Canvas&, Resources&, double seconds, bool overlay = false);
 private:
     struct Box { float x = 0, y = 0, w = 0, h = 0; };
     Box focus_{};

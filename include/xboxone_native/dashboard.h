@@ -28,6 +28,7 @@ public:
     virtual void rumble() = 0;
     virtual bool apply_display(std::uint32_t width, std::uint32_t height, bool fullscreen, std::string& error) = 0;
     virtual void focus_dashboard() = 0;
+    virtual std::uintptr_t session_window() { return 0; }
     virtual bool open_folder(const std::filesystem::path& folder) = 0;
     virtual std::uint32_t controllers() = 0;
     virtual void request_exit() = 0;
@@ -85,6 +86,10 @@ public:
 
     Page page = Page::sign_in;
     bool guide_open = false;
+    [[nodiscard]] session::SurfaceMode active_surface() const {
+        if (session_title.empty() || page != Page::session) return session::SurfaceMode::system_ui;
+        return guide_open || !dialogs.empty() ? session::SurfaceMode::guide : session::SurfaceMode::title;
+    }
     std::string guide_focus;
     std::vector<Dialog> dialogs; // stacked; back() is shown
     std::deque<Toast> toasts;

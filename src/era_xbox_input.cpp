@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "era_winrt_classes.h"
 #include "era_winrt_object.h"
+#include "era_session.h"
 #include <activation.h>
 #include <xinput.h>
 #include <winstring.h>
@@ -99,6 +100,7 @@ HRESULT STDMETHODCALLTYPE gamepad_vibration(Gamepad* self, const std::array<floa
     if (!host().set) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
     XINPUT_VIBRATION vibration{WORD(std::lround(value[0] * 65535.f)), WORD(std::lround(value[1] * 65535.f))};
     std::lock_guard lock(input_mutex);
+    if (!session_title_input()) { self->owner->stop_vibration(); return S_OK; }
     const DWORD error = host().set(self->owner->index, &vibration);
     if (error) return HRESULT_FROM_WIN32(error);
     self->owner->vibrating = vibration.wLeftMotorSpeed || vibration.wRightMotorSpeed;
@@ -111,6 +113,11 @@ HRESULT STDMETHODCALLTYPE raw_gamepad_reading(Gamepad* self,RawGamepadReading* o
     XINPUT_STATE state{};
     const DWORD error=host().get(self->owner->index,&state);
     if (error) return HRESULT_FROM_WIN32(error);
+    if (!session_title_input()) {
+        state.Gamepad = {};
+        std::lock_guard lock(input_mutex);
+        self->owner->stop_vibration();
+    }
     LARGE_INTEGER counter{},frequency{};
     if (!QueryPerformanceCounter(&counter) || !QueryPerformanceFrequency(&frequency) || frequency.QuadPart<=0)
         return E_FAIL;

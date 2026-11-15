@@ -7,6 +7,8 @@
 #include "xboxone_native/dashboard.h"
 #include "xboxone_native/session_supervisor.h"
 #include "sha256.h"
+#include "dashboard_render.h"
+#include <algorithm>
 
 #include <chrono>
 #include <cstdio>
@@ -56,6 +58,7 @@ struct FakePlatform : dashboard::Platform {
 struct FakeSession : session::Host {
     std::vector<session::Request> requests;
     bool running = false, fail_start = false, terminated = false;
+    int focus_requests = 0;
     std::optional<session::Result> finish;
     bool start(const session::Request& r, std::string& error) override {
         if (fail_start) { error = "cannot start ERA runtime: Win32 2"; return false; }
@@ -72,8 +75,37 @@ struct FakeSession : session::Host {
         return true;
     }
     void terminate() override { terminated = true; finish = session::interpret(1, true, ""); }
-    bool focus_title() override { return running; }
+    bool focus_title() override { ++focus_requests; return running; }
 };
+
+void test_overlay_pixels() {
+    struct Resources : dashboard::Resources {
+        void text(dashboard::Canvas&, const std::string&, int, int, int, int, int,
+                  dashboard::Font, std::uint32_t, dashboard::Align) override {}
+        const dashboard::Image* image(const std::string&) override { return nullptr; }
+    } resources;
+    FakePlatform platform;
+    FakeSession session;
+    dashboard::Dashboard ui({}, {}, platform, session);
+    dashboard::Renderer renderer;
+    std::vector<std::uint32_t> pixels(1920 * 1080, 0xFFFFFFFF);
+    dashboard::Canvas canvas(pixels.data(), 1920, 1080, 1920);
+    ui.guide_open = true;
+    renderer.draw(ui, canvas, resources, 1.0, true);
+    check(pixels[500 * 1920 + 20] == 0xFF202020 && pixels[500 * 1920 + 1900] == 0x99000000,
+          "Guide-only rendering keeps its blade opaque and the game area translucent");
+    ui.guide_open = false;
+    renderer.draw(ui, canvas, resources, 1.0, true);
+    check(pixels[500 * 1920 + 20] == 0 && pixels[500 * 1920 + 1900] == 0,
+          "closing Guide clears its overlay without drawing dashboard content");
+    canvas.fill(0, 0, 1, 1, 0x8000FF00);
+    check(pixels[0] == 0x80008000, "UI blending preserves premultiplied alpha on transparent surfaces");
+    ui.page = dashboard::Page::session;
+    ui.toasts.push_back({"Starting title", "", 5.0});
+    renderer.draw(ui, canvas, resources, 1.0);
+    check(ui.items().empty() && std::all_of(pixels.begin(), pixels.end(), [](auto pixel) { return pixel == 0xFF000000; }),
+          "launch hands presentation to the title without an invented Playing page, management buttons or launcher toast");
+}
 
 std::string sha_of(const fs::path& file) {
     std::ifstream in(file, std::ios::binary);
@@ -261,6 +293,31 @@ void test_dashboard_flow() {
         check(fs::file_size(expected / ".xone-local-profile") == 32, "ERA profile record prepared before launch");
     }
     check(ui.title(recent.id)->play_count == 1, "play count recorded");
+    check(ui.active_surface() == session::SurfaceMode::title, "title owns presentation and input after launch");
+    const auto focus_before = session.focus_requests;
+    ui.input(dashboard::Button::guide);
+    check(ui.active_surface() == session::SurfaceMode::guide, "Guide takes presentation and input ownership");
+    ui.input(dashboard::Button::b);
+    check(!ui.guide_open && session.focus_requests == focus_before + 1 && session.running,
+          "B closes Guide and returns focus to the same running title");
+    ui.input(dashboard::Button::guide);
+    ui.input(dashboard::Button::guide);
+    check(!ui.guide_open && session.focus_requests == focus_before + 2 && session.running,
+          "Xbox button closes Guide and returns focus to the same running title");
+    ui.input(dashboard::Button::guide);
+    for (const auto& item : ui.guide_items()) if (item.key == "guide:home") item.activate();
+    check(ui.page == dashboard::Page::home && session.running && ui.active_surface() == session::SurfaceMode::system_ui,
+          "Home owns presentation and input while preserving the active title");
+    const auto launches = session.requests.size();
+    ui.launch(recent.id);
+    check(ui.page == dashboard::Page::session && session.requests.size() == launches,
+          "returning from Home reuses the running title and restores its active surface");
+    ui.input(dashboard::Button::guide);
+    for (const auto& item : ui.guide_items()) if (item.key == "guide:home") item.activate();
+    ui.input(dashboard::Button::guide);
+    for (const auto& item : ui.guide_items()) if (item.key == "guide:return") item.activate();
+    check(ui.page == dashboard::Page::session && !ui.guide_open && session.requests.size() == launches,
+          "Guide return selects the title surface without starting another process");
     ui.input(dashboard::Button::guide);
     bool has_quit = false;
     for (const auto& item : ui.guide_items()) has_quit |= item.key == "guide:quit";
@@ -315,6 +372,7 @@ void test_dashboard_flow() {
 } // namespace
 
 int main() {
+    test_overlay_pixels();
     test_state_roundtrip();
     test_interpret();
     test_dashboard_flow();

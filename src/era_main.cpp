@@ -8,6 +8,7 @@
 #include "xboxone_native/era_loader.h"
 #include "era_display.h"
 #include "era_audio.h"
+#include "era_session.h"
 #include "sha256.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -189,6 +190,7 @@ int wmain(int argc, wchar_t** argv) {
     bool stop_on_activation = false;
     bool warp = false;
     bool deadline = true;
+    HWND session_window = nullptr;
     for (int i = 3; i < argc; ++i) {
         const std::wstring option = argv[i];
         if (option == L"--timeout-ms" && i + 1 < argc) timeout = static_cast<DWORD>(std::wcstoul(argv[++i], nullptr, 10));
@@ -197,9 +199,18 @@ int wmain(int argc, wchar_t** argv) {
         else if (option == L"--stop-on-missing-imports") stop_on_missing = true;
         else if (option == L"--warp") warp = true;
         else if (option == L"--no-deadline") deadline = false;
+        else if (option == L"--session-window" && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const auto value = std::wcstoull(argv[++i], &end, 10);
+            if (!value || !end || *end || value > UINTPTR_MAX) return usage();
+            session_window = reinterpret_cast<HWND>(static_cast<std::uintptr_t>(value));
+        }
         else return usage();
     }
     if (run && (timeout == 0 || timeout > 600000)) { std::cerr << "timeout must be 1..600000 ms\n"; return 2; }
+    if (session_window && !xboxone::era::bind_session_surface(session_window)) {
+        std::cerr << "cannot bind the supervised session surface\n"; return 1;
+    }
 
     const std::filesystem::path title = std::filesystem::absolute(argv[2]);
     const HRESULT acp_binding = xboxone::era::bind_acp_module((title.parent_path().parent_path() /

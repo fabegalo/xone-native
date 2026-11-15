@@ -58,7 +58,8 @@ void Canvas::blend(int x, int y, std::uint32_t argb, float coverage) {
     const auto mix = [&](int shift) {
         return static_cast<std::uint32_t>(channel(argb, shift) * a + channel(d, shift) * (1 - a) + 0.5f) << shift;
     };
-    d = 0xFF000000u | mix(16) | mix(8) | mix(0);
+    const auto alpha = static_cast<std::uint32_t>(255 * a + channel(d, 24) * (1 - a) + 0.5f);
+    d = (alpha << 24) | mix(16) | mix(8) | mix(0);
 }
 
 void Canvas::fill(int x, int y, int w, int h, std::uint32_t argb) {
@@ -132,7 +133,7 @@ void Canvas::image(const Image& img, int x, int y, int w, int h, float opacity) 
     }
 }
 
-bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double seconds) {
+bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double seconds, bool overlay) {
     clock_ += seconds;
     const float s = std::min(canvas.width() / 1920.0f, canvas.height() / 1080.0f);
     const float ox = (canvas.width() - 1920 * s) / 2, oy = (canvas.height() - 1080 * s) / 2;
@@ -156,6 +157,15 @@ bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double 
     scroll_ = approach(scroll_, static_cast<float>(ui.scroll), seconds, 16);
     const float slide = (1 - ease(page_)) * 48;
 
+    const Item* focus = nullptr;
+    auto items = ui.items();
+    const float shift = -scroll_ + slide;
+    const bool title_surface = ui.page == Page::session;
+    if (overlay || title_surface) {
+        for (int y = 0; y < canvas.height(); ++y)
+            std::fill_n(canvas.pixels() + std::size_t(y) * canvas.stride(), canvas.width(), overlay ? 0u : 0xFF000000u);
+    }
+    if (!overlay && !title_surface) {
     // Background and header.
     canvas.gradient(0, 0, canvas.width(), canvas.height(), 0xFF1C1F1C, 0xFF0A0A0A);
     fill(0, 0, 1920, 6, accent);
@@ -172,9 +182,7 @@ bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double 
              centred ? Align::center : Align::left);
     }
 
-    auto items = ui.items();
-    const Item* focus = ui.guide_open || !ui.dialogs.empty() ? nullptr : ui.focused(items);
-    const float shift = -scroll_ + slide;
+    focus = ui.guide_open || !ui.dialogs.empty() ? nullptr : ui.focused(items);
 
     // Page decorations.
     if (ui.page == Page::home) {
@@ -210,15 +218,6 @@ bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double 
         fill(444, 370 + slide, 1032, 4, accent);
         const bool caret = std::fmod(clock_, 1.0) < 0.55;
         text(ui.keyboard_text + (caret ? "|" : " "), 468, 290 + slide, 990, 84, 38, Font::regular, white);
-    } else if (ui.page == Page::session) {
-        if (const auto* t = ui.title(ui.session_title)) {
-            fill(810, 230 + slide, 300, 300, 0xFF2B2B2B);
-            if (const auto* img = res.image(t->logo)) canvas.image(*img, X(830), Y(250 + slide), S(260), S(260));
-            else text("\xEE\x9F\xBC", 810, 230 + slide, 300, 300, 110, Font::icons, dim, Align::center);
-            text(ui.translate("Playing"), 0, 560 + slide, 1920, 48, 28, Font::regular, secondary, Align::center);
-            text(t->name, 0, 610 + slide, 1920, 80, 52, Font::light, white, Align::center);
-            text(ui.translate("Press the Xbox button or Ctrl+Home for the Guide"), 0, 690 + slide, 1920, 44, 22, Font::regular, dim, Align::center);
-        }
     }
 
     // Animated focus box.
@@ -345,9 +344,10 @@ bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double 
         text(ui.translate("Locally recreated dashboard. Not Xbox One SystemOS."), 96, 1012, 900, 40, 16, Font::regular, 0x5E5E5E);
     }
 
+    }
     // Toasts.
     float ty = 930;
-    for (auto toast = ui.toasts.rbegin(); toast != ui.toasts.rend(); ++toast) {
+    for (auto toast = ui.toasts.rbegin(); (!title_surface || ui.guide_open) && toast != ui.toasts.rend(); ++toast) {
         const float in = std::clamp(static_cast<float>(5.0 - toast->remaining) / 0.25f, 0.0f, 1.0f);
         const float x = 96 - (1 - ease(in)) * 80;
         fill(x, ty, 760, 64, 0xF0262626);
@@ -410,7 +410,7 @@ bool Renderer::draw(const Dashboard& ui, Canvas& canvas, Resources& res, double 
     }
 
     // Page transition fade.
-    if (page_ < 1) canvas.fill(0, 0, canvas.width(), canvas.height(), static_cast<std::uint32_t>(0xC0 * (1 - ease(page_))) << 24 | 0x0A0A0A);
+    if (!overlay && !title_surface && page_ < 1) canvas.fill(0, 0, canvas.width(), canvas.height(), static_cast<std::uint32_t>(0xC0 * (1 - ease(page_))) << 24 | 0x0A0A0A);
 
     const bool focus_moving = focus && (std::fabs(focus_.x - focus->rect.x) > 0.3f || std::fabs(focus_.y - (focus->rect.y + shift)) > 0.3f ||
                                         std::fabs(focus_.w - focus->rect.w) > 0.3f || std::fabs(focus_.h - focus->rect.h) > 0.3f);

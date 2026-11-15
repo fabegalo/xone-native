@@ -6,6 +6,7 @@
 #include "dashboard_windows.h"
 #include "xboxone_native/title_catalog.h"
 #include "sha256.h"
+#include "xboxone_native/presentation.h"
 
 #include <objbase.h>
 
@@ -27,11 +28,13 @@ void check(bool ok, const char* what) {
 }
 
 struct Platform : dashboard::Platform {
+    HWND parent = nullptr;
     bool pick_folder(fs::path&) override { return false; }
     void play(dashboard::Sound) override {}
     void rumble() override {}
     bool apply_display(std::uint32_t, std::uint32_t, bool, std::string&) override { return true; }
-    void focus_dashboard() override {}
+    void focus_dashboard() override { if (parent) { SetForegroundWindow(parent); SetFocus(parent); } }
+    std::uintptr_t session_window() override { return reinterpret_cast<std::uintptr_t>(parent); }
     bool open_folder(const fs::path&) override { return true; }
     std::uint32_t controllers() override { return 0; }
     void request_exit() override {}
@@ -85,8 +88,17 @@ int original_lifecycle(const fs::path& runtime, const fs::path& package, const f
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     auto host = session::create_host();
     Platform platform;
-    dashboard::Dashboard ui(root, runtime, platform, *host);
     std::string error;
+    presentation::Presenter presenter;
+    presentation::PresenterConfig config;
+    config.width = 1920; config.height = 1080; config.visible = true;
+    config.swapchain_format = presentation::PixelFormat::bgra8_unorm;
+    config.window_title = "xone-native session integration (local_recreation UI)";
+    if (!presenter.initialize(config, error)) { std::cerr << error << '\n'; CoUninitialize(); return 1; }
+    platform.parent = static_cast<HWND>(presenter.native_window());
+    SetWindowLongPtrW(platform.parent, GWL_STYLE, GetWindowLongPtrW(platform.parent, GWL_STYLE) | WS_CLIPCHILDREN);
+    SetWindowPos(platform.parent, nullptr, 40, 40, 1280, 720, SWP_NOZORDER | SWP_NOACTIVATE);
+    dashboard::Dashboard ui(root, runtime, platform, *host);
     if (!ui.start(error)) { std::cerr << error << '\n'; CoUninitialize(); return 1; }
     if (ui.state.profiles.empty()) {
         ui.input(dashboard::Button::a);
@@ -113,6 +125,12 @@ int original_lifecycle(const fs::path& runtime, const fs::path& package, const f
         auto canvas=surface.canvas();
         for(int i=0;i<30;++i) renderer.draw(ui,canvas,surface,0.05);
         write_bmp(root/name,surface);
+        presentation::ExternalFrameView frame;
+        frame.width = 1920; frame.height = 1080; frame.row_pitch_bytes = 1920 * 4;
+        frame.format = presentation::PixelFormat::bgra8_unorm;
+        frame.provenance = {presentation::FrameOrigin::local_recreation, "xone_local_dashboard", "", 0};
+        frame.pixels = {reinterpret_cast<const std::uint8_t*>(surface.bits()), 1920 * 1080 * 4};
+        check(presenter.present_frame(frame, error), "dashboard frame reaches persistent session window");
     };
     capture("home.bmp");
     // Exercise the finite session setting as well as a Guide quit before it expires.
@@ -121,6 +139,7 @@ int original_lifecycle(const fs::path& runtime, const fs::path& package, const f
     check(ui.session_title == id, "original launched by dashboard");
     const auto start = std::chrono::steady_clock::now();
     while (!ui.session_title.empty() && elapsed_ms(start) < duration_ms) {
+        bool quit = false; check(presenter.pump_messages(quit, error) && !quit, "session window message pump");
         ui.tick(0.025); Sleep(25);
         std::error_code ec;
         if (fs::file_size(root / "logs/last-session.log", ec) > 2 * 1024 * 1024 && !ec) {
@@ -132,8 +151,43 @@ int original_lifecycle(const fs::path& runtime, const fs::path& package, const f
     ui.input(dashboard::Button::guide);
     check(ui.guide_open && ui.profile(), "Guide retains the session profile");
     capture("guide.bmp");
+    dashboard::Renderer overlay_renderer;
+    auto overlay = surface.canvas();
+    overlay_renderer.draw(ui, overlay, surface, 1.0, true);
+    GdiFlush();
+    check(host->present_system_ui({ui.active_surface(), 1920, 1080,
+          std::span<const std::uint32_t>(surface.bits(), 1920 * 1080)}), "Guide frame published to original title presentation");
+    bool composed = false;
+    for (int i = 0; i < 100 && !composed && !ui.session_title.empty(); ++i) {
+        bool quit = false; presenter.pump_messages(quit, error);
+        ui.tick(0.025); Sleep(25);
+        const auto output = read(root / "logs/last-session.log");
+        composed = std::string(output.begin(), output.end()).find("local_recreation Guide composited on title output") != std::string::npos;
+    }
+    check(composed, "original title presented a frame with the local Guide composed on its output");
+    const auto child = FindWindowExW(platform.parent, nullptr, L"xone-era-core-window", nullptr);
+    const auto profile_id = ui.profile() ? ui.profile()->id : std::string{};
+    check(child != nullptr, "original title shares the persistent session window");
+    ui.input(dashboard::Button::b);
+    check(host->present_system_ui({ui.active_surface(), 1920, 1080,
+          std::span<const std::uint32_t>(surface.bits(), 1920 * 1080)}), "close Guide on original title");
+    ui.input(dashboard::Button::guide);
+    for (const auto& item : ui.guide_items()) if (item.key == "guide:home") item.activate();
+    check(host->present_system_ui({ui.active_surface(), 1920, 1080,
+          std::span<const std::uint32_t>(surface.bits(), 1920 * 1080)}) && !IsWindowVisible(child),
+          "Home takes presentation without ending original title");
+    capture("home.bmp");
+    ui.launch(id);
+    check(host->present_system_ui({ui.active_surface(), 1920, 1080,
+          std::span<const std::uint32_t>(surface.bits(), 1920 * 1080)}) && IsWindowVisible(child) &&
+          FindWindowExW(platform.parent, nullptr, L"xone-era-core-window", nullptr) == child &&
+          ui.profile() && ui.profile()->id == profile_id,
+          "return from Home keeps the same original title window and profile");
     ui.quit_title();
-    for (int i = 0; i < 400 && !ui.session_title.empty(); ++i) { ui.tick(0.025); Sleep(25); }
+    for (int i = 0; i < 400 && !ui.session_title.empty(); ++i) {
+        bool quit = false; presenter.pump_messages(quit, error);
+        ui.tick(0.025); Sleep(25);
+    }
     check(ui.session_title.empty() && !host->active() && ui.page == dashboard::Page::home,
           "original returns to Home after Guide quit");
     ui.input(dashboard::Button::b);

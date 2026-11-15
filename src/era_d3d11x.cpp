@@ -326,6 +326,8 @@ struct DxgiObject : GraphicsObject {
     Device* device = nullptr; // Owns one device reference.
     IUnknown* host = nullptr; // Owned host DXGI object, if any (swapchain).
     std::unique_ptr<DisplayTransfer> display;
+    GuideComposition guide;
+    bool guide_presented = false;
     DXGI_SWAP_CHAIN_DESC1 requested_desc{}; // Includes consumed Xbox display flags.
     std::array<Texture*, 16> backbuffers{}; // Owned logical surfaces; host buffers are presentation targets.
     std::mutex swapchain_mutex;
@@ -2582,6 +2584,14 @@ HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESE
             self->present_target->GetCPUDescriptorHandleForHeapStart(),UINT(desc.Width),desc.Height,true);
     } else self->present_list->CopyResource(output.Get(),source->gpu.resource);
     if(FAILED(hr)) return hr;
+    // System UI shares the host presentation, never the title's backing texture.
+    D3D12_RESOURCE_BARRIER guide_target = barrier;
+    guide_target.Transition.StateBefore = target_state;
+    guide_target.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if(target_state != D3D12_RESOURCE_STATE_RENDER_TARGET) self->present_list->ResourceBarrier(1,&guide_target);
+    hr=self->guide.record(self->device->d3d12,self->present_list.Get(),output.Get());
+    if(FAILED(hr)) return hr;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);self->present_list->ResourceBarrier(1,&barrier);
     hr=end_title_gpu_texture(source->gpu,self->present_list.Get());
     if(SUCCEEDED(hr)) hr=self->present_list->Close();if(FAILED(hr)) return hr;
@@ -2595,6 +2605,11 @@ HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESE
     if(FAILED(hr)) return hr;
     if(legacy) {hr=pace_legacy_present(self,interval);if(FAILED(hr)) return hr;}
     hr=chain->Present(legacy ? 0 : interval,0);
+    if(hr==S_OK && self->guide.active() && !self->guide_presented) {
+        self->guide_presented=true;
+        std::fprintf(stderr,"xone-era: local_recreation Guide composited on title output at frame %llu\n",value);
+        std::fflush(stderr);
+    }
     // The +0x28 PresentArray field is an opaque frame-statistics cookie, not
     // a fence or pointer to dereference. Publish it only after real retirement.
     // DXGIXGetFrameStatistics remains unsupported rather than inventing timing.

@@ -167,13 +167,14 @@ void on_exit() { report("xone-era: title called exit\n"); }
 
 int usage() {
     std::cerr << "Usage: xone-era check <title.exe>\n"
-                 "       xone-era run <title.exe> [--timeout-ms N | --no-deadline] [--storage DIR] [--warp] [--stop-on-missing | --stop-on-missing-imports]\n"
+                 "       xone-era run <title.exe> [--timeout-ms N | --no-deadline] [--storage DIR] [--warp] [--stop-on-missing | --stop-on-missing-imports] [--trace-graphics]\n"
                  "check maps the image and binds imports without calling the entry point.\n"
                  "run also executes the title natively in this process (default deadline 15000 ms).\n"
                  "--no-deadline: the supervising session owner (dashboard) ends the process instead.\n"
                  "--stop-on-missing diagnoses missing imports, activations and service calls (exit 125).\n"
                  "--stop-on-missing-imports traps missing imports but returns real activation failures to the title.\n";
-    std::cerr << "--warp selects the software GPU explicitly and enables bounded graphics diagnostics.\n";
+    std::cerr << "--warp selects the software GPU explicitly.\n"
+                 "--trace-graphics enables bounded pixel hashing and graphics diagnostics (slower).\n";
     return 2;
 }
 
@@ -189,6 +190,7 @@ int wmain(int argc, wchar_t** argv) {
     bool stop_on_missing = false;
     bool stop_on_activation = false;
     bool warp = false;
+    bool trace_graphics = false;
     bool deadline = true;
     HWND session_window = nullptr;
     for (int i = 3; i < argc; ++i) {
@@ -198,6 +200,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (option == L"--stop-on-missing") { stop_on_missing = true; stop_on_activation = true; }
         else if (option == L"--stop-on-missing-imports") stop_on_missing = true;
         else if (option == L"--warp") warp = true;
+        else if (option == L"--trace-graphics") trace_graphics = true;
         else if (option == L"--no-deadline") deadline = false;
         else if (option == L"--session-window" && i + 1 < argc) {
             wchar_t* end = nullptr;
@@ -265,7 +268,7 @@ int wmain(int argc, wchar_t** argv) {
     const auto selected=title.filename().u8string();
     xboxone::era::set_title_package_root(title.parent_path().wstring(),std::string(selected.begin(),selected.end()),title_hash.finish());
     xboxone::era::set_stop_on_missing_activation(stop_on_activation);
-    xboxone::era::set_graphics_diagnostics(stop_on_missing || warp, warp);
+    xboxone::era::set_graphics_diagnostics(trace_graphics, warp);
     xboxone::era::set_audio_diagnostics(stop_on_missing || warp);
     diagnostic_exceptions.store(stop_on_missing);
     for (const auto* runtime : {L"vccorlib110.dll", L"vccorlib140.dll"}) {

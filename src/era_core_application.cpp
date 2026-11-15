@@ -257,6 +257,8 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
             if (FAILED(h) && SUCCEEDED(hr)) hr = h;
         }
     }
+    // The local session owns visibility even when a title never calls Activate.
+    if (SUCCEEDED(hr)) hr = activate_window(&core_window());
     if (SUCCEEDED(hr)) { note("xone-era: view Run\n"); hr = call<HRESULT>(fv, 9); }
     if (initialized) { // Uninitialize pairs with a successful Initialize, also after a later failure.
         note("xone-era: view Uninitialize\n");

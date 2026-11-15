@@ -4687,7 +4687,7 @@ HRESULT WINAPI D3D11XCreateDeviceX(const CreateParameters* parameters, void** de
 void set_d3d11x_trap_handler(D3D11XTrapHandler handler) { trap_handler.store(handler); }
 void set_graphics_diagnostics(bool enabled, bool warp) {
     graphics_diagnostics.store(enabled);
-    diagnostic_warp.store(enabled && warp);
+    diagnostic_warp.store(warp);
 }
 
 HRESULT bind_d3d11x_abi(const std::wstring& original_combase) {

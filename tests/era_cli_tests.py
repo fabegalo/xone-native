@@ -18,8 +18,9 @@ with tempfile.TemporaryDirectory(prefix="xone-era-cli-") as scratch:
         result = subprocess.run([launcher, command, title], capture_output=True, text=True, timeout=5)
         assert result.returncode == 1, result
         assert "unresolved 2" in result.stdout and "running title" not in result.stdout, result
-    for option in ("--stop-on-missing", "--stop-on-missing-imports"):
-        result = subprocess.run([launcher, "run", title, option, "--timeout-ms", "2000"],
+    for options in (("--stop-on-missing",), ("--stop-on-missing-imports",),
+                    ("--stop-on-missing-imports", "--trace-graphics")):
+        result = subprocess.run([launcher, "run", title, *options, "--timeout-ms", "2000"],
                                 capture_output=True, text=True, timeout=5)
         assert result.returncode == 125, result
         assert "resolved 0, unresolved 2" in result.stdout, result

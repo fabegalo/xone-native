@@ -4362,6 +4362,7 @@ int main(int argc, char** argv) {
             static std::string lifecycle;
             static std::wstring loaded;
             static bool fail_load = false;
+            static HWND owned_window = nullptr;
             struct Handler : IUnknown {
                 HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** out) override { *out = this; return S_OK; }
                 ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
@@ -4393,6 +4394,8 @@ int main(int argc, char** argv) {
                     return reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*, std::int64_t*)>(vt[7])(view, &handler, &token);
                 }
                 virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
+                    owned_window = core_window_hwnd(window);
+                    check(!IsWindowVisible(core_window_hwnd(window)), "window stays hidden during view setup");
                     check(core_window_hwnd(nullptr) && core_window_hwnd(nullptr) == core_window_hwnd(window),
                         "Xbox null-window swapchain binding selects the same owned local window");
                     constexpr GUID iid_window_static{0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};
@@ -4459,7 +4462,10 @@ int main(int argc, char** argv) {
                     lifecycle += "L";
                     return S_OK;
                 }
-                virtual HRESULT STDMETHODCALLTYPE Run() { lifecycle += "R"; return S_OK; }
+                virtual HRESULT STDMETHODCALLTYPE Run() {
+                    check(IsWindowVisible(core_window_hwnd(nullptr)), "session shows the title before Run without a guest Activate call");
+                    lifecycle += "R"; return S_OK;
+                }
                 virtual HRESULT STDMETHODCALLTYPE Uninitialize() { lifecycle += "U"; return S_OK; }
             };
             static View fake_view;
@@ -4496,13 +4502,13 @@ int main(int argc, char** argv) {
                 check(hr == S_OK, "CoreApplication::Run succeeds");
                 check(lifecycle == "ISLARU", "view lifecycle Initialize, SetWindow, Load, Activated, Run, Uninitialize");
                 check(loaded == L"Title.App", "Load receives the manifest entry point");
-                check(!FindWindowW(L"xone-era-core-window", nullptr), "window destroyed after Run");
+                check(!IsWindow(owned_window), "window destroyed after Run");
                 lifecycle.clear();
                 fail_load = true;
                 check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*)>(vt[13])(app, &source) == E_ABORT &&
                           lifecycle == "ISlU",
                       "failed Load returns its HRESULT and still uninitializes");
-                check(!FindWindowW(L"xone-era-core-window", nullptr), "window destroyed after a failed Run");
+                check(!IsWindow(owned_window), "window destroyed after a failed Run");
                 fail_load = false;
                 check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*, IUnknown*)>(vt[13])(app, nullptr) == E_INVALIDARG,
                       "Run without a view source");

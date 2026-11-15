@@ -2536,11 +2536,11 @@ void diagnose_presented_pixels(Texture* source,UINT64 frame,const char* boundary
     } catch(const std::bad_alloc&) {std::fputs("xone-era: frame pixel verification allocation failed\n",stderr);}
 }
 HRESULT present_frame(DxgiObject* self,UINT interval,UINT flags,const DXGI_PRESENT_PARAMETERS* input,bool legacy,UINT64 cookie=0) {
+    std::lock_guard submission(self->device->list_execution);
+    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     if(!self->host || self->device->legacy!=legacy || interval>4) return DXGI_ERROR_UNSUPPORTED;
     DXGI_PRESENT_PARAMETERS parameters{};SIZE_T read=0;
     if(input && (!ReadProcessMemory(GetCurrentProcess(),input,&parameters,sizeof parameters,&read) || read!=sizeof parameters)) return E_INVALIDARG;
-    std::lock_guard submission(self->device->list_execution);
-    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     if(flags || parameters.DirtyRectsCount || parameters.pScrollRect || parameters.pScrollOffset) return DXGI_ERROR_UNSUPPORTED;
     std::lock_guard lock(self->swapchain_mutex);
     auto* source=self->backbuffers[0];
@@ -3176,11 +3176,11 @@ std::unique_ptr<Context> capture_draw_state(Context* self) {
     return state;
 }
 HRESULT clear_view(Context* self,BufferView* view,const FLOAT* color,FLOAT depth,UINT clear_flags=D3D11_CLEAR_DEPTH,UINT8 stencil=0) {
+    std::lock_guard submission(self->device->list_execution);
+    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     if (!view || view->device != self->device || !view->resource ||
         view->resource->vtable != texture_vtable().data() || !view->heap || view->view_type != (color ? 0u : 1u)) return E_INVALIDARG;
     if(self->deferred) {
-    std::lock_guard submission(self->device->list_execution);
-    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
         try {
             auto command=std::make_shared<RecordedCommand>();
             command->kind=color ? RecordedCommand::clear_color : RecordedCommand::clear_depth;
@@ -3287,6 +3287,8 @@ HRESULT refresh_graphics_bindings(Context* self) {
     return S_OK;
 }
 HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) {
+    std::lock_guard submission(self->device->list_execution);
+    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     const auto failed=[&](HRESULT hr,UINT line) {
         if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw failure at era_d3d11x.cpp:%u HRESULT=0x%08lX\n",line,hr);
         return hr;
@@ -3406,8 +3408,6 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     };
     for(UINT i=0;i<self->render_targets.size();++i) if(auto* view=self->render_targets[i]) {
         if(i!=pipeline.NumRenderTargets || view->resource->vtable!=texture_vtable().data()) return unsupported(__LINE__);
-    std::lock_guard submission(self->device->list_execution);
-    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
         auto* texture=static_cast<Texture*>(view->resource);
         if(texture->volume || texture->desc.standard.SampleDesc.Count!=1 || texture->desc.standard.ArraySize!=1) return unsupported(__LINE__);
         pipeline.RTVFormats[i]=view->rtv_desc.Format;++pipeline.NumRenderTargets;
@@ -3601,6 +3601,8 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     return S_OK;
 }
 HRESULT execute_compute(Context* self,UINT x,UINT y,UINT z) {
+    std::lock_guard submission(self->device->list_execution);
+    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     if(x>65535 || y>65535 || z>65535) return E_INVALIDARG;
     auto* shader=context_state<Shader*,0x1f0>(self);
     struct Prefix {const void* table;UINT refs,flags;Device* device;void* data;UINT native_flags,stage;} prefix{};
@@ -3720,8 +3722,6 @@ HRESULT execute_compute(Context* self,UINT x,UINT y,UINT z) {
         }
     }
     return S_OK;
-    std::lock_guard submission(self->device->list_execution);
-    if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
 }
 void STDMETHODCALLTYPE context_dispatch(Context* self,UINT x,UINT y,UINT z) {
     HRESULT hr=E_OUTOFMEMORY;
@@ -3752,6 +3752,8 @@ void STDMETHODCALLTYPE legacy_context_draw(Context* self,UINT count,UINT first) 
         (void)trap_slot<kind_context,14>(self,count,first);
     }
 }
+HRESULT STDMETHODCALLTYPE context_suspend(Context* self,UINT flags);
+HRESULT STDMETHODCALLTYPE context_resume(Context* self);
 const std::array<const void*, vtable_slots>& context_vtable() {
     static const auto table = [] {
         auto t = traps<kind_context>();
@@ -3780,6 +3782,8 @@ const std::array<const void*, vtable_slots>& context_vtable() {
         t[20] = reinterpret_cast<const void*>(&context_vertices);
         t[21] = reinterpret_cast<const void*>(&context_indices);
         t[14] = reinterpret_cast<const void*>(&context_draw_indexed);
+        t[201] = reinterpret_cast<const void*>(&context_suspend);
+        t[202] = reinterpret_cast<const void*>(&context_resume);
         return t;
     }();
     return table;
@@ -3871,8 +3875,6 @@ HRESULT STDMETHODCALLTYPE context_finish_list(Context* self,BOOL,void** out) {
     if(FAILED(self->recording_error)) return self->recording_error;
     for(const auto& [buffer,version]:self->buffer_versions) if(version.mapped) return DXGI_ERROR_INVALID_CALL;
     auto list=std::unique_ptr<CommandList>(new(std::nothrow) CommandList);
-HRESULT STDMETHODCALLTYPE context_suspend(Context* self,UINT flags);
-HRESULT STDMETHODCALLTYPE context_resume(Context* self);
     if(!list) return E_OUTOFMEMORY;
     list->vtable=command_list_vtable().data();list->flags=1;list->refcount=0;
     list->device=self->device;list->context_flags=self->creation_flags;
@@ -3901,8 +3903,6 @@ HRESULT execute_update(const RecordedCommand& command) {
     auto* resource=reinterpret_cast<GraphicsObject*>(command.update_resource.Get());
     const bool buffer=resource->vtable==buffer_vtable().data();
     auto& gpu=buffer ? static_cast<Buffer*>(resource)->gpu : static_cast<Texture*>(resource)->gpu;
-        t[201] = reinterpret_cast<const void*>(&context_suspend);
-        t[202] = reinterpret_cast<const void*>(&context_resume);
     void* canonical=nullptr;
     HRESULT hr=map_title_gpu_resource(gpu,&canonical);
     if(FAILED(hr)) return hr;
@@ -3997,6 +3997,7 @@ void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL
         return;
     }
     std::lock_guard lock(self->device->list_execution);
+    if(self->device->suspended) { (void)trap_slot<kind_context,58>(self); return; }
     for(SIZE_T i=0;i<list->commands.size();++i) {
         auto& command=*list->commands[i];
         HRESULT hr=E_OUTOFMEMORY;
@@ -4041,7 +4042,9 @@ void STDMETHODCALLTYPE context_execute_list(Context* self,CommandList* list,BOOL
     }
 }
 void STDMETHODCALLTYPE context_flush(Context* self) {
+    std::lock_guard submission(self->device->list_execution);
     if(self->deferred) return; // Original deferred slot 111, 180001810, is RET.
+    if(self->device->suspended) { (void)trap_slot<kind_context,111>(self); return; }
     // 18000d080 submits without a CPU wait. Draws/clears already submit through this queue.
     HRESULT hr=S_OK;
     if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
@@ -4049,6 +4052,8 @@ void STDMETHODCALLTYPE context_flush(Context* self) {
     if(FAILED(hr)) default_trap("graphics flush submission",111);
 }
 HRESULT submit_global_gpu_barrier(Context* self) {
+    std::lock_guard submission(self->device->list_execution);
+    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     HRESULT hr=S_OK;
     if(!self->submission_fence) hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&self->submission_fence));
     Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
@@ -4069,6 +4074,34 @@ HRESULT submit_global_gpu_barrier(Context* self) {
     if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     if(FAILED(hr)) default_trap("GPU event retirement",197);
     return S_OK;
+}
+HRESULT STDMETHODCALLTYPE context_suspend(Context* self,UINT flags) {
+    // 16299 UMD 18001eec0 -> 1800a2ad0; title 1402497a8 requests flags 0.
+    // shortcut: immediate modern context, no DMA engines; extend only with verified engine/flag contracts.
+    if(self->device->legacy || self->deferred || flags) return E_NOTIMPL;
+    std::lock_guard submission(self->device->list_execution);
+    std::lock_guard ownership(self->device->ownership);
+    for(const auto& engine:self->device->dma) if(engine) return E_NOTIMPL;
+    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(!completed.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
+    HRESULT hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence));
+    if(SUCCEEDED(hr)) hr=self->device->queue->Signal(fence.Get(),1);
+    if(SUCCEEDED(hr)) hr=fence->SetEventOnCompletion(1,completed.Get());
+    if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if(SUCCEEDED(hr)) hr=self->device->d3d12->GetDeviceRemovedReason();
+    if(SUCCEEDED(hr)) self->device->suspended=true;
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE context_resume(Context* self) {
+    // 16299 UMD 18001eed0 -> 1800a2c50; bindings and canonical pixels survive.
+    if(self->device->legacy || self->deferred) return E_NOTIMPL;
+    std::lock_guard submission(self->device->list_execution);
+    if(!self->device->suspended) return DXGI_ERROR_INVALID_CALL;
+    const HRESULT hr=self->device->d3d12->GetDeviceRemovedReason();
+    if(SUCCEEDED(hr)) self->device->suspended=false;
+    return hr;
 }
 HRESULT execute_gpu_event(Context* self,UINT event) {
     // 11295 180017100: CS_PARTIAL_FLUSH EVENT_WRITE / PFP_SYNC_ME, not CPU sleeps.
@@ -4116,7 +4149,6 @@ void STDMETHODCALLTYPE context_gpu_event(Context* self,UINT event) {
     if(FAILED(hr)) {
         std::fprintf(stderr,"xone-era: GPU pipeline event 0x%X refused 0x%08lX\n",event,hr);
         (void)trap_slot<kind_context,197>(self,event);
-    if(self->device->suspended) { (void)trap_slot<kind_context,58>(self); return; }
     }
 }
 HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
@@ -4163,9 +4195,7 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
         const HRESULT hr=map_title_gpu_resource(renamed->gpu,&address);
         if(FAILED(hr)) return hr;
         try {
-    std::lock_guard submission(self->device->list_execution);
             DeferredBuffer entry;entry.original=reinterpret_cast<IUnknown*>(resource);entry.version=version;entry.mapped=true;
-    if(self->device->suspended) { (void)trap_slot<kind_context,111>(self); return; }
             self->buffer_versions.insert_or_assign(resource,std::move(entry));
         } catch(const std::bad_alloc&) {
             if(FAILED(unmap_title_gpu_resource(renamed->gpu))) default_trap("deferred map rollback",15);
@@ -4173,8 +4203,6 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
         }
         retain_recorded_binding(self,resource);retain_recorded_binding(self,renamed);
         out->pData=address;out->RowPitch=out->DepthPitch=resource->desc.standard.ByteWidth;
-    std::lock_guard submission(self->device->list_execution);
-    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
         return S_OK;
     }
     void* address = nullptr;
@@ -4196,34 +4224,6 @@ void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource) {
             if(version!=self->buffer_versions.end() && version->second.mapped) {
                 hr=unmap_title_gpu_resource(reinterpret_cast<Buffer*>(version->second.version.Get())->gpu);
                 if(SUCCEEDED(hr)) version->second.mapped=false;
-HRESULT STDMETHODCALLTYPE context_suspend(Context* self,UINT flags) {
-    // 16299 UMD 18001eec0 -> 1800a2ad0; title 1402497a8 requests flags 0.
-    // shortcut: immediate modern context, no DMA engines; extend only with verified engine/flag contracts.
-    if(self->device->legacy || self->deferred || flags) return E_NOTIMPL;
-    std::lock_guard submission(self->device->list_execution);
-    std::lock_guard ownership(self->device->ownership);
-    for(const auto& engine:self->device->dma) if(engine) return E_NOTIMPL;
-    if(self->device->suspended) return DXGI_ERROR_INVALID_CALL;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
-    if(!completed.IsValid()) return HRESULT_FROM_WIN32(GetLastError());
-    HRESULT hr=self->device->d3d12->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence));
-    if(SUCCEEDED(hr)) hr=self->device->queue->Signal(fence.Get(),1);
-    if(SUCCEEDED(hr)) hr=fence->SetEventOnCompletion(1,completed.Get());
-    if(SUCCEEDED(hr) && WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0) hr=HRESULT_FROM_WIN32(ERROR_TIMEOUT);
-    if(SUCCEEDED(hr)) hr=self->device->d3d12->GetDeviceRemovedReason();
-    if(SUCCEEDED(hr)) self->device->suspended=true;
-    return hr;
-}
-HRESULT STDMETHODCALLTYPE context_resume(Context* self) {
-    // 16299 UMD 18001eed0 -> 1800a2c50; bindings and canonical pixels survive.
-    if(self->device->legacy || self->deferred) return E_NOTIMPL;
-    std::lock_guard submission(self->device->list_execution);
-    if(!self->device->suspended) return DXGI_ERROR_INVALID_CALL;
-    const HRESULT hr=self->device->d3d12->GetDeviceRemovedReason();
-    if(SUCCEEDED(hr)) self->device->suspended=false;
-    return hr;
-}
             }
         } else hr=unmap_title_gpu_resource(resource->gpu);
     }
@@ -4299,6 +4299,8 @@ void STDMETHODCALLTYPE context_unmap_modern(Context* self,GraphicsObject* resour
 const std::array<const void*, vtable_slots>& legacy_context_vtable() {
     static const auto table = [] {
         auto t = context_vtable();
+        t[201] = traps<kind_context>()[201]; // The old revision has different slots here.
+        t[202] = traps<kind_context>()[202];
         for(UINT slot : {9u,10u,11u,12u,13u,14u,18u,19u,20u,21u,25u}) t[slot]=traps<kind_context>()[slot];
         t[8] = reinterpret_cast<const void*>(&context_constants<1,8>); // 11295 180010b90, VS constant buffers.
         t[34] = reinterpret_cast<const void*>(&trap_slot<kind_context,34>);
@@ -4420,8 +4422,6 @@ HRESULT WINAPI D3D11CreateDevice(void* adapter, D3D_DRIVER_TYPE type, HMODULE so
 
     auto* device = new (std::nothrow) Device;
     if (!device) { queue->Release(); d3d12->Release(); return E_OUTOFMEMORY; }
-        t[201] = traps<kind_context>()[201]; // The old revision has different slots here.
-        t[202] = traps<kind_context>()[202];
     device->vtable = device_vtable().data();
     device->flags = 0;
     device->refcount = 1;

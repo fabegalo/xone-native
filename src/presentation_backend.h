@@ -20,6 +20,8 @@ public:
     [[nodiscard]] virtual PresenterStats stats() const = 0;
 
     virtual bool pump_messages(bool& quit_requested, std::string& error) = 0;
+    virtual void take_input(std::vector<WindowInputEvent>& out) = 0;
+    [[nodiscard]] virtual void* native_window() const noexcept = 0;
     virtual bool resize(std::uint32_t new_width, std::uint32_t new_height, std::string& error) = 0;
     virtual bool present_frame(const ExternalFrameView& frame, std::string& error) = 0;
     virtual bool wait_for_gpu(std::string& error) = 0;

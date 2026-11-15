@@ -28,6 +28,7 @@ using Microsoft::WRL::ComPtr;
 
 constexpr wchar_t kWindowClassName[] = L"XboxOneNativePresentationWindowClass";
 constexpr std::string_view kSyntheticTitlePrefix = "[SYNTHETIC TEST - NOT SYSTEMOS] ";
+constexpr std::string_view kLocalRecreationTitlePrefix = "[LOCAL RECREATION - NOT SYSTEMOS] ";
 
 std::string format_hresult(std::string_view context, HRESULT hr) {
     std::ostringstream oss;
@@ -68,18 +69,15 @@ DXGI_FORMAT to_dxgi_format(PixelFormat format) noexcept {
     return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
-std::string build_safe_window_title(std::string_view requested_title, bool authentic_systemos) {
-    if (authentic_systemos) {
+std::string build_safe_window_title(std::string_view requested_title, FrameOrigin origin) {
+    if (origin == FrameOrigin::systemos_component) {
         return std::string(requested_title);
     }
-    if (requested_title.starts_with(kSyntheticTitlePrefix)) {
+    const auto prefix = origin == FrameOrigin::local_recreation ? kLocalRecreationTitlePrefix : kSyntheticTitlePrefix;
+    if (requested_title.starts_with(prefix)) {
         return std::string(requested_title);
     }
-    std::string title;
-    title.reserve(kSyntheticTitlePrefix.size() + requested_title.size());
-    title.append(kSyntheticTitlePrefix);
-    title.append(requested_title);
-    return title;
+    return std::string(prefix) + std::string(requested_title);
 }
 
 bool select_d3d12_adapter(IDXGIFactory4* factory,
@@ -275,12 +273,23 @@ public:
         while (PeekMessageW(&msg, reinterpret_cast<HWND>(-1), 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
                 close_requested_ = true;
+            } else if (msg.message == WM_HOTKEY) {
+                input_.push_back({WindowInputEvent::Kind::hotkey, static_cast<std::uint32_t>(msg.wParam)});
             }
         }
 
         stats_.window_open = window_open_ && !close_requested_;
         quit_requested = !stats_.window_open;
         return true;
+    }
+
+    void take_input(std::vector<WindowInputEvent>& out) override {
+        out.swap(input_);
+        input_.clear();
+    }
+
+    [[nodiscard]] void* native_window() const noexcept override {
+        return window_open_ ? hwnd_ : nullptr;
     }
 
     bool resize(std::uint32_t new_width, std::uint32_t new_height, std::string& error) override {
@@ -499,17 +508,18 @@ public:
         switch (frame.provenance.origin) {
             case FrameOrigin::synthetic_test:
                 ++stats_.synthetic_frames;
-                update_window_title_mode(false);
                 break;
             case FrameOrigin::external_host_buffer:
                 ++stats_.external_host_frames;
-                update_window_title_mode(false);
                 break;
             case FrameOrigin::systemos_component:
                 ++stats_.authentic_systemos_frames;
-                update_window_title_mode(true);
+                break;
+            case FrameOrigin::local_recreation:
+                ++stats_.local_recreation_frames;
                 break;
         }
+        update_window_title_mode(frame.provenance.origin);
 
         return true;
     }
@@ -709,6 +719,18 @@ private:
                 }
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN:
+                if (self != nullptr) {
+                    self->input_.push_back({WindowInputEvent::Kind::key_down, static_cast<std::uint32_t>(wparam)});
+                }
+                if (msg == WM_SYSKEYDOWN && wparam != VK_F4) return 0; // keep Alt+F4, no menu activation
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            case WM_CHAR:
+                if (self != nullptr) {
+                    self->input_.push_back({WindowInputEvent::Kind::character, static_cast<std::uint32_t>(wparam)});
+                }
+                return 0;
             case WM_DESTROY:
                 if (self != nullptr) {
                     self->window_open_ = false;
@@ -745,7 +767,7 @@ private:
             return false;
         }
 
-        const std::string safe_title = build_safe_window_title(config.window_title, false);
+        const std::string safe_title = build_safe_window_title(config.window_title, FrameOrigin::synthetic_test);
         const std::wstring wide_title = utf8_to_wide(safe_title);
         if (wide_title.empty()) {
             error = "Failed to convert window_title to UTF-16";
@@ -787,9 +809,9 @@ private:
         return true;
     }
 
-    void update_window_title_mode(bool authentic_systemos) {
+    void update_window_title_mode(FrameOrigin origin) {
         const std::string expected_title =
-            build_safe_window_title(config_.window_title, authentic_systemos);
+            build_safe_window_title(config_.window_title, origin);
         if (expected_title == stats_.active_window_title) {
             return;
         }
@@ -1057,6 +1079,7 @@ private:
     HWND hwnd_ = nullptr;
     bool window_open_ = false;
     bool close_requested_ = false;
+    std::vector<WindowInputEvent> input_;
     bool has_presented_frame_ = false;
     std::uint32_t last_presented_backbuffer_index_ = 0;
 

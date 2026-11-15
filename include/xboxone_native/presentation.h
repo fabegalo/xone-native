@@ -28,6 +28,8 @@ enum class FrameOrigin {
     synthetic_test,
     external_host_buffer,
     systemos_component,
+    // Locally recreated Xbox One-style dashboard (own code and assets). Never SystemOS.
+    local_recreation,
 };
 
 struct FrameProvenance {
@@ -122,6 +124,7 @@ struct PresenterStats {
     std::uint64_t synthetic_frames = 0;
     std::uint64_t external_host_frames = 0;
     std::uint64_t authentic_systemos_frames = 0;
+    std::uint64_t local_recreation_frames = 0;
     std::uint64_t resize_count = 0;
     std::uint64_t recovered_error_count = 0;
     std::uint64_t last_submitted_fence_value = 0;
@@ -178,6 +181,13 @@ bool make_synthetic_test_image(std::uint32_t width, std::uint32_t height,
                                std::uint32_t frame_index, PixelFormat format,
                                SyntheticImage& out_image, std::string& error);
 
+// Host window input in arrival order: Win32 VK_* for key_down, UTF-16 units
+// for character, RegisterHotKey ids for hotkey.
+struct WindowInputEvent {
+    enum class Kind { key_down, character, hotkey } kind = Kind::key_down;
+    std::uint32_t code = 0;
+};
+
 class BackendInstance;
 
 class Presenter {
@@ -198,6 +208,10 @@ public:
     [[nodiscard]] PresenterStats stats() const;
 
     bool pump_messages(bool& quit_requested, std::string& error);
+    // Moves input collected by pump_messages into out (cleared first).
+    void take_input(std::vector<WindowInputEvent>& out);
+    // Native window (HWND on Windows) for host adapters; null when closed.
+    [[nodiscard]] void* native_window() const noexcept;
     bool resize(std::uint32_t new_width, std::uint32_t new_height, std::string& error);
     bool present_frame(const ExternalFrameView& frame, std::string& error);
     bool wait_for_gpu(std::string& error);

@@ -85,6 +85,7 @@ bool validate_provenance(const FrameProvenance& provenance, std::string& error) 
     switch (provenance.origin) {
         case FrameOrigin::synthetic_test:
         case FrameOrigin::external_host_buffer:
+        case FrameOrigin::local_recreation:
             return true;
         case FrameOrigin::systemos_component:
             if (!is_valid_sha256_hex(provenance.component_sha256)) {
@@ -286,6 +287,15 @@ bool Presenter::pump_messages(bool& quit_requested, std::string& error) {
         return false;
     }
     return backend_->pump_messages(quit_requested, error);
+}
+
+void Presenter::take_input(std::vector<WindowInputEvent>& out) {
+    out.clear();
+    if (backend_) backend_->take_input(out);
+}
+
+void* Presenter::native_window() const noexcept {
+    return backend_ ? backend_->native_window() : nullptr;
 }
 
 bool Presenter::resize(std::uint32_t new_width, std::uint32_t new_height, std::string& error) {

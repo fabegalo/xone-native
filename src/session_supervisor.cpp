@@ -129,6 +129,13 @@ public:
         log.reset(CreateFileW(request.log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr));
         if (log.value == INVALID_HANDLE_VALUE) { error = "cannot create session log: Win32 " + std::to_string(GetLastError()); return false; }
+        FILETIME started{};GetSystemTimeAsFileTime(&started);
+        const auto stamp=(std::uint64_t(started.dwHighDateTime)<<32)|started.dwLowDateTime;
+        const auto header="xone-native: session "+std::to_string(stamp)+"\n";
+        DWORD written=0;
+        if(!WriteFile(log.value,header.data(),DWORD(header.size()),&written,nullptr) || written!=header.size()) {
+            error="cannot initialize session log: Win32 "+std::to_string(GetLastError());return false;
+        }
         std::wstring command = quote(request.runtime.wstring()) + (request.mode == Mode::run ? L" run " : L" check ") +
                                quote(request.title.wstring());
         if (request.mode == Mode::run) {

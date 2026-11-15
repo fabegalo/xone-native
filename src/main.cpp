@@ -2,6 +2,7 @@
 #include "xboxone_native/inspection.h"
 #include "xboxone_native/inventory.h"
 #include "xboxone_native/dashboard.h"
+#include "diagnostic_console.h"
 
 #include <charconv>
 #include <array>
@@ -86,6 +87,9 @@ void help() {
     std::cout << "xone-native: local Xbox One-style dashboard and read-only content inspector\n"
               << "Usage: xone-native [dashboard]   (no arguments: open the local dashboard)\n"
               << "       xone-native inspect <file> [--json]\n"
+#ifdef _WIN32
+              << "       xone-native logs <session.log>   (live diagnostic console; dashboard: F8 or ~)\n"
+#endif
               << "       xone-native inventory <directory> [--json]\n"
               << "           [--max-file-bytes N] [--max-total-bytes N]\n"
               << "       xone-native inspect-xvd-header <declared-file-size> [--json]\n"
@@ -182,6 +186,9 @@ bool argument_is(const auto* text, std::string_view expected) {
 }
 
 int run(int argc, const auto* const* argv) {
+#ifdef _WIN32
+    if(argc==3 && argument_is(argv[1],"logs"))return xboxone::diagnostics::run_console(std::filesystem::path(argv[2]));
+#endif
     if (argc == 1 || (argc == 2 && argument_is(argv[1], "dashboard"))) return xboxone::dashboard::run_host();
     if (argc == 2 && (argument_is(argv[1], "--help") || argument_is(argv[1], "-h"))) {
         help(); return 0;

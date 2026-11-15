@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Windows x64 host adapter for the local dashboard.
 #include "dashboard_windows.h"
+#include "diagnostic_console.h"
 #include "xboxone_native/presentation.h"
 
 #include <objbase.h>
@@ -201,6 +202,7 @@ public:
     Dashboard* ui = nullptr;
     bool exit = false;
     Pads pads;
+    diagnostics::Console logs;
 
     HWND window() const { return static_cast<HWND>(presenter_.native_window()); }
 
@@ -338,6 +340,12 @@ public:
 
     void key(std::uint32_t vk) {
         if (!ui) return;
+        if(vk==VK_F8 || vk==VK_OEM_3) {
+            const auto source=ui->root()/"logs"/(ui->checking_title.empty() ? "last-session.log" : "last-check.log");
+            if(!logs.show(source,reinterpret_cast<std::uintptr_t>(window())))
+                MessageBoxW(window(),L"Cannot open the diagnostic console",L"xone-native",MB_ICONERROR);
+            return;
+        }
         if (ui->active_surface() == session::SurfaceMode::title && vk != VK_HOME && vk != VK_F1) return;
         ui->controller_hints = false;
         const bool typing = ui->page == Page::keyboard && ui->dialogs.empty() && !ui->guide_open;

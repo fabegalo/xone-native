@@ -181,6 +181,7 @@ int usage() {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    std::setvbuf(stdout,nullptr,_IONBF,0); // The supervisor's live console must see output before process exit.
     if (argc < 3) return usage();
     const std::wstring command = argv[1];
     const bool run = command == L"run";

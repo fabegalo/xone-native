@@ -8,6 +8,7 @@
 #include "xboxone_native/session_supervisor.h"
 #include "sha256.h"
 #include "dashboard_render.h"
+#include "diagnostic_console.h"
 #include <algorithm>
 
 #include <chrono>
@@ -372,6 +373,19 @@ void test_dashboard_flow() {
 } // namespace
 
 int main() {
+    {
+        diagnostics::LogBuffer log;
+        log.append("original GPU ");log.append("bytes\r\npartial");
+        check(log.lines.size()==1 && log.lines.front()=="original GPU bytes" && log.fragment=="partial",
+              "live console retains incomplete writes until the original line is complete");
+        log.append("\n");
+        for(std::size_t i=0;i<diagnostics::LogBuffer::line_limit;++i)log.append("line\n");
+        check(log.lines.size()==diagnostics::LogBuffer::line_limit && log.omitted==2,"console history reports bounded eviction");
+        log.clear();log.append(std::string(diagnostics::LogBuffer::byte_limit+32,'x'));
+        check(log.lines.size()<=diagnostics::LogBuffer::line_limit && log.fragment.size()<diagnostics::LogBuffer::fragment_limit,
+              "unterminated guest output cannot grow the console without bound");
+        log.clear();check(log.lines.empty() && log.fragment.empty() && !log.omitted,"clear view resets only the retained model");
+    }
     test_overlay_pixels();
     test_state_roundtrip();
     test_interpret();

@@ -158,7 +158,7 @@ std::atomic<HWND> suspend_window{nullptr};
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
     if (message == suspend_message) { raise_suspending(); return 0; }
     if (auto parent = session_parent()) {
-        if (message == WM_KEYDOWN && (wparam == VK_HOME || wparam == VK_F1)) {
+        if (message == WM_KEYDOWN && (wparam == VK_HOME || wparam == VK_F1 || wparam == VK_F8 || wparam == VK_OEM_3)) {
             if (!(lparam & (1LL << 30))) PostMessageW(parent, WM_KEYDOWN, wparam, lparam);
             return 0;
         }

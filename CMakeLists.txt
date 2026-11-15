@@ -89,7 +89,7 @@ target_include_directories(xboxone_console PUBLIC
 target_compile_features(xboxone_console PUBLIC cxx_std_20)
 target_link_libraries(xboxone_console PUBLIC xboxone_inspection PRIVATE xboxone_systemos)
 if(WIN32)
-    target_sources(xboxone_console PRIVATE src/dashboard_windows.cpp)
+    target_sources(xboxone_console PRIVATE src/dashboard_windows.cpp src/diagnostic_console.cpp)
     target_link_libraries(xboxone_console PRIVATE xboxone_presentation user32 gdi32 ole32 shell32 windowscodecs winmm)
 endif()
 if(MSVC)

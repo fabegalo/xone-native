@@ -18,7 +18,10 @@
 #include <winstring.h>
 
 #include <cstdio>
+#include <cwchar>
 #include <atomic>
+#include <iterator>
+#include <new>
 
 namespace xboxone::era {
 namespace {
@@ -146,7 +149,12 @@ HRESULT STDMETHODCALLTYPE activate_window(WinrtObject*) {
     return S_OK;
 }
 
+void raise_suspending();
+constexpr UINT suspend_message = WM_APP + 0x53;
+std::atomic<HWND> suspend_window{nullptr};
+
 LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (message == suspend_message) { raise_suspending(); return 0; }
     if (message == WM_DESTROY && window_thread == GetCurrentThreadId()) PostQuitMessage(0);
     return DefWindowProcW(hwnd, message, wparam, lparam);
 }
@@ -164,6 +172,7 @@ HRESULT create_window() {
     window = CreateWindowExW(0, wc.lpszClassName, L"xone-era", style, CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left,
                              r.bottom - r.top, nullptr, nullptr, wc.hInstance, nullptr);
     window_thread = window ? GetCurrentThreadId() : 0;
+    suspend_window = window;
     dispatcher_quit = false;
     return window ? S_OK : HRESULT_FROM_WIN32(GetLastError());
 }
@@ -244,6 +253,7 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
     }
     static_cast<IUnknown*>(fv)->Release();
     stop_title_input();
+    suspend_window = nullptr;
     window_thread = 0;
     if (window) { DestroyWindow(window); window = nullptr; }
     WindowsDeleteString(entry_point);
@@ -253,8 +263,79 @@ HRESULT STDMETHODCALLTYPE run(WinrtObject*, IUnknown* source_unknown) {
     return hr;
 }
 
-// The launcher never suspends the title, so these are stored and never raised.
+// Suspending is raised when the system UI closes the title (process lifetime
+// management, as on console); the process is then terminated, so Resuming is
+// stored and never raised.
 WinrtEvent suspending, resuming;
+
+// SuspendingEventArgs / SuspendingOperation / SuspendingDeferral, public SDK layouts:
+// ISuspendingEventArgs 6 get_SuspendingOperation; ISuspendingOperation 6 GetDeferral,
+// 7 get_Deadline; ISuspendingDeferral 6 Complete.
+constexpr GUID iid_suspending_args{0x96061c05, 0x2dba, 0x4d08, {0xb0, 0xbd, 0x2b, 0x30, 0xa1, 0x31, 0xc6, 0xaa}};
+constexpr GUID iid_suspending_operation{0x9da4ca41, 0x20e1, 0x4e9b, {0x9f, 0x65, 0xa9, 0xf4, 0x35, 0x34, 0x0c, 0x3a}};
+constexpr GUID iid_suspending_deferral{0x59140509, 0x8bc9, 0x4eb4, {0xb6, 0x36, 0xda, 0xbd, 0xc4, 0xf4, 0x6f, 0x66}};
+std::atomic<int> open_deferrals{0};
+std::atomic<bool> suspend_delivered{false};
+std::atomic<std::int64_t> suspend_deadline{0}; // Windows.Foundation.DateTime (FILETIME ticks).
+
+struct Deferral : WinrtObject { std::atomic<bool> completed{false}; };
+HRESULT STDMETHODCALLTYPE complete_deferral(Deferral* self) {
+    if (!self->completed.exchange(true)) --open_deferrals;
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE get_deferral(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    static const auto vt = [] { auto t = winrt_vtable(); t[6] = reinterpret_cast<const void*>(&complete_deferral); return t; }();
+    // Process-wide lifetime like every title-layer object; the process ends after suspension.
+    auto* deferral = new (std::nothrow) Deferral;
+    if (!deferral) return E_OUTOFMEMORY;
+    static_cast<WinrtObject&>(*deferral) = {vt.data(), L"Windows.ApplicationModel.SuspendingDeferral", iid_suspending_deferral, &self_query};
+    ++open_deferrals;
+    *out = reinterpret_cast<IInspectable*>(deferral);
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE get_deadline(WinrtObject*, std::int64_t* out) {
+    if (!out) return E_POINTER;
+    *out = suspend_deadline;
+    return S_OK;
+}
+WinrtObject& suspending_operation() {
+    static const auto vt = [] {
+        auto t = winrt_vtable();
+        t[6] = reinterpret_cast<const void*>(&get_deferral);
+        t[7] = reinterpret_cast<const void*>(&get_deadline);
+        return t;
+    }();
+    static WinrtObject object{vt.data(), L"Windows.ApplicationModel.SuspendingOperation", iid_suspending_operation, &self_query};
+    return object;
+}
+HRESULT STDMETHODCALLTYPE get_suspending_operation(WinrtObject*, IInspectable** out) {
+    if (!out) return E_POINTER;
+    *out = reinterpret_cast<IInspectable*>(&suspending_operation());
+    return S_OK;
+}
+WinrtObject& suspending_args() {
+    static const auto vt = [] { auto t = winrt_vtable(); t[6] = reinterpret_cast<const void*>(&get_suspending_operation); return t; }();
+    static WinrtObject object{vt.data(), L"Windows.ApplicationModel.SuspendingEventArgs", iid_suspending_args, &self_query};
+    return object;
+}
+WinrtObject& statics();
+
+// Runs on the title's window thread, where the console delivers Suspending.
+void raise_suspending() {
+    note("xone-era: raising Suspending\n");
+    for (IUnknown* handler : suspending.snapshot()) {
+        // EventHandler<SuspendingEventArgs>::Invoke(sender, args)
+        const HRESULT hr = call<HRESULT>(handler, 3, &statics(), &suspending_args());
+        handler->Release();
+        if (FAILED(hr)) {
+            char line[80];
+            std::snprintf(line, sizeof line, "xone-era: Suspending handler -> 0x%08lX\n", static_cast<unsigned long>(hr));
+            note(line);
+        }
+    }
+    suspend_delivered = true;
+}
 HRESULT STDMETHODCALLTYPE add_suspending(WinrtObject*, IUnknown* h, std::int64_t* t) { return suspending.add(h, t); }
 HRESULT STDMETHODCALLTYPE remove_suspending(WinrtObject*, std::int64_t t) { return suspending.remove(t); }
 HRESULT STDMETHODCALLTYPE add_resuming(WinrtObject*, IUnknown* h, std::int64_t* t) { return resuming.add(h, t); }
@@ -313,6 +394,50 @@ HRESULT query(WinrtObject*, REFIID iid, void** out) {
 }
 
 } // namespace
+
+SuspendOutcome suspend_title(DWORD budget_ms) {
+    const HWND target = suspend_window;
+    if (!target || !suspending.size()) return SuspendOutcome::no_handler;
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    suspend_deadline = ((static_cast<std::int64_t>(now.dwHighDateTime) << 32) | now.dwLowDateTime) +
+                       static_cast<std::int64_t>(budget_ms) * 10000;
+    suspend_delivered = false;
+    if (!PostMessageW(target, suspend_message, 0, 0)) return SuspendOutcome::no_handler;
+    const auto end = GetTickCount64() + budget_ms;
+    while (GetTickCount64() < end) {
+        if (suspend_delivered && open_deferrals <= 0) return SuspendOutcome::suspended;
+        Sleep(5);
+    }
+    return SuspendOutcome::deadline;
+}
+
+namespace {
+DWORD WINAPI suspend_watch(void* event) {
+    WaitForSingleObject(static_cast<HANDLE>(event), INFINITE);
+    note("xone-era: system UI requested suspend\n");
+    // shortcut: fixed budget like the desktop PLM default; use the console's figure once measured.
+    switch (suspend_title(5000)) {
+    case SuspendOutcome::suspended: note("xone-era: title suspended\n"); break;
+    case SuspendOutcome::deadline: note("xone-era: suspend deadline reached; terminating title\n"); break;
+    case SuspendOutcome::no_handler: note("xone-era: title has no Suspending handler; terminating\n"); break;
+    }
+    TerminateProcess(GetCurrentProcess(), 0);
+    return 0;
+}
+} // namespace
+
+bool start_suspend_watch() {
+    // Created by the session supervisor (session_supervisor.cpp) before this process resumes.
+    wchar_t name[64];
+    std::swprintf(name, std::size(name), L"Local\\xone-era-suspend-%lu", GetCurrentProcessId());
+    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, name);
+    if (!event) return false; // Not supervised: nothing can ask for suspension.
+    HANDLE thread = CreateThread(nullptr, 0, suspend_watch, event, 0, nullptr);
+    if (!thread) { CloseHandle(event); return false; }
+    CloseHandle(thread);
+    return true;
+}
 
 HWND core_window_hwnd(const void* object) {
     // Reference 14004c5c0 accepts NULL for the runtime's current local window.

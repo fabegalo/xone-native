@@ -10,6 +10,7 @@
 #include <objbase.h>
 
 #include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -45,6 +46,22 @@ bool wait(session::Host& host, session::Result& result) {
     return false;
 }
 
+// Stand-in for xone-era's suspend watch, used to test the supervisor's side of the
+// contract: the event named after this process, then the line xone-era prints.
+int fake_runtime(const std::wstring& title) {
+    const auto name = L"Local\\xone-era-suspend-" + std::to_wstring(GetCurrentProcessId());
+    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, name.c_str());
+    if (!event) { std::puts("fake-era: no suspend event"); return 3; }
+    if (title.find(L"hang") != std::wstring::npos) Sleep(INFINITE);
+    if (WaitForSingleObject(event, 20000) != WAIT_OBJECT_0) return 4;
+    std::puts("xone-era: system UI requested suspend\nxone-era: title suspended");
+    return 0;
+}
+
+long long elapsed_ms(std::chrono::steady_clock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - since).count();
+}
+
 std::vector<char> read(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
     return {std::istreambuf_iterator<char>(in), {}};
@@ -63,6 +80,7 @@ void write_bmp(const fs::path& path, const dashboard::GdiSurface& surface) {
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    if (argc >= 3 && std::wstring(argv[1]) == L"run") return fake_runtime(argv[2]);
     if (argc < 4) { std::cerr << "usage: dashboard_era_tests <xone-era> <era_component> <AppxManifest.xml> [--capture DIR]\n"; return 2; }
     const fs::path runtime = argv[1], component = argv[2], manifest = argv[3];
     const fs::path capture = argc == 6 && std::wstring(argv[4]) == L"--capture" ? fs::path(argv[5]) : fs::path{};
@@ -95,6 +113,29 @@ int wmain(int argc, wchar_t** argv) {
     probe.storage = scratch / "storage";
     check(host->start(probe, error) && wait(*host, result) && !result.normal && result.exit_code == 1,
           "a title that cannot map is never reported as running");
+
+    // Guide quit: the title is asked to suspend before the supervisor ends it.
+    wchar_t self[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, self, MAX_PATH);
+    session::Request quit{session::Mode::run, self, scratch / "suspend.exe", scratch / "storage", scratch / "logs" / "quit.log", 0};
+    check(host->start(quit, error), "supervisor starts a run session");
+    auto since = std::chrono::steady_clock::now();
+    host->terminate();
+    check(wait(*host, result) && result.terminated && result.summary == "Closed by the system UI after the title suspended" &&
+          elapsed_ms(since) < 5000, "quit lets the title suspend, then reports it");
+    quit.title = scratch / "hang.exe";
+    quit.suspend_grace_ms = 300;
+    check(host->start(quit, error), "supervisor starts a title that ignores suspension");
+    since = std::chrono::steady_clock::now();
+    host->terminate();
+    check(wait(*host, result) && result.terminated && result.summary == "Closed by the system UI" && elapsed_ms(since) >= 300,
+          "a title that never suspends is ended after the grace period");
+    quit.suspend_grace_ms = 20000;
+    check(host->start(quit, error), "supervisor starts a title for forced quit");
+    since = std::chrono::steady_clock::now();
+    host->terminate();
+    host->terminate();
+    check(wait(*host, result) && result.terminated && elapsed_ms(since) < 5000, "a second quit ends the title at once");
 
     // Catalog identification from the package's own metadata.
     const auto package = scratch / "library" / "Owned Package";

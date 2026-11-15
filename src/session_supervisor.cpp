@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <optional>
 #include <sstream>
 
 #ifdef _WIN32
@@ -60,7 +61,12 @@ Result interpret(int exit_code, bool terminated, const std::string& output) {
     const bool returned = !first_line_with(lines, "title entry returned").empty() || !first_line_with(lines, "title called exit").empty();
     char code[32];
     std::snprintf(code, sizeof code, "0x%08X", static_cast<unsigned>(exit_code));
-    if (terminated) r.summary = "Closed by the system UI";
+    if (terminated) {
+        r.summary = "Closed by the system UI";
+        if (!first_line_with(lines, "xone-era: title suspended").empty()) r.summary += " after the title suspended";
+        else if (!first_line_with(lines, "suspend deadline reached").empty()) r.summary += "; the title did not finish suspending in time";
+        else if (!first_line_with(lines, "no Suspending handler").empty()) r.summary += "; the title registered no Suspending handler";
+    }
     else if (exit_code == 0 && returned) { r.normal = true; r.summary = "Title exited normally"; }
     else if (exit_code == 0 && r.mapped) r.summary = std::to_string(r.resolved) + " imports resolved, 0 missing";
     else if (exit_code == 124) r.summary = "Time limit reached; the runtime ended the title";
@@ -149,6 +155,11 @@ public:
         thread.reset(info.hThread);
         process_.reset(info.hProcess);
         pid_ = info.dwProcessId;
+        // Opened by xone-era's suspend watch (era_core_application.cpp) under this name.
+        suspend_.reset(request.mode == Mode::run ?
+            CreateEventW(nullptr, TRUE, FALSE, (L"Local\\xone-era-suspend-" + std::to_wstring(pid_)).c_str()) : nullptr);
+        grace_ = std::chrono::milliseconds(request.suspend_grace_ms);
+        kill_at_.reset();
         if (!AssignProcessToJobObject(job_.value, process_.value)) {
             const DWORD failure = GetLastError();
             TerminateProcess(process_.value, 1);
@@ -165,11 +176,15 @@ public:
     [[nodiscard]] bool active() const override { return process_.value != nullptr; }
 
     bool poll(Result& result) override {
-        if (!active() || WaitForSingleObject(process_.value, 0) != WAIT_OBJECT_0) return false;
+        if (!active()) return false;
+        if (kill_at_ && std::chrono::steady_clock::now() >= *kill_at_) { TerminateJobObject(job_.value, 1); kill_at_.reset(); }
+        if (WaitForSingleObject(process_.value, 0) != WAIT_OBJECT_0) return false;
         DWORD code = 0;
         GetExitCodeProcess(process_.value, &code);
         process_.reset();
         job_.reset();
+        suspend_.reset();
+        kill_at_.reset();
         result = interpret(static_cast<int>(code), terminated_, read_tail(log_));
         result.duration_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started_).count());
@@ -179,6 +194,11 @@ public:
     void terminate() override {
         if (!active()) return;
         terminated_ = true;
+        if (suspend_.value && !kill_at_ && SetEvent(suspend_.value)) {
+            kill_at_ = std::chrono::steady_clock::now() + grace_;
+            return;
+        }
+        kill_at_.reset();
         TerminateJobObject(job_.value, 1);
     }
 
@@ -199,7 +219,9 @@ public:
     }
 
 private:
-    Handle process_, job_;
+    Handle process_, job_, suspend_;
+    std::chrono::milliseconds grace_{0};
+    std::optional<std::chrono::steady_clock::time_point> kill_at_;
     DWORD pid_ = 0;
     bool terminated_ = false;
     std::filesystem::path log_;

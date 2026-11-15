@@ -50,6 +50,11 @@ HRESULT package_transfer_watcher_factory(REFIID iid, void** factory);
 // Windows.ApplicationModel.Core.CoreApplication (view lifecycle driven here).
 HRESULT core_application_factory(REFIID iid, void** factory);
 HRESULT core_window_factory(REFIID iid, void** factory);
+// Process lifetime: raise the title's Suspending handlers on its window thread and
+// wait for its deferrals, at most budget_ms.
+enum class SuspendOutcome { suspended, deadline, no_handler };
+SuspendOutcome suspend_title(DWORD budget_ms);
+bool start_suspend_watch(); // Watches the supervisor's suspend event, then ends the process.
 inline constexpr char dlc_package_view_signature[] =
     "pinterface({bbe1fa4c-b0e3-4583-baef-1f1b2e483e56};rc(Windows.Xbox.Management.Deployment.DownloadableContentPackage;"
     "{696996e9-f0f6-4497-a05e-514d915b7d05}))";

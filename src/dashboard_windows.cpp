@@ -453,7 +453,9 @@ int run_host() {
         }
     }
     if (hotkey) UnregisterHotKey(nullptr, hotkey_guide);
+    // The title gets its Suspending call before the job closes; poll kills it after the grace period.
     ui.quit_title();
+    while (!ui.session_title.empty()) { ui.tick(0.02); Sleep(20); }
     presenter.shutdown();
     return 0;
 }

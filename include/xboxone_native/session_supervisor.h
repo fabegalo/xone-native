@@ -20,6 +20,7 @@ struct Request {
     std::filesystem::path storage;  // ERA --storage root (run only)
     std::filesystem::path log;      // child stdout+stderr, replaced per session
     std::uint32_t time_limit_ms = 0; // 0: no ERA deadline, the supervisor owns shutdown
+    std::uint32_t suspend_grace_ms = 8000; // run: terminate() waits this long for Suspending, then kills
 };
 
 struct Result {
@@ -43,6 +44,8 @@ public:
     [[nodiscard]] virtual bool active() const = 0;
     // True once, when the active session has ended; result then holds its outcome.
     virtual bool poll(Result& result) = 0;
+    // Run sessions are asked to suspend first (the title's Suspending handlers run);
+    // the process is killed after the grace period or on a second call.
     virtual void terminate() = 0;
     // Brings the title's window to the foreground; false when it has none.
     virtual bool focus_title() = 0;

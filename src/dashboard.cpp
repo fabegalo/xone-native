@@ -69,7 +69,7 @@ const std::map<std::string, std::string>& portuguese() {
         {"Could not start", "Não foi possível iniciar"}, {"Quit", "Fechar"}, {"A title is running", "Um título está em execução"},
         {"Remove this profile? Its save data stays on disk.", "Remover este perfil? Os dados salvos permanecem no disco."},
         {"Remove this title from the library? Its files are not deleted.", "Remover este título da biblioteca? Os arquivos não são apagados."},
-        {"Quitting closes the running title.", "Sair fecha o título em execução."}, {"Starting", "Iniciando"},
+        {"Quitting closes the running title.", "Sair fecha o título em execução."}, {"Starting", "Iniciando"}, {"Closing", "Fechando"},
         {"Library folders", "Pastas da biblioteca"}, {"X: remove", "X: remover"}, {"minutes", "minutos"},
         {"Display settings could not be applied", "Não foi possível aplicar o vídeo"},
         {"Locally recreated dashboard. Not Xbox One SystemOS.", "Dashboard recriada localmente. Não é o SystemOS do Xbox One."},
@@ -769,7 +769,10 @@ void Dashboard::next_check() {
 }
 
 void Dashboard::quit_title() {
-    if (!session_title.empty()) session_.terminate();
+    if (session_title.empty()) return;
+    session_.terminate(); // Asks the title to suspend; a second quit ends it at once.
+    const auto* t = title(session_title);
+    notify(translate("Closing") + " " + (t ? t->name : session_title), 0xE711);
 }
 
 void Dashboard::finished(const session::Result& result) {

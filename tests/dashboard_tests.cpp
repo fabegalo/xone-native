@@ -146,6 +146,14 @@ void test_state_roundtrip() {
     char hex[3];
     std::snprintf(hex, sizeof hex, "%02x", bytes.size() == 32 ? bytes[16] : 0);
     check(p.id.substr(0, 2) == hex, "ERA record identity is the profile id");
+    const auto name = [&] {
+        std::ifstream in(storage / ".xone-local-profile-name", std::ios::binary);
+        return std::string{std::istreambuf_iterator<char>(in), {}};
+    };
+    check(name() == p.name, "profile name written for the title's GameDisplayName");
+    auto renamed = p;
+    renamed.name = "Jogadora Dois";
+    check(console::prepare_title_storage(storage, renamed, error) && name() == "Jogadora Dois", "renamed profile updates the name");
 }
 
 void test_interpret() {
@@ -162,7 +170,13 @@ void test_interpret() {
     r = session::interpret(124, false, "");
     check(r.summary.find("Time limit") == 0, "deadline");
     r = session::interpret(1, true, "");
-    check(r.terminated && !r.normal, "terminated by system UI");
+    check(r.terminated && !r.normal && r.summary == "Closed by the system UI", "terminated by system UI");
+    r = session::interpret(0, true, "xone-era: system UI requested suspend\nxone-era: title suspended\n");
+    check(r.terminated && r.summary == "Closed by the system UI after the title suspended", "suspended before quit");
+    r = session::interpret(0, true, "xone-era: suspend deadline reached; terminating title\n");
+    check(r.summary.find("did not finish suspending") != std::string::npos, "suspend deadline reported");
+    r = session::interpret(0, true, "xone-era: title has no Suspending handler; terminating\n");
+    check(r.summary.find("no Suspending handler") != std::string::npos, "title without handler reported");
 }
 
 void test_dashboard_flow() {

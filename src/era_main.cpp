@@ -13,6 +13,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <intrin.h>
+#include "era_winrt_classes.h"
 
 #include <array>
 #include <atomic>
@@ -265,6 +266,8 @@ int wmain(int argc, wchar_t** argv) {
     title_end = title_base + image.size();
     AddVectoredExceptionHandler(1, on_exception);
     std::atexit(on_exit);
+    // Guide "quit" from a supervising dashboard: Suspending first, then termination.
+    if (!deadline) xboxone::era::start_suspend_watch();
     if (deadline) {
         HANDLE dog = CreateThread(nullptr, 0, watchdog, reinterpret_cast<void*>(static_cast<std::uintptr_t>(timeout)), 0, nullptr);
         if (!dog) { std::cerr << "cannot start watchdog\n"; return 1; }

@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <cstdio>
 #include <intrin.h>
@@ -87,7 +88,7 @@ template<class T> HRESULT STDMETHODCALLTYPE dynamic_query(T* self,REFIID iid,voi
 }
 struct LocalUser;
 struct DisplayInfo : WinrtObject { LocalUser* owner=nullptr; };
-struct LocalUser : WinrtObject { std::atomic<ULONG> refs{1}; ProfileRecord profile; DisplayInfo display{}; };
+struct LocalUser : WinrtObject { std::atomic<ULONG> refs{1}; ProfileRecord profile; std::wstring name; DisplayInfo display{}; };
 HRESULT STDMETHODCALLTYPE display_query(DisplayInfo* self,REFIID iid,void** out) {
     if (!out) return E_POINTER; *out=nullptr;
     if (iid!=__uuidof(IUnknown) && iid!=__uuidof(IInspectable) && iid!=__uuidof(IAgileObject) && iid!=iid_display) return E_NOINTERFACE;
@@ -95,10 +96,30 @@ HRESULT STDMETHODCALLTYPE display_query(DisplayInfo* self,REFIID iid,void** out)
 }
 ULONG STDMETHODCALLTYPE display_retain(DisplayInfo* self) { return retain(self->owner); }
 ULONG STDMETHODCALLTYPE display_release(DisplayInfo* self) { return release(self->owner); }
-HRESULT STDMETHODCALLTYPE display_name(DisplayInfo*,HSTRING* out) {
+HRESULT STDMETHODCALLTYPE display_name(DisplayInfo* self,HSTRING* out) {
     if (!out) return E_POINTER;
-    constexpr wchar_t name[]=L"Local Player";
-    return WindowsCreateString(name,UINT(std::size(name)-1),out);
+    const auto& name=self->owner->name;
+    return WindowsCreateString(name.c_str(),UINT(name.size()),out);
+}
+// Name of the profile the system UI signed in (console_state.cpp writes it beside the
+// record); without one, or if it is unusable, the session shows a generic local name.
+std::wstring load_profile_name(const std::wstring& root) {
+    const std::wstring fallback=L"Local Player";
+    const auto path=xboxone::detail::file_path(root)/L".xone-local-profile-name";
+    std::error_code error;
+    if (std::filesystem::is_symlink(std::filesystem::symlink_status(path,error)) ||
+        !std::filesystem::is_regular_file(path,error)) return fallback;
+    std::ifstream in(path,std::ios::binary);
+    char bytes[257]{};
+    in.read(bytes,256);
+    const int size=static_cast<int>(in.gcount());
+    if (size<=0 || !in.eof()) return fallback;
+    std::wstring name(static_cast<std::size_t>(size),L'\0');
+    const int length=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,bytes,size,name.data(),size);
+    if (length<=0) return fallback;
+    name.resize(static_cast<std::size_t>(length));
+    for (const wchar_t c:name) if (c<0x20 || c==0x7F) return fallback;
+    return name;
 }
 HRESULT STDMETHODCALLTYPE user_display(LocalUser* self,void** out) {
     if (!out) return E_POINTER;
@@ -155,7 +176,7 @@ HRESULT acquire_user(LocalUser** out) {
         ProfileRecord record;
         const HRESULT hr=load_profile(root,record); if (FAILED(hr)) return hr;
         auto user=std::make_unique<LocalUser>();
-        static_cast<WinrtObject&>(*user)={user_table().data(),class_name,iid_user,&user_query}; user->profile=record;
+        static_cast<WinrtObject&>(*user)={user_table().data(),class_name,iid_user,&user_query}; user->profile=record; user->name=load_profile_name(root);
         static const auto display=[] { auto t=winrt_vtable();t[0]=reinterpret_cast<const void*>(&display_query);
             t[1]=reinterpret_cast<const void*>(&display_retain);t[2]=reinterpret_cast<const void*>(&display_release);t[6]=reinterpret_cast<const void*>(&display_name);return t; }();
         static_cast<WinrtObject&>(user->display)={display.data(),L"Windows.Xbox.System.UserDisplayInfo",iid_display,nullptr};user->display.owner=user.get();

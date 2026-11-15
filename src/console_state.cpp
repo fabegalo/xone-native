@@ -248,6 +248,32 @@ std::filesystem::path title_storage(const std::filesystem::path& root, const Pro
     return profile_storage(root, profile) / "titles" / title.id.substr(0, 16);
 }
 
+namespace {
+// Replaces the file atomically unless it already holds exactly `bytes`.
+bool install_file(const std::filesystem::path& target, const std::string& bytes, const char* what, std::string& error) {
+    const auto path = detail::file_path(target);
+    {
+        std::ifstream existing(path, std::ios::binary);
+        std::string current(bytes.size() + 1, '\0');
+        if (existing && existing.read(current.data(), static_cast<std::streamsize>(current.size())).gcount() ==
+                            static_cast<std::streamsize>(bytes.size()) && current.compare(0, bytes.size(), bytes) == 0)
+            return true;
+    }
+    auto temporary = target;
+    temporary += ".tmp";
+    {
+        std::ofstream file(detail::file_path(temporary), std::ios::binary | std::ios::trunc);
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        file.flush();
+        if (!file) { error = std::string("cannot write ") + what; return false; }
+    }
+    std::error_code ec;
+    std::filesystem::rename(detail::file_path(temporary), path, ec);
+    if (ec) { error = std::string("cannot install ") + what + ": " + ec.message(); return false; }
+    return true;
+}
+} // namespace
+
 bool prepare_title_storage(const std::filesystem::path& storage, const Profile& profile, std::string& error) {
     if (!hex_id(profile.id, 32)) { error = "invalid profile identity"; return false; }
     std::error_code ec;
@@ -257,23 +283,9 @@ bool prepare_title_storage(const std::filesystem::path& storage, const Profile& 
     std::array<char, 32> record{'X', 'O', 'N', 'E', 'U', 'S', 'R', '1', 1, 0, 0, 0, 0, 0, 0, 0};
     for (std::size_t i = 0; i < 16; ++i)
         record[16 + i] = static_cast<char>(std::stoi(profile.id.substr(i * 2, 2), nullptr, 16));
-    const auto path = detail::file_path(storage / ".xone-local-profile");
-    {
-        std::ifstream existing(path, std::ios::binary);
-        std::array<char, 33> current{};
-        if (existing && existing.read(current.data(), 33).gcount() == 32 && std::memcmp(current.data(), record.data(), 32) == 0)
-            return true;
-    }
-    const auto temporary = detail::file_path(storage / ".xone-local-profile.tmp");
-    {
-        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-        file.write(record.data(), record.size());
-        file.flush();
-        if (!file) { error = "cannot write ERA profile record"; return false; }
-    }
-    std::filesystem::rename(temporary, path, ec);
-    if (ec) { error = "cannot install ERA profile record: " + ec.message(); return false; }
-    return true;
+    // The name answers the title's UserDisplayInfo.GameDisplayName (era_xbox_system.cpp).
+    return install_file(storage / ".xone-local-profile", std::string(record.data(), record.size()), "ERA profile record", error) &&
+           install_file(storage / ".xone-local-profile-name", profile.name, "ERA profile name", error);
 }
 
 Profile* find_profile(State& state, const std::string& id) {

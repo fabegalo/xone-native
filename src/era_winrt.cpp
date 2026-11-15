@@ -31,6 +31,8 @@ constexpr TitleClass title_classes[]{
     {L"Windows.ApplicationModel.Package", &package_factory},
     {L"Windows.Xbox.Services.XboxLiveConfiguration", &xbox_live_configuration_factory},
     {L"Windows.Xbox.System.User", &xbox_user_factory},
+    {L"Windows.Xbox.UI.SystemUI", &xbox_system_ui_factory},
+    {L"Windows.Xbox.Storage.ConnectedStorageSpace", &connected_storage_factory},
     {L"Windows.Xbox.Input.Controller", &xbox_controller_factory},
     {L"Windows.Xbox.Input.Gamepad", &xbox_gamepad_factory},
     {L"Windows.Xbox.Management.Deployment.DownloadableContentPackageManager", &dlc_package_manager_factory},

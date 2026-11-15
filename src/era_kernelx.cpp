@@ -68,6 +68,7 @@ struct GpuWindow {
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     bool copied_back = false;
+    bool read_only = false;
     bool preparing = false, completing = false;
     TitleTextureLayout texture;
     Microsoft::WRL::ComPtr<ID3D12Resource> upload, readback;
@@ -80,6 +81,8 @@ struct GpuWindow {
     UINT sample_srv_step = 0, sample_rtv_step = 0;
     std::vector<unsigned char> sample_linear;
     bool staged_buffer = false;
+    std::unique_ptr<TextureLayoutTransfer> layout_transfer;
+    bool gpu_layout_active = false, gpu_layout_refused = false;
     std::array<bool, 512> physical_pages{};
 };
 using GpuWindows = std::multimap<std::pair<SIZE_T, SIZE_T>, GpuWindow>;
@@ -1176,11 +1179,14 @@ static HRESULT prepare_staged_buffer(GpuWindow& window, const void* canonical, S
     return S_OK;
 }
 
-HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state) {
+static bool gpu_read_only(D3D12_RESOURCE_STATES state);
+HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only) {
+    if(read_only && !gpu_read_only(state))return E_INVALIDARG;
     std::lock_guard lock(memory_mutex);
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
     const HRESULT hr = claim_gpu_window(buffer, list, state, false, backing, window);
     if (FAILED(hr)) return hr;
+    window->read_only=read_only;
     if (window->staged_buffer) {
         const auto* canonical = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
         const HRESULT prepared = prepare_staged_buffer(*window, canonical, buffer.size);
@@ -1201,11 +1207,21 @@ HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandLi
     return S_OK;
 }
 
+static bool gpu_read_only(D3D12_RESOURCE_STATES state) {
+    constexpr UINT reads=D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER|D3D12_RESOURCE_STATE_INDEX_BUFFER|
+        D3D12_RESOURCE_STATE_DEPTH_READ|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT|D3D12_RESOURCE_STATE_COPY_SOURCE|D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    return state!=D3D12_RESOURCE_STATE_COMMON && !(UINT(state)&~reads);
+}
 HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list) {
     std::lock_guard lock(memory_mutex);
     auto* backing = gpu_backing(buffer);
     auto* window = gpu_window(buffer, backing);
     if (!window || window->texture.context || window->active != &buffer || window->list.Get() != list || window->copied_back) return E_INVALIDARG;
+    if (window->read_only) {
+        gpu_transition(list,buffer.resource,window->state,D3D12_RESOURCE_STATE_COMMON);
+        window->copied_back=true;return S_OK;
+    }
     gpu_transition(list, buffer.resource, window->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     if (window->staged_buffer) list->CopyBufferRegion(window->readback.Get(), 0, buffer.resource, 0, buffer.size);
     else {
@@ -1300,7 +1316,8 @@ static void interleave_samples(GpuWindow& window, void* mapped, bool into_array)
     }
 }
 
-static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool discard_contents=false) {
+static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,const TitleGpuClearState& clear,bool discard_contents,
+                                     const D3D12_SUBRESOURCE_DATA* input,bool gpu_allowed) {
     try {
         if (!window.upload) {
             Microsoft::WRL::ComPtr<ID3D12Device> device;
@@ -1333,7 +1350,45 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool di
             if (FAILED(hr)) return hr;
             window.upload = std::move(upload); window.readback = std::move(readback);
         }
+        window.gpu_layout_active=false;
+        static const bool cpu_layout=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_CPU_LAYOUT",value,2)==1 && value[0]==L'1';}();
+        if(gpu_allowed && !cpu_layout && !input && !window.sample_array && window.footprints.size()==1 &&
+            window.texture.offsets && !window.gpu_layout_refused) {
+            if(!window.layout_transfer) {
+                const UINT32* offsets=nullptr;SIZE_T count=0;
+                const auto ready=window.texture.offsets(window.texture.context.get(),&offsets,&count);
+                if(FAILED(ready))return ready;
+                if(ready==S_OK) {
+                    Microsoft::WRL::ComPtr<ID3D12Device> device;HRESULT hr=window.resource->GetDevice(IID_PPV_ARGS(&device));
+                    if(FAILED(hr))return hr;
+                    auto transfer=std::make_unique<TextureLayoutTransfer>();const auto& desc=window.texture.resource_desc;
+                    hr=transfer->initialize(device.Get(),{offsets,count},UINT(desc.Width),desc.Height,window.footprints[0],window.texture.bytes);
+                    if(FAILED(hr))return hr;
+                    if(hr==S_OK)window.layout_transfer=std::move(transfer);else window.gpu_layout_refused=true;
+                    wchar_t timing[2]{};
+                    if(GetEnvironmentVariableW(L"XONE_ERA_TIMING",timing,2)==1 && timing[0]==L'1')
+                        std::fprintf(stderr,"xone-era: timing layout=%s width=%llu height=%u format=%u bytes=%zu\n",
+                            hr==S_OK ? "gpu" : "cpu-budget",desc.Width,desc.Height,desc.Format,window.texture.bytes);
+                }
+            }
+            if(window.layout_transfer) {
+                const HRESULT hr=window.layout_transfer->prepare(canonical,discard_contents);if(FAILED(hr))return hr;
+                window.gpu_layout_active=true;return S_OK;
+            }
+        }
         if(discard_contents) return S_OK; // Readback/sample staging is still required after a full clear.
+        UINT64 input_row_bytes=0;
+        if(input) {
+            if(window.sample_array || !input->pData || input->RowPitch<=0 || input->SlicePitch<=0 ||
+                window.rows.empty() || !window.rows[0] || !window.footprints[0].Footprint.Depth) return E_INVALIDARG;
+            Microsoft::WRL::ComPtr<ID3D12Device> device;
+            HRESULT hr=window.resource->GetDevice(IID_PPV_ARGS(&device));if(FAILED(hr)) return hr;
+            const auto desc=window.resource->GetDesc();
+            device->GetCopyableFootprints(&desc,0,1,0,nullptr,nullptr,&input_row_bytes,nullptr);
+            if(UINT64(input->RowPitch)<input_row_bytes || UINT64(input->RowPitch)>UINT64_MAX/window.rows[0] ||
+                UINT64(input->SlicePitch)<UINT64(input->RowPitch)*window.rows[0] ||
+                UINT64(input->SlicePitch)>SIZE_MAX/window.footprints[0].Footprint.Depth) return E_INVALIDARG;
+        }
         void* mapped = nullptr;
         const D3D12_RANGE no_read{0, 0};
         HRESULT hr = window.upload->Map(0, &no_read, &mapped);
@@ -1342,7 +1397,7 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool di
             const auto& desc = window.texture.resource_desc;
             const UINT element=sample_pixel_bytes(desc.Format);
             const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * element;
-            hr = window.texture.copy(window.texture.context.get(), false, window.sample_linear.data(), canonical, 0, row, row * desc.Height);
+            hr = window.texture.copy(window.texture.context.get(), false, window.sample_linear.data(), canonical, 0, row, row * desc.Height,&clear);
             if (SUCCEEDED(hr) && (desc.Format==DXGI_FORMAT_R32G8X24_TYPELESS || desc.Format==DXGI_FORMAT_R32_TYPELESS)) for (SIZE_T at=0;at<window.sample_linear.size();at+=element) {
                 UINT32 bits; std::memcpy(&bits,window.sample_linear.data()+at,4);
                 // SV_Depth cannot promise lossless NaN, signed-zero or denormal payloads.
@@ -1352,8 +1407,12 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool di
         } else for (UINT i = 0; i < window.footprints.size(); ++i) {
             const auto& footprint = window.footprints[i];
             const UINT slice = footprint.Footprint.RowPitch * window.rows[i];
-            hr = window.texture.copy(window.texture.context.get(), false, static_cast<unsigned char*>(mapped) + footprint.Offset,
-                canonical, i, footprint.Footprint.RowPitch, slice);
+            if(i==0 && input) {
+                for(UINT z=0;z<footprint.Footprint.Depth;++z) for(UINT y=0;y<window.rows[i];++y)
+                    std::memcpy(static_cast<unsigned char*>(mapped)+footprint.Offset+SIZE_T(z)*slice+SIZE_T(y)*footprint.Footprint.RowPitch,
+                        static_cast<const unsigned char*>(input->pData)+SIZE_T(z)*input->SlicePitch+SIZE_T(y)*input->RowPitch,SIZE_T(input_row_bytes));
+            } else hr = window.texture.copy(window.texture.context.get(), false, static_cast<unsigned char*>(mapped) + footprint.Offset,
+                canonical, i, footprint.Footprint.RowPitch, slice,&clear);
             if (FAILED(hr)) break;
         }
         const D3D12_RANGE written{0, static_cast<SIZE_T>(window.staging_bytes)};
@@ -1362,11 +1421,15 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,bool di
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
-HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents) {
+HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents,
+                                const D3D12_SUBRESOURCE_DATA* input,bool read_only) {
+    if(discard_contents && input) return E_INVALIDARG;
+    if(read_only && (discard_contents || input || !gpu_read_only(state)))return E_INVALIDARG;
     std::unique_lock lock(memory_mutex);
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
     HRESULT hr = claim_gpu_window(texture, list, state, true, backing, window);
     if (FAILED(hr)) {std::fprintf(stderr,"xone-era: texture ingress claim failed 0x%08lX\n",hr);return hr;}
+    window->read_only=read_only;
     if(discard_contents) {
         const auto& desc=window->texture.resource_desc;
         if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels!=1 || desc.DepthOrArraySize!=1 ||
@@ -1376,10 +1439,11 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
     }
     window->preparing = true;
     auto* canonical = static_cast<unsigned char*>(texture.allocation) + texture.canonical_offset;
+    const auto clear=texture.clear;
     // The ownership gate keeps this range alive and exclusive while CPU layout
     // conversion runs; original helpers may call allocation hooks themselves.
     lock.unlock();
-    hr = prepare_texture_upload(*window, canonical,discard_contents);
+    hr = prepare_texture_upload(*window, canonical,clear,discard_contents,input,list->GetType()==D3D12_COMMAND_LIST_TYPE_DIRECT);
     lock.lock();
     window->preparing = false;
     if (FAILED(hr)) { std::fprintf(stderr,"xone-era: texture ingress layout failed 0x%08lX\n",hr);release_physical(*window, &texture, false); window->active = nullptr; window->list.Reset(); return hr; }
@@ -1387,6 +1451,11 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
         // A full clear defines all samples/aspects; do not decode an undefined preimage (e.g. HTILE).
         gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COMMON,state);
         return S_OK;
+    }
+    if(window->gpu_layout_active) {
+        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+        window->layout_transfer->detile(list,texture.resource);
+        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COPY_DEST,state);return S_OK;
     }
     auto* copy_target = window->sample_array ? window->sample_array.Get() : texture.resource;
     gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1422,6 +1491,16 @@ HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandLi
     if (!window || !window->texture.context || window->active != &texture || window->list.Get() != list || window->copied_back)
         return E_INVALIDARG;
     if (window->preparing) return E_PENDING;
+    if (window->read_only) {
+        gpu_transition(list,texture.resource,window->state,D3D12_RESOURCE_STATE_COMMON);
+        window->copied_back=true;return S_OK;
+    }
+    if(window->gpu_layout_active) {
+        gpu_transition(list,texture.resource,window->state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        window->layout_transfer->retile(list,texture.resource);
+        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+        window->copied_back=true;return S_OK;
+    }
     auto* copy_source = window->sample_array ? window->sample_array.Get() : texture.resource;
     if (window->sample_array) {
         gpu_transition(list, texture.resource, window->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -1460,7 +1539,17 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
     if (!window->copied_back || window->completing) return E_PENDING;
     const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;
-    if (window->texture.context || window->staged_buffer) {
+    if(window->gpu_layout_active && !window->read_only) {
+        // The GPU snapshot already contains every texel and padding byte.
+        // Map may fail before publication; no fallible conversion follows it.
+        window->completing=true;auto* readback=window->layout_transfer->readback();
+        const D3D12_RANGE read{0,buffer.size};void* mapped=nullptr;
+        lock.unlock();const HRESULT mapped_result=readback->Map(0,&read,&mapped);lock.lock();
+        if(FAILED(mapped_result)){window->completing=false;return mapped_result;}
+        std::memcpy(static_cast<unsigned char*>(buffer.allocation)+buffer.canonical_offset,mapped,buffer.size);
+        const D3D12_RANGE no_write{0,0};readback->Unmap(0,&no_write);window->completing=false;
+    // Read-only use retains ownership/fence retirement without redundant writeback.
+    } else if ((window->texture.context || window->staged_buffer) && !window->read_only) {
         window->completing = true;
         auto* canonical = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
         lock.unlock();
@@ -1469,8 +1558,9 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
         try {
             commit.assign(canonical, canonical + buffer.size);
             void* mapped = nullptr;
-            const D3D12_RANGE read{0, static_cast<SIZE_T>(window->staging_bytes)};
-            converted = window->readback->Map(0, &read, &mapped);
+            const D3D12_RANGE read{0,static_cast<SIZE_T>(window->staging_bytes)};
+            auto* readback=window->readback.Get();
+            converted = readback->Map(0, &read, &mapped);
             if (SUCCEEDED(converted)) {
                 if (window->staged_buffer) std::memcpy(commit.data(), mapped, buffer.size);
                 else if (window->sample_array) {
@@ -1478,16 +1568,16 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
                     const auto& desc = window->texture.resource_desc;
                     const UINT row = UINT(desc.Width) * desc.SampleDesc.Count * sample_pixel_bytes(desc.Format);
                     converted = window->texture.copy(window->texture.context.get(), true, window->sample_linear.data(), commit.data(),
-                        0, row, row * desc.Height);
+                        0, row, row * desc.Height,nullptr);
                 } else for (UINT i = 0; i < window->footprints.size(); ++i) {
                     const auto& footprint = window->footprints[i];
                     converted = window->texture.copy(window->texture.context.get(), true,
                         static_cast<unsigned char*>(mapped) + footprint.Offset, commit.data(), i,
-                        footprint.Footprint.RowPitch, footprint.Footprint.RowPitch * window->rows[i]);
+                        footprint.Footprint.RowPitch, footprint.Footprint.RowPitch * window->rows[i],nullptr);
                     if (FAILED(converted)) break;
                 }
                 const D3D12_RANGE no_write{0, 0};
-                window->readback->Unmap(0, &no_write);
+                readback->Unmap(0, &no_write);
             }
         } catch (const std::bad_alloc&) { converted = E_OUTOFMEMORY; }
         lock.lock();
@@ -1531,6 +1621,20 @@ HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer) {
     if (!window || window->cpu != &buffer) return E_INVALIDARG;
     release_physical(*window, &buffer, true);
     window->cpu = nullptr;
+    return S_OK;
+}
+HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil) {
+    FLOAT value=0;std::memcpy(&value,&depth,sizeof value);
+    if(!aspects || (aspects&~3u) || ((aspects&1) && !(value>=0.f && value<=1.f))) return E_INVALIDARG;
+    std::lock_guard lock(memory_mutex);
+    auto* backing=gpu_backing(resource);auto* window=gpu_window(resource,backing);
+    if(!window || !window->texture.context || backing->retiring ||
+        !(window->resource->GetDesc().Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return E_INVALIDARG;
+    if(window->active) return E_PENDING;
+    if(window->cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    if(aspects&1) resource.clear.depth=depth;
+    if(aspects&2) resource.clear.stencil=stencil;
+    resource.clear.known|=UINT8(aspects);
     return S_OK;
 }
 
@@ -1614,6 +1718,7 @@ void set_title_storage_root(const std::wstring& root) {
     reset_title_users();
 }
 std::wstring title_storage_root() { std::lock_guard lock(storage_mutex); return storage_root; }
+bool title_writable_path(const std::wstring& path) { return writable_path(path.c_str()); }
 
 void* resolve_kernelx(const ImportRequest& request) {
     if (!same_library(request.library, "kernelx.dll") || request.name.empty()) return nullptr;

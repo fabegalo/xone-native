@@ -8,12 +8,15 @@
 // Observed (Sonic Mania 1.0.4.2): slot 12 called first with (handler, token*),
 // then slot 10.
 // Users enumerates the approved persistent local profile. Online identity and
-// authentication remain explicit gaps; the reference's fixed XUID is not reused.
+// authentication remain explicit gaps. XboxUserId exposes a profile-derived
+// emulated offline ID, never a provisioned Xbox services identity.
 #include "era_winrt_classes.h"
 #include "era_winrt_object.h"
 #include "file_path.h"
+#include "sha256.h"
 
 #include <activation.h>
+#include <asyncinfo.h>
 #include <winstring.h>
 #include <wrl/wrappers/corewrappers.h>
 #include <atomic>
@@ -22,7 +25,6 @@
 #include <fstream>
 #include <memory>
 #include <cstdio>
-#include <intrin.h>
 
 namespace xboxone::era {
 namespace {
@@ -142,12 +144,23 @@ HRESULT STDMETHODCALLTYPE user_is_signed_in(LocalUser*,boolean* out) {
 }
 HRESULT STDMETHODCALLTYPE user_location(LocalUser*,UINT* out) { if (!out) return E_POINTER; *out=0; return S_OK; }
 HRESULT STDMETHODCALLTYPE user_sponsor(LocalUser*,void** out) { if (!out) return E_POINTER; *out=nullptr; return S_OK; }
-HRESULT STDMETHODCALLTYPE user_xbox_id(LocalUser*,HSTRING* out) {
+HRESULT STDMETHODCALLTYPE user_xbox_id(LocalUser* self,HSTRING* out) try {
     if (!out) return E_POINTER;
     *out=nullptr;
-    // A local profile has no provisioned Xbox services identity.
-    std::fprintf(stderr,"xone-era: XboxUserId requires a provisioned identity; local profile only (caller %p)\n",_ReturnAddress());
-    return E_NOTIMPL;
+    // Approved local recreation: decimal ABI, stable across titles using this
+    // profile. This grants no Xbox Live authentication or content rights.
+    detail::Sha256 hash;
+    hash.update({reinterpret_cast<const std::uint8_t*>(&self->profile.identity),sizeof(GUID)});
+    const auto value=std::stoull(hash.finish().substr(0,16),nullptr,16);
+    const auto id=std::to_wstring(value ? value : 1);
+    return WindowsCreateString(id.c_str(),UINT(id.size()),out);
+} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+// Sonic 1402d5100: method, URL, headers, string body, operation** (slot 18).
+// The locally recreated profile has no Xbox Live authentication provider.
+HRESULT STDMETHODCALLTYPE user_token(LocalUser*,HSTRING,HSTRING,HSTRING,HSTRING,void** out) {
+    if (!out) return E_POINTER;
+    *out=nullptr;
+    return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
 }
 const auto& user_table() {
     static const auto table=[] { auto t=winrt_vtable();
@@ -157,7 +170,8 @@ const auto& user_table() {
         t[10]=reinterpret_cast<const void*>(&user_is_guest);
         t[11]=reinterpret_cast<const void*>(&user_is_signed_in);t[12]=reinterpret_cast<const void*>(&user_location);
         t[13]=reinterpret_cast<const void*>(&user_sponsor);
-        t[15]=reinterpret_cast<const void*>(&user_xbox_id);return t; }();
+        t[15]=reinterpret_cast<const void*>(&user_xbox_id);
+        t[18]=reinterpret_cast<const void*>(&user_token);return t; }();
     return table;
 }
 struct ProfileState {
@@ -178,7 +192,9 @@ HRESULT acquire_user(LocalUser** out) {
         auto user=std::make_unique<LocalUser>();
         static_cast<WinrtObject&>(*user)={user_table().data(),class_name,iid_user,&user_query}; user->profile=record; user->name=load_profile_name(root);
         static const auto display=[] { auto t=winrt_vtable();t[0]=reinterpret_cast<const void*>(&display_query);
-            t[1]=reinterpret_cast<const void*>(&display_retain);t[2]=reinterpret_cast<const void*>(&display_release);t[6]=reinterpret_cast<const void*>(&display_name);return t; }();
+            t[1]=reinterpret_cast<const void*>(&display_retain);t[2]=reinterpret_cast<const void*>(&display_release);t[6]=reinterpret_cast<const void*>(&display_name);
+            // IUserDisplayInfo: 6 Gamertag, 9 GameDisplayName; offline both are the local profile name.
+            t[9]=reinterpret_cast<const void*>(&display_name);return t; }();
         static_cast<WinrtObject&>(user->display)={display.data(),L"Windows.Xbox.System.UserDisplayInfo",iid_display,nullptr};user->display.owner=user.get();
         state.root=root;
         auto* previous=state.user; state.user=user.release();
@@ -308,12 +324,139 @@ UserFactory& factory() {
     return instance;
 }
 
+// Windows.Xbox.UI.SystemUI statics (ISystemUIStatics per the public IDL).
+// Only observed slots are filled in; others trap with their slot number.
+// Observed (Sonic Mania 1.0.4.2): slot 10 ShowAccountPickerAsync(controller,
+// options) at the title screen. The session has exactly one local profile, so
+// the picker completes with it; no Xbox Live sign-in is implied. Pairing the
+// controller to that profile remains an explicit gap of the input HLE.
+constexpr wchar_t system_ui_class[] = L"Windows.Xbox.UI.SystemUI";
+constexpr GUID iid_system_ui_statics{0x1A0DD80E,0x3F9D,0x4CFA,{0x8E,0x50,0x0E,0x2E,0xBD,0x1A,0xA7,0x2F}};
+constexpr GUID iid_picker_result{0x84453B4A,0x51F3,0x4651,{0xA5,0x17,0x53,0xC7,0x3B,0xB3,0xE1,0xF4}};
+constexpr wchar_t picker_result_class[] = L"Windows.Xbox.UI.AccountPickerResult";
+struct PickerResult : WinrtObject {
+    std::atomic<ULONG> refs{1}; LocalUser* user=nullptr;
+    ~PickerResult() { if (user) release(user); }
+};
+HRESULT picker_result_query(WinrtObject* self,REFIID iid,void** out) {
+    if (iid!=__uuidof(IUnknown) && iid!=__uuidof(IInspectable) && iid!=__uuidof(IAgileObject) && iid!=iid_picker_result) return E_NOINTERFACE;
+    *out=self; retain(static_cast<PickerResult*>(self)); return S_OK;
+}
+HRESULT STDMETHODCALLTYPE picker_result_user(PickerResult* self,void** out) {
+    if (!out) return E_POINTER;
+    retain(self->user); *out=self->user; return S_OK;
+}
+// Already-completed IAsyncOperation<AccountPickerResult> plus its IAsyncInfo.
+struct PickerOperation;
+struct PickerInfo : WinrtObject { PickerOperation* owner=nullptr; };
+struct PickerOperation : WinrtObject {
+    std::atomic<ULONG> refs{1}; PickerResult* result=nullptr; PickerInfo info{};
+    std::mutex mutex; IUnknown* handler=nullptr; bool closed=false;
+    ~PickerOperation() { if (handler) handler->Release(); if (result) release(result); }
+};
+const GUID& picker_operation_iid() {
+    static const GUID iid=winrt_pinterface_iid("pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};"
+        "rc(Windows.Xbox.UI.AccountPickerResult;{84453b4a-51f3-4651-a517-53c73bb3e1f4}))");
+    return iid;
+}
+HRESULT picker_operation_query(WinrtObject* self,REFIID iid,void** out) {
+    auto* operation=static_cast<PickerOperation*>(self);
+    if (iid==__uuidof(IAsyncInfo)) *out=&operation->info;
+    else if (iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==__uuidof(IAgileObject) || iid==picker_operation_iid()) *out=operation;
+    else return E_NOINTERFACE;
+    retain(operation); return S_OK;
+}
+HRESULT STDMETHODCALLTYPE picker_info_query(PickerInfo* self,REFIID iid,void** out) {
+    if (!out) return E_POINTER; *out=nullptr; return picker_operation_query(self->owner,iid,out);
+}
+ULONG STDMETHODCALLTYPE picker_info_retain(PickerInfo* self) { return retain(self->owner); }
+ULONG STDMETHODCALLTYPE picker_info_release(PickerInfo* self) { return release(self->owner); }
+HRESULT STDMETHODCALLTYPE picker_info_id(PickerInfo*,UINT* out) { if (!out) return E_POINTER; *out=1; return S_OK; }
+HRESULT STDMETHODCALLTYPE picker_info_status(PickerInfo*,INT32* out) { if (!out) return E_POINTER; *out=1; return S_OK; } // Completed
+HRESULT STDMETHODCALLTYPE picker_info_error(PickerInfo*,HRESULT* out) { if (!out) return E_POINTER; *out=S_OK; return S_OK; }
+HRESULT STDMETHODCALLTYPE picker_info_cancel(PickerInfo*) { return S_OK; } // No effect once completed.
+HRESULT STDMETHODCALLTYPE picker_info_close(PickerInfo* self) {
+    std::lock_guard lock(self->owner->mutex); self->owner->closed=true; return S_OK;
+}
+HRESULT STDMETHODCALLTYPE picker_put_completed(PickerOperation* self,IUnknown* handler) {
+    if (!handler) return E_POINTER;
+    {
+        std::lock_guard lock(self->mutex);
+        if (self->closed) return E_ILLEGAL_METHOD_CALL;
+        if (self->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
+        handler->AddRef(); self->handler=handler;
+    }
+    // Completed before assignment: the handler runs now, on the assigning thread.
+    using Invoke=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,void*,INT32);
+    return reinterpret_cast<Invoke>((*reinterpret_cast<void***>(handler))[3])(handler,self,1);
+}
+HRESULT STDMETHODCALLTYPE picker_get_completed(PickerOperation* self,IUnknown** out) {
+    if (!out) return E_POINTER;
+    std::lock_guard lock(self->mutex);
+    if (self->handler) self->handler->AddRef();
+    *out=self->handler; return S_OK;
+}
+HRESULT STDMETHODCALLTYPE picker_results(PickerOperation* self,void** out) {
+    if (!out) return E_POINTER; *out=nullptr;
+    std::lock_guard lock(self->mutex);
+    if (self->closed) return E_ILLEGAL_METHOD_CALL;
+    retain(self->result); *out=self->result; return S_OK;
+}
+HRESULT STDMETHODCALLTYPE show_account_picker(WinrtObject*,IUnknown*,INT32 options,void** out) try {
+    if (!out) return E_POINTER; *out=nullptr;
+    if (options<0 || options>2) return E_INVALIDARG; // None, AllowGuests, AllowOnlyDistinctControllerTypes.
+    static const auto result_vt=[] { auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&dynamic_query<PickerResult>);t[1]=reinterpret_cast<const void*>(&retain<PickerResult>);
+        t[2]=reinterpret_cast<const void*>(&release<PickerResult>);t[6]=reinterpret_cast<const void*>(&picker_result_user);return t; }();
+    static const auto operation_vt=[] { auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&dynamic_query<PickerOperation>);t[1]=reinterpret_cast<const void*>(&retain<PickerOperation>);
+        t[2]=reinterpret_cast<const void*>(&release<PickerOperation>);t[6]=reinterpret_cast<const void*>(&picker_put_completed);
+        t[7]=reinterpret_cast<const void*>(&picker_get_completed);t[8]=reinterpret_cast<const void*>(&picker_results);return t; }();
+    static const auto info_vt=[] { auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&picker_info_query);t[1]=reinterpret_cast<const void*>(&picker_info_retain);
+        t[2]=reinterpret_cast<const void*>(&picker_info_release);t[6]=reinterpret_cast<const void*>(&picker_info_id);
+        t[7]=reinterpret_cast<const void*>(&picker_info_status);t[8]=reinterpret_cast<const void*>(&picker_info_error);
+        t[9]=reinterpret_cast<const void*>(&picker_info_cancel);t[10]=reinterpret_cast<const void*>(&picker_info_close);return t; }();
+    auto result=std::make_unique<PickerResult>();
+    static_cast<WinrtObject&>(*result)={result_vt.data(),picker_result_class,iid_picker_result,&picker_result_query};
+    const HRESULT hr=acquire_user(&result->user); if (FAILED(hr)) return hr;
+    auto operation=std::make_unique<PickerOperation>();
+    static_cast<WinrtObject&>(*operation)={operation_vt.data(),picker_result_class,picker_operation_iid(),&picker_operation_query};
+    static_cast<WinrtObject&>(operation->info)={info_vt.data(),picker_result_class,__uuidof(IAsyncInfo),nullptr};
+    operation->info.owner=operation.get(); operation->result=result.release();
+    std::fputs("xone-era: account picker completed with the session's local profile\n",stderr);
+    *out=operation.release(); return S_OK;
+} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+struct SystemUiFactory { WinrtObject activation; WinrtObject statics; };
+SystemUiFactory& system_ui();
+HRESULT system_ui_query(WinrtObject*, REFIID iid, void** out) {
+    if (iid == __uuidof(IUnknown) || iid == __uuidof(IInspectable) || iid == __uuidof(IActivationFactory) || iid == __uuidof(IAgileObject))
+        *out = &system_ui().activation;
+    else if (iid == iid_system_ui_statics) *out = &system_ui().statics;
+    else return E_NOINTERFACE;
+    return S_OK;
+}
+SystemUiFactory& system_ui() {
+    static const auto activation_vt = winrt_vtable();
+    static const auto statics_vt = [] { auto t = winrt_vtable();
+        t[10] = reinterpret_cast<const void*>(&show_account_picker); return t; }();
+    static SystemUiFactory instance{{activation_vt.data(), system_ui_class, __uuidof(IActivationFactory), &system_ui_query},
+                                    {statics_vt.data(), system_ui_class, iid_system_ui_statics, &system_ui_query}};
+    return instance;
+}
+
 } // namespace
 
 HRESULT xbox_user_factory(REFIID iid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     return query(nullptr, iid, out);
+}
+
+HRESULT xbox_system_ui_factory(REFIID iid, void** out) {
+    if (!out) return E_POINTER;
+    *out = nullptr;
+    return system_ui_query(nullptr, iid, out);
 }
 
 std::size_t xbox_user_removed_handlers() { return user_removed.size(); }

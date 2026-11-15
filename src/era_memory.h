@@ -9,6 +9,10 @@ namespace xboxone::era {
 // ACP heaps retain registered CPU backing until their session ends.
 HRESULT pin_title_audio_memory(void* address, std::size_t bytes);
 void unpin_title_audio_memory(void* address);
+struct TitleGpuClearState {
+    UINT32 depth = 0; // Full IEEE bits, not quantized HTILE bounds.
+    UINT8 stencil = 0, known = 0; // D3D11_CLEAR_DEPTH / D3D11_CLEAR_STENCIL.
+};
 struct TitleTextureLayout {
     std::size_t bytes = 0, alignment = 0;
     UINT tile_mode = UINT_MAX;
@@ -19,7 +23,10 @@ struct TitleTextureLayout {
     // Original helper copies one subresource between tiled canonical bytes and
     // a linear footprint. Both pitches describe the linear side, in bytes.
     HRESULT (*copy)(void* context, bool into_tiled, void* linear, void* tiled,
-                    UINT subresource, UINT row_pitch, UINT slice_pitch) = nullptr;
+                    UINT subresource, UINT row_pitch, UINT slice_pitch,const TitleGpuClearState* clear) = nullptr;
+    // Immutable, original-XG-verified 32-bit texel byte offsets, when available.
+    // S_FALSE keeps the CPU reference path for other layouts/revisions.
+    HRESULT (*offsets)(void* context,const UINT32** values,std::size_t* count) = nullptr;
 };
 HRESULT create_xg_texture_layout(UINT width, UINT height, UINT mips, UINT arrays, DXGI_FORMAT format,
                                  UINT tile_mode, TitleTextureLayout& out, UINT bind_flags = 0, UINT samples = 1);
@@ -38,7 +45,9 @@ struct TitleGpuResource {
     void* representation = nullptr; // Registry-owned aligned window, if requested.
     std::size_t canonical_offset = 0, size = 0;
     bool composite = false; // A graphics reservation spanning physical/shared commitments.
+    TitleGpuClearState clear; // Logical resource state; physical aliases retain independent clear registers.
 };
+HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil);
 HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_list);
 // Resource capabilities are fixed by the first binding; later requests never
 // replace a cached resource with an unsynchronized alias.
@@ -50,10 +59,13 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
 // real fence after that command list before CPU access or overlapping GPU use.
 // Overlapping representations cannot be active together. Never copy a live handle.
 // Return the representation to the state passed to begin before calling end.
-HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state);
+// read_only promises no writes or write-state transitions within this interval;
+// it skips redundant writeback, but retains exclusion and fence retirement.
+HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only=false);
 HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list);
 // discard_contents requires a full overwrite of every aspect of a single-subresource texture.
-HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents=false);
+HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents=false,
+                                const D3D12_SUBRESOURCE_DATA* first_subresource=nullptr,bool read_only=false);
 HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list);
 // A texture's GPU fence is internal: complete also retiles readback bytes into
 // canonical memory. Publish guest completion only after this returns S_OK.

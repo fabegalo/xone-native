@@ -12,7 +12,7 @@ add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJEC
             ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_input.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_deployment.cpp
             ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_session.cpp)
+            ${PROJECT_SOURCE_DIR}/src/era_session.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_storage.cpp)
 target_link_libraries(xboxone_era PRIVATE xboxone_inspection d3d12 dxgi dxguid runtimeobject oleaut32 xmllite shlwapi ole32 bcrypt version)
 target_link_libraries(xboxone_era PRIVATE xboxone_systemos)
 # Diagnostic vtable thunks need /bigobj to stay within COFF section limits.
@@ -88,6 +88,10 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     add_test(NAME era_loader_regressions COMMAND xboxone_era_loader_tests $<TARGET_FILE:era_component>
              $<TARGET_FILE:era_tls_component> $<TARGET_FILE:era_module_component>)
     set_tests_properties(era_loader_regressions PROPERTIES TIMEOUT 20 LABELS "windows;synthetic;era")
+    add_executable(xboxone_era_storage_tests ${PROJECT_SOURCE_DIR}/tests/era_storage_tests.cpp)
+    target_link_libraries(xboxone_era_storage_tests PRIVATE xboxone_era)
+    add_test(NAME era_storage_regressions COMMAND xboxone_era_storage_tests)
+    set_tests_properties(era_storage_regressions PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era")
     add_test(NAME era_check_cli COMMAND xone-era check $<TARGET_FILE:era_component>)
     set_tests_properties(era_check_cli PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "resolved 2, unresolved 0")
     if(Python3_Interpreter_FOUND)

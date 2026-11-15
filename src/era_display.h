@@ -4,8 +4,34 @@
 #include <wrl/client.h>
 #include <array>
 #include <vector>
+#include <span>
+#include <utility>
 
 namespace xboxone::era {
+// Exact byte transport using verified offsets, not texture sampling or color math.
+// The caller supplies texture states and retains its normal submission fence.
+class TextureLayoutTransfer {
+public:
+    TextureLayoutTransfer()=default;
+    ~TextureLayoutTransfer();
+    TextureLayoutTransfer(const TextureLayoutTransfer&)=delete;
+    TextureLayoutTransfer& operator=(const TextureLayoutTransfer&)=delete;
+    HRESULT initialize(ID3D12Device* device,std::span<const UINT32> offsets,UINT width,UINT height,
+                       const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,SIZE_T tiled_bytes);
+    HRESULT prepare(const void* canonical,bool full_overwrite=false);
+    void detile(ID3D12GraphicsCommandList* list,ID3D12Resource* texture) const;
+    void retile(ID3D12GraphicsCommandList* list,ID3D12Resource* texture) const;
+    ID3D12Resource* readback() const {return readback_.Get();}
+private:
+    void dispatch(ID3D12GraphicsCommandList* list,bool into_tiled) const;
+    SIZE_T retained_bytes_=0,tiled_bytes_=0;
+    UINT width_=0,height_=0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint_{};
+    std::vector<std::pair<SIZE_T,SIZE_T>> padding_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> offsets_,upload_,linear_,tiled_,readback_;
+};
 void set_graphics_diagnostics(bool enabled, bool warp = false);
 // Xbox display transfer inside the native GPU backend. The caller owns resource
 // states, descriptor lifetime and submission fences, as for other GPU commands.

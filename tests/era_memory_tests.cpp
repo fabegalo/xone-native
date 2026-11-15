@@ -28,7 +28,7 @@ void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     list->ResourceBarrier(1, &b);
 }
 struct LinearTextureFixture { bool fail_writeback = false; };
-HRESULT linear_texture_copy(void* opaque, bool into_tiled, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice) {
+HRESULT linear_texture_copy(void* opaque, bool into_tiled, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice,const TitleGpuClearState*) {
     if (!opaque || !linear || !canonical || subresource >= 3) return E_INVALIDARG;
     auto* fixture = static_cast<LinearTextureFixture*>(opaque);
     if (into_tiled && fixture->fail_writeback && subresource == 1) return E_FAIL;
@@ -43,7 +43,7 @@ HRESULT linear_texture_copy(void* opaque, bool into_tiled, void* linear, void* c
     }
     return S_OK;
 }
-HRESULT linear_sample_copy(void*, bool into, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice) {
+HRESULT linear_sample_copy(void*, bool into, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice,const TitleGpuClearState*) {
     if (!linear || !canonical || subresource || pitch < 512 || UINT64(pitch) * 16 > slice) return E_INVALIDARG;
     for (UINT y = 0; y < 16; ++y) {
         auto* a = static_cast<unsigned char*>(canonical) + y * 512;
@@ -601,6 +601,62 @@ int main(int argc, char** argv) {
         VirtualQuery(storage, &info, sizeof info);
         check(info.State == MEM_FREE, "last aligned owner frees canonical and GPU representations together");
     }
+    // Independent reverse-order map, padded rows, raw float payloads, CPU edits
+    // and a GPU-authored replacement check both directions without XG reuse.
+    for(const auto format:{DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_B8G8R8A8_UNORM}) {
+        constexpr UINT width=31,height=17,count=width*height;
+        constexpr SIZE_T bytes=count*4+32;
+        std::vector<UINT32> offsets(count);
+        for(UINT i=0;i<count;++i)offsets[i]=16+(count-1-i)*4;
+        D3D12_RESOURCE_DESC image_desc{};image_desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        image_desc.Width=width;image_desc.Height=height;image_desc.DepthOrArraySize=image_desc.MipLevels=1;image_desc.Format=format;image_desc.SampleDesc.Count=1;
+        D3D12_HEAP_PROPERTIES image_heap{};image_heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        ComPtr<ID3D12Resource> image;
+        if(FAILED(device->CreateCommittedResource(&image_heap,D3D12_HEAP_FLAG_NONE,&image_desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&image))))return 1;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        device->GetCopyableFootprints(&image_desc,0,1,0,&footprint,nullptr,nullptr,nullptr);
+        TextureLayoutTransfer transfer;
+        const auto initialized=transfer.initialize(device.Get(),offsets,width,height,footprint,bytes);
+        if(initialized!=S_OK)std::cerr<<"layout transfer HRESULT 0x"<<std::hex<<initialized<<std::dec<<'\n';
+        check(initialized==S_OK,"exact GPU layout transfer initializes for a bounded validated map");if(initialized!=S_OK)return 1;
+        auto invalid=offsets;invalid[1]=invalid[0];TextureLayoutTransfer duplicate;
+        check(duplicate.initialize(device.Get(),invalid,width,height,footprint,bytes)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA),"duplicate offsets are rejected before a racy GPU scatter");
+        invalid=offsets;invalid[0]=UINT(bytes);TextureLayoutTransfer outside;
+        check(outside.initialize(device.Get(),invalid,width,height,footprint,bytes)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA),"GPU layout rejects out-of-range offsets before publication");
+        ComPtr<ID3D12Fence> layout_fence;if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&layout_fence))))return 1;
+        for(UINT iteration=0;iteration<3;++iteration) {
+            const bool full_overwrite=iteration==2;
+            std::vector<unsigned char> canonical(bytes,static_cast<unsigned char>(0x5a+iteration));std::vector<UINT32> pixels(count);
+            for(UINT i=0;i<count;++i){pixels[i]=i==0?0x7fc00001u:i==1?0x80000000u:0xa3b40000u+iteration*count+i;std::memcpy(canonical.data()+offsets[i],&pixels[i],4);}
+            if(FAILED(transfer.prepare(canonical.data(),full_overwrite)) || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr)))return 1;
+            if(!full_overwrite){transfer.detile(list.Get(),image.Get());barrier(list.Get(),image.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE);}
+            D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=image.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
+            if(!full_overwrite)list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+            auto expected=canonical;
+            if(iteration) {
+                if(FAILED(upload->Map(0,nullptr,&mapped)))return 1;
+                for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){UINT value=0x7f800000u^(y*width+x);std::memcpy(static_cast<unsigned char*>(mapped)+SIZE_T(y)*footprint.Footprint.RowPitch+x*4,&value,4);std::memcpy(expected.data()+offsets[y*width+x],&value,4);if(full_overwrite)pixels[y*width+x]=value;}
+                upload->Unmap(0,nullptr);from.pResource=upload.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=footprint;
+                to.pResource=image.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;to.SubresourceIndex=0;
+                if(!full_overwrite)barrier(list.Get(),image.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+                list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+                barrier(list.Get(),image.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE);
+                if(full_overwrite){from.pResource=image.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;from.SubresourceIndex=0;
+                    to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);}
+            }
+            transfer.retile(list.Get(),image.Get());barrier(list.Get(),image.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST);
+            if(FAILED(list->Close()))return 1;queue->ExecuteCommandLists(1,lists);
+            HANDLE ready=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!ready)return 1;
+            hr=queue->Signal(layout_fence.Get(),iteration+1);if(SUCCEEDED(hr))hr=layout_fence->SetEventOnCompletion(iteration+1,ready);
+            const bool done=SUCCEEDED(hr)&&WaitForSingleObject(ready,3000)==WAIT_OBJECT_0;CloseHandle(ready);if(!done)return 1;
+            if(FAILED(readback->Map(0,nullptr,&mapped)))return 1;bool exact=true;
+            for(UINT y=0;y<height;++y)for(UINT x=0;x<width;++x){UINT value=0;std::memcpy(&value,static_cast<unsigned char*>(mapped)+SIZE_T(y)*footprint.Footprint.RowPitch+x*4,4);exact=exact&&value==pixels[y*width+x];}
+            readback->Unmap(0,nullptr);check(exact,"GPU detile preserves all raw texel bits and refreshes CPU changes");
+            if(FAILED(transfer.readback()->Map(0,nullptr,&mapped)))return 1;
+            check(!std::memcmp(mapped,expected.data(),bytes),"GPU retile preserves raw GPU writes and every canonical padding/guard byte");transfer.readback()->Unmap(0,nullptr);
+        }
+    }
     const auto texture_fixture = [&](TitleTextureLayout layout, UINT block, UINT bytes_per_block, UINT64 signal,
                                      LinearTextureFixture* injected, bool packed_uav=false) -> bool {
         const auto& d = layout.resource_desc;
@@ -619,7 +675,7 @@ int main(int argc, char** argv) {
             expected[mip].resize(columns * rows * depth * bytes_per_block);
             for (UINT i = 0; i < expected[mip].size(); ++i) expected[mip][i] = static_cast<unsigned char>(0x39 + mip * 11 + i % 17);
             if (FAILED(layout.copy(layout.context.get(), true, expected[mip].data(), canonical, mip,
-                columns * bytes_per_block, columns * rows * bytes_per_block))) return false;
+                columns * bytes_per_block, columns * rows * bytes_per_block,nullptr))) return false;
         }
         const std::vector<unsigned char> preimage(canonical, canonical + layout.bytes);
         TitleGpuResource texture, alias;
@@ -736,7 +792,7 @@ int main(int argc, char** argv) {
                 const UINT rows = ((std::max)(1u, d.Height >> mip) + block - 1) / block;
                 std::vector<unsigned char> actual(expected[mip].size());
                 const HRESULT copied = layout.copy(layout.context.get(), false, actual.data(), canonical, mip,
-                    columns * bytes_per_block, columns * rows * bytes_per_block);
+                    columns * bytes_per_block, columns * rows * bytes_per_block,nullptr);
                 same = same && SUCCEEDED(copied) && actual == expected[mip];
             }
             for (unsigned i = 0; i < 16; ++i) same = same && canonical[int(i) - 16] == 0x5a && canonical[layout.bytes + i] == 0x5a;
@@ -749,16 +805,47 @@ int main(int argc, char** argv) {
         const UINT last_columns = ((std::max)(1u, static_cast<UINT>(d.Width) >> (mips - 1)) + block - 1) / block;
         const UINT last_rows = ((std::max)(1u, d.Height >> (mips - 1)) + block - 1) / block;
         hr = layout.copy(layout.context.get(), true, expected.back().data(), canonical, mips - 1,
-            last_columns * bytes_per_block, last_columns * last_rows * bytes_per_block);
+            last_columns * bytes_per_block, last_columns * last_rows * bytes_per_block,nullptr);
         if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
+        const std::vector<unsigned char> read_preimage(canonical,canonical+layout.bytes);
         if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
-        if (FAILED(begin_title_gpu_texture(texture, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE)) ||
+        check(begin_title_gpu_texture(texture,list.Get(),D3D12_RESOURCE_STATE_COPY_DEST,false,nullptr,true)==E_INVALIDARG,
+              "read-only intent rejects a writable GPU state without claiming the resource");
+        if (FAILED(begin_title_gpu_texture(texture, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,false,nullptr,true)) ||
             FAILED(end_title_gpu_texture(texture, list.Get())) || FAILED(list->Close())) return false;
         queue->ExecuteCommandLists(1, lists);
-        if (!wait_for(signal + 1) || FAILED(complete_title_gpu_resource(texture, fence.Get(), signal + 1))) return false;
+        check(complete_title_gpu_resource(texture,fence.Get(),signal+1)==E_PENDING,
+              "read-only texture access still requires its actual GPU fence");
+        if(injected)injected->fail_writeback=true;
+        hr=wait_for(signal+1) ? complete_title_gpu_resource(texture,fence.Get(),signal+1) : E_FAIL;
+        if(injected)injected->fail_writeback=false;
+        if(FAILED(hr))return false;
+        check(!std::memcmp(canonical,read_preimage.data(),read_preimage.size()),
+              "read-only texture use preserves every canonical byte without invoking writeback");
         check(matches(), "texture reuse refreshes canonical CPU changes and preserves previous GPU data");
+        ComPtr<ID3D12Fence> final_fence=fence;UINT64 final_value=signal+1;
+        const UINT32* verified=nullptr;SIZE_T verified_count=0;
+        if(layout.offsets && layout.offsets(layout.context.get(),&verified,&verified_count)==S_OK) {
+            ComPtr<ID3D12Fence> converted_fence;
+            if(FAILED(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&converted_fence))) ||
+                FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr)) ||
+                FAILED(begin_title_gpu_texture(texture,list.Get(),D3D12_RESOURCE_STATE_COPY_DEST)))return false;
+            if(FAILED(upload->Map(0,nullptr,&data)))return false;
+            std::memset(data,0x3c,mutation.Footprint.RowPitch*rows);upload->Unmap(0,nullptr);
+            list->CopyTextureRegion(&destination,0,0,0,&source,nullptr);
+            if(FAILED(end_title_gpu_texture(texture,list.Get())) || FAILED(list->Close()))return false;
+            queue->ExecuteCommandLists(1,lists);
+            check(complete_title_gpu_resource(texture,converted_fence.Get(),1)==E_PENDING,"GPU layout conversion cannot publish before its real fence");
+            HANDLE ready=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!ready)return false;
+            hr=queue->Signal(converted_fence.Get(),1);if(SUCCEEDED(hr))hr=converted_fence->SetEventOnCompletion(1,ready);
+            const bool done=SUCCEEDED(hr)&&WaitForSingleObject(ready,3000)==WAIT_OBJECT_0;CloseHandle(ready);
+            if(!done || FAILED(complete_title_gpu_resource(texture,converted_fence.Get(),1)))return false;
+            std::fill(expected[0].begin(),expected[0].end(),0x3c);
+            check(matches(),"verified original-XG layout uses GPU conversion with identical canonical texels and guards");
+            final_fence=converted_fence;final_value=1;
+        }
         layout.context.reset(); // The registry now owns the last original-computer reference in the XG case.
-        check(release_title_gpu_resource(texture, fence.Get(), signal + 1) == S_OK, "texture ownership retires after conversion and its fence");
+        check(release_title_gpu_resource(texture, final_fence.Get(), final_value) == S_OK, "texture ownership retires after conversion and its fence");
         release(storage, attributes);
         return true;
     };
@@ -835,12 +922,26 @@ int main(int argc, char** argv) {
             const UINT16 edges[]{0,0x8000,1,0x3ff,0x400,0x3c00,0x7bff,0x7c00,0xfc00,0x7e00,0x7fff,0xfe01,0x3555,0xb555,0x401,0x83ff};
             std::memcpy(expected.data(),edges,sizeof edges);
         }
-        if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, row, slice))) return false;
+        if (FAILED(layout.copy(layout.context.get(), true, expected.data(), canonical, 0, row, slice,nullptr))) return false;
         TitleGpuResource texture;
         HRESULT hr = acquire_title_gpu_texture(canonical, layout, device.Get(), texture);
         check(SUCCEEDED(hr), "four-sample resource acquires a real native MSAA texture");
         if (FAILED(hr)) return false;
         check(texture.resource->GetDesc().SampleDesc.Count == 4, "MSAA storage retains all four hardware samples");
+        if(depth_target) {
+            TitleGpuResource alias;
+            check(!texture.clear.known && SUCCEEDED(acquire_title_gpu_texture(canonical,layout,device.Get(),alias)),
+                "new logical depth resources have explicit unknown clear state even when physical storage is shared");
+            if(!alias.resource) return false;
+            check(set_title_gpu_clear(texture,1,0x3e800000,0)==S_OK && !alias.clear.known &&
+                set_title_gpu_clear(alias,3,0x3f400000,0xa7)==S_OK && texture.clear.depth==0x3e800000 && texture.clear.known==1,
+                "physical aliases retain independent full-precision depth/stencil clear registers");
+            check(set_title_gpu_clear(texture,2,0,0x27)==S_OK && texture.clear.depth==0x3e800000 && texture.clear.stencil==0x27 &&
+                set_title_gpu_clear(texture,1,0x7fc00001,0)==E_INVALIDARG && texture.clear.depth==0x3e800000,
+                "partial clear state preserves the other aspect and rejects NaN without changing known state");
+            if(FAILED(release_title_gpu_resource(alias,fence.Get(),fence->GetCompletedValue()))) return false;
+            check(!alias.clear.known,"released logical depth resource discards its clear register ownership");
+        }
         ComPtr<ID3D12DescriptorHeap> targets;
         const D3D12_DESCRIPTOR_HEAP_DESC heap{depth_target ? D3D12_DESCRIPTOR_HEAP_TYPE_DSV : D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
         if (FAILED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&targets)))) return false;
@@ -851,19 +952,44 @@ int main(int argc, char** argv) {
             depth_view.Format=depth_stencil ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT : DXGI_FORMAT_D32_FLOAT; depth_view.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2DMS;
             device->CreateDepthStencilView(texture.resource,&depth_view,targets->GetCPUDescriptorHandleForHeapStart());
         } else device->CreateRenderTargetView(texture.resource, &view, targets->GetCPUDescriptorHandleForHeapStart());
-        for (UINT iteration = 0; iteration < 3; ++iteration) {
+        const UINT iterations=original_xg && depth_target && !depth_stencil && layout.guest_descriptor[0] ? 4 : 3;
+        for (UINT iteration = 0; iteration < iterations; ++iteration) {
             if (iteration == 2) {
                 void* cpu = nullptr;
                 if (FAILED(map_title_gpu_resource(texture, &cpu))) return false;
+                if(depth_target) check(set_title_gpu_clear(texture,1,0,0)==HRESULT_FROM_WIN32(ERROR_BUSY),
+                    "CPU ownership excludes concurrent clear-register publication");
                 for (UINT i = 0; i < expected.size(); ++i) if (!depth_target || i>=4*words || (depth_stencil && i%2))
                     expected[i] ^= ((i/words) % 4 + 1) << 1; // Distinct finite mantissas in each sample.
-                hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, row, slice);
+                hr = layout.copy(layout.context.get(), true, expected.data(), cpu, 0, row, slice,nullptr);
                 if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
             }
+            if(iteration==3) {
+                void* cpu=nullptr;
+                if(FAILED(map_title_gpu_resource(texture,&cpu))) return false;
+                std::fill(expected.begin(),expected.end(),0x3f000000u);
+                hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice,nullptr);
+                const UINT64 depth_base=UINT64(layout.guest_descriptor[0])<<8;
+                if(FAILED(hr) || !depth_base || depth_base>=layout.bytes) {unmap_title_gpu_resource(texture);return false;}
+                std::memset(cpu,0,SIZE_T(depth_base)); // Native XG depth SRD bounds the preceding HTILE plane.
+                if(FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr) || FAILED(set_title_gpu_clear(texture,1,0,0))) return false;
+                std::fill(expected.begin(),expected.end(),0);
+            }
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) return false;
+            if(iteration==3) {
+                TitleGpuResource incompatible;
+                if(FAILED(acquire_title_gpu_texture(canonical,layout,device.Get(),incompatible)) ||
+                    FAILED(set_title_gpu_clear(incompatible,1,0x3f800000,0))) return false;
+                check(begin_title_gpu_texture(incompatible,list.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE)==DXGI_ERROR_UNSUPPORTED,
+                    "shared physical storage cannot reuse a different logical resource's fast-clear register");
+                if(FAILED(release_title_gpu_resource(incompatible,fence.Get(),fence->GetCompletedValue())) || FAILED(list->Close()) ||
+                    FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr))) return false;
+            }
             hr = begin_title_gpu_texture(texture, list.Get(), depth_target ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET);
             if (FAILED(hr)) std::cerr << "MSAA upload format=" << layout.resource_desc.Format << " hr=0x" << std::hex << hr << std::dec << '\n';
             check(SUCCEEDED(hr), "sample upload uses per-sample GPU shading without resolve");
+            if(depth_target && SUCCEEDED(hr)) check(set_title_gpu_clear(texture,1,0,0)==E_PENDING,
+                "in-flight GPU ownership excludes premature clear-register changes");
             if (FAILED(hr)) return false;
             if (iteration == 1) {
                 const float color[]{.5f, 1, 2, 1};
@@ -886,7 +1012,7 @@ int main(int argc, char** argv) {
             if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(signal + iteration, ready);
             const bool completed = SUCCEEDED(hr) && WaitForSingleObject(ready, 3000) == WAIT_OBJECT_0;
             CloseHandle(ready); if (!completed || FAILED(complete_title_gpu_resource(texture, fence.Get(), signal + iteration))) return false;
-            hr = layout.copy(layout.context.get(), false, actual.data(), canonical, 0, row, slice);
+            hr = layout.copy(layout.context.get(), false, actual.data(), canonical, 0, row, slice,nullptr);
             check(SUCCEEDED(hr) && actual == expected, iteration == 1 ? "independent native MSAA clear updates every canonical sample" :
                 "all four distinct MSAA samples survive GPU upload/readback and CPU reuse");
             for (UINT i = 0; i < 16; ++i)
@@ -898,7 +1024,7 @@ int main(int argc, char** argv) {
             if (FAILED(map_title_gpu_resource(texture,&cpu))) return false;
             const auto valid=expected;
             expected[0]=0x7fc00001u;
-            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice);
+            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice,nullptr);
             if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr))) return false;
             check(begin_title_gpu_texture(texture,list.Get(),D3D12_RESOURCE_STATE_DEPTH_WRITE)==DXGI_ERROR_UNSUPPORTED,
@@ -907,11 +1033,11 @@ int main(int argc, char** argv) {
             check(map_title_gpu_resource(texture,&cpu)==S_OK && cpu==canonical,"failed MSAA depth upload releases CPU and physical alias gates");
             expected=valid;
             if (!cpu) return false;
-            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice);
+            hr=layout.copy(layout.context.get(),true,expected.data(),cpu,0,row,slice,nullptr);
             if (FAILED(unmap_title_gpu_resource(texture)) || FAILED(hr)) return false;
             check(!std::memcmp(canonical,before.data(),before.size()),"failed MSAA upload can restore every canonical plane without stale GPU data");
         }
-        if (FAILED(release_title_gpu_resource(texture, fence.Get(), signal + 2))) return false;
+        if (FAILED(release_title_gpu_resource(texture, fence.Get(), signal + iterations-1))) return false;
         if (storage) release(storage, attributes);
         return true;
     };
@@ -1011,7 +1137,7 @@ TextureCube<float4> image:register(t0);SamplerState point_sampler:register(s0);R
             for (UINT face=0;face<6;++face) for (UINT mip=0;mip<2;++mip) {
                 const UINT size=8>>mip;std::vector<UINT32> pixels(size*size);
                 for (UINT y=0;y<size;++y) for (UINT x=0;x<size;++x) pixels[y*size+x]=(face*31+iteration*5+mip)|(x*29<<8)|(y*27<<16)|0xff000000u;
-                if (FAILED(cube_layout.copy(cube_layout.context.get(),true,pixels.data(),canonical,face*2+mip,size*4,size*size*4))) return 1;
+                if (FAILED(cube_layout.copy(cube_layout.context.get(),true,pixels.data(),canonical,face*2+mip,size*4,size*size*4,nullptr))) return 1;
             }
             std::fill(output,output+64,0x5a5a5a5a);
             if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),pipeline.Get())) ||

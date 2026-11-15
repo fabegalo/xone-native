@@ -30,6 +30,10 @@ std::wstring title_storage_root();
 void reset_title_users();
 HRESULT title_local_user_identity(GUID* identity, std::uint32_t* local_id);
 HRESULT title_local_user(void** user); // Retained snapshot of the selected session profile.
+// Windows.Xbox.UI.SystemUI (statics; observed slots only).
+HRESULT xbox_system_ui_factory(REFIID iid, void** factory);
+HRESULT connected_storage_factory(REFIID iid, void** factory);
+bool title_writable_path(const std::wstring& path);
 HRESULT xbox_controller_factory(REFIID iid, void** factory);
 HRESULT xbox_gamepad_factory(REFIID iid, void** factory);
 struct RawGamepadReading {

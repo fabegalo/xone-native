@@ -6,8 +6,126 @@
 #include <climits>
 #include <utility>
 #include <cstdio>
+#include <atomic>
+#include <algorithm>
 
 namespace xboxone::era {
+namespace {
+std::atomic<SIZE_T> layout_bytes{0};
+constexpr SIZE_T layout_budget=128u<<20;
+void layout_transition(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
+    D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};list->ResourceBarrier(1,&barrier);
+}
+}
+TextureLayoutTransfer::~TextureLayoutTransfer() {
+    offsets_.Reset();upload_.Reset();linear_.Reset();tiled_.Reset();readback_.Reset();
+    if(retained_bytes_)layout_bytes.fetch_sub(retained_bytes_);
+}
+HRESULT TextureLayoutTransfer::initialize(ID3D12Device* device,std::span<const UINT32> offsets,UINT width,UINT height,
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,SIZE_T tiled_bytes) try {
+    if(!device || retained_bytes_)return E_INVALIDARG;
+    const UINT64 count=UINT64(width)*height,linear_bytes=UINT64(footprint.Footprint.RowPitch)*height;
+    if(!width || !height || offsets.size()!=count || !tiled_bytes || footprint.Offset ||
+        footprint.Footprint.Width!=width || footprint.Footprint.Height!=height || footprint.Footprint.Depth!=1 ||
+        footprint.Footprint.RowPitch<UINT64(width)*4 || footprint.Footprint.RowPitch%4)return E_INVALIDARG;
+    if(count>65535u*64 || tiled_bytes>(16u<<20) || linear_bytes>(16u<<20))return S_FALSE;
+    const SIZE_T padded=(tiled_bytes+3)&~SIZE_T(3);
+    auto sorted=std::vector<UINT32>(offsets.begin(),offsets.end());std::sort(sorted.begin(),sorted.end());
+    for(SIZE_T i=0;i<sorted.size();++i)
+        if(sorted[i]%4 || sorted[i]>tiled_bytes || tiled_bytes-sorted[i]<4 || (i && sorted[i]==sorted[i-1]))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    SIZE_T end=0;for(auto offset:sorted){if(offset>end)padding_.push_back({end,offset-end});end=SIZE_T(offset)+4;}
+    if(end<tiled_bytes)padding_.push_back({end,tiled_bytes-end});
+    const SIZE_T required=padded*3+SIZE_T(linear_bytes)+offsets.size_bytes()+padding_.capacity()*sizeof(padding_[0]);
+    auto used=layout_bytes.load();
+    do {if(required>layout_budget-used)return S_FALSE;}while(!layout_bytes.compare_exchange_weak(used,used+required));
+    retained_bytes_=required;tiled_bytes_=tiled_bytes;width_=width;height_=height;footprint_=footprint;
+    const auto create=[&](SIZE_T bytes,D3D12_HEAP_TYPE type,D3D12_RESOURCE_FLAGS flags,D3D12_RESOURCE_STATES state,auto& out) {
+        D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=bytes;
+        desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;desc.Flags=flags;
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=type;
+        return device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,state,nullptr,IID_PPV_ARGS(&out));
+    };
+    HRESULT hr=create(offsets.size_bytes(),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,offsets_);
+    if(SUCCEEDED(hr))hr=create(padded,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,upload_);
+    if(SUCCEEDED(hr))hr=create(padded,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,tiled_);
+    if(SUCCEEDED(hr))hr=create(SIZE_T(linear_bytes),D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,linear_);
+    if(SUCCEEDED(hr))hr=create(padded,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,readback_);
+    if(FAILED(hr))return hr;
+    void* mapped=nullptr;const D3D12_RANGE no_read{0,0};hr=offsets_->Map(0,&no_read,&mapped);
+    if(FAILED(hr))return hr;std::memcpy(mapped,offsets.data(),offsets.size_bytes());offsets_->Unmap(0,nullptr);
+    static constexpr char source[]=R"(
+ByteAddressBuffer offsets:register(t0);ByteAddressBuffer input:register(t1);RWByteAddressBuffer output:register(u0);
+cbuffer Layout:register(b0){uint width;uint pitch;uint count;uint into_tiled;};
+[numthreads(64,1,1)] void main(uint3 id:SV_DispatchThreadID){
+ if(id.x>=count)return;
+ uint linear_address=(id.x/width)*pitch+(id.x%width)*4;uint tiled_address=offsets.Load(id.x*4);
+ output.Store(into_tiled?tiled_address:linear_address,input.Load(into_tiled?linear_address:tiled_address));
+})";
+    struct Compiler{HMODULE value=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);~Compiler(){if(value)FreeLibrary(value);}}compiler;
+    if(!compiler.value)return HRESULT_FROM_WIN32(GetLastError());
+    const auto compile=reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler.value,"D3DCompile"));
+    if(!compile)return E_NOINTERFACE;
+    Microsoft::WRL::ComPtr<ID3DBlob> code,errors,serialized;
+    hr=compile(source,sizeof(source)-1,nullptr,nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+    if(FAILED(hr) && errors)std::fprintf(stderr,"xone-era: layout shader: %.2048s\n",static_cast<const char*>(errors->GetBufferPointer()));
+    if(FAILED(hr))return hr;
+    D3D12_ROOT_PARAMETER parameters[4]{};
+    for(UINT i=0;i<2;++i){parameters[i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;parameters[i].Descriptor.ShaderRegister=i;}
+    parameters[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;parameters[2].Descriptor.ShaderRegister=0;
+    parameters[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[3].Constants={0,0,4};
+    const D3D12_ROOT_SIGNATURE_DESC root{4,parameters,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    hr=D3D12SerializeRootSignature(&root,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,nullptr);
+    if(SUCCEEDED(hr))hr=device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root_));
+    if(SUCCEEDED(hr)){D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};desc.pRootSignature=root_.Get();desc.CS={code->GetBufferPointer(),code->GetBufferSize()};hr=device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pipeline_));}
+    return hr;
+}catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+HRESULT TextureLayoutTransfer::prepare(const void* canonical,bool full_overwrite) {
+    if(!canonical || !pipeline_)return E_INVALIDARG;
+    void* mapped=nullptr;const D3D12_RANGE no_read{0,0};const auto hr=upload_->Map(0,&no_read,&mapped);
+    if(FAILED(hr))return hr;
+    if(full_overwrite) {
+        for(const auto& [offset,bytes]:padding_)std::memcpy(static_cast<unsigned char*>(mapped)+offset,static_cast<const unsigned char*>(canonical)+offset,bytes);
+    } else std::memcpy(mapped,canonical,tiled_bytes_);
+    if(tiled_bytes_%4)std::memset(static_cast<unsigned char*>(mapped)+tiled_bytes_,0,4-tiled_bytes_%4);
+    upload_->Unmap(0,nullptr);return S_OK;
+}
+void TextureLayoutTransfer::dispatch(ID3D12GraphicsCommandList* list,bool into) const {
+    list->SetPipelineState(pipeline_.Get());list->SetComputeRootSignature(root_.Get());
+    list->SetComputeRootShaderResourceView(0,offsets_->GetGPUVirtualAddress());
+    list->SetComputeRootShaderResourceView(1,(into?linear_:tiled_)->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2,(into?tiled_:linear_)->GetGPUVirtualAddress());
+    const UINT constants[]{width_,footprint_.Footprint.RowPitch,width_*height_,UINT(into)};
+    list->SetComputeRoot32BitConstants(3,4,constants,0);list->Dispatch((width_*height_+63)/64,1,1);
+}
+void TextureLayoutTransfer::detile(ID3D12GraphicsCommandList* list,ID3D12Resource* texture) const {
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(tiled_.Get(),0,upload_.Get(),0,(tiled_bytes_+3)&~SIZE_T(3));
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch(list,false);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=linear_.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=footprint_;
+    to.pResource=texture;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+}
+void TextureLayoutTransfer::retile(ID3D12GraphicsCommandList* list,ID3D12Resource* texture) const {
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=texture;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.pResource=linear_.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint_;
+    list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(tiled_.Get(),0,upload_.Get(),0,(tiled_bytes_+3)&~SIZE_T(3));
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    dispatch(list,true);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback_.Get(),0,tiled_.Get(),0,(tiled_bytes_+3)&~SIZE_T(3));
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+}
 static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format, UINT samples,
         const char* source, const D3D_SHADER_MACRO* macros,
         Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline,

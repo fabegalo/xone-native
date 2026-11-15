@@ -257,7 +257,7 @@ int main(int argc, char** argv) {
                     TitleTextureLayout layout;
                     hr=create_xg_texture_layout(33,17,1,1,format,UINT_MAX,layout,D3D11_BIND_SHADER_RESOURCE);
                     std::vector<unsigned char> linear(33*17*pixel);
-                    if(SUCCEEDED(hr)) hr=canonical ? layout.copy(layout.context.get(),false,linear.data(),canonical,0,33*pixel,33*17*pixel) : E_POINTER;
+                    if(SUCCEEDED(hr)) hr=canonical ? layout.copy(layout.context.get(),false,linear.data(),canonical,0,33*pixel,33*17*pixel,nullptr) : E_POINTER;
                     bool equal=SUCCEEDED(hr);
                     for(UINT y=0;y<17 && equal;++y) for(UINT x=0;x<33*pixel;++x)
                         equal=equal && linear[y*33*pixel+x]==static_cast<unsigned char>(pass*29+y*13+x*7);
@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
                             const FLOAT rgba[]{(17.f+pass*17)/255,34.f/255,51.f/255,68.f/255};
                             reinterpret_cast<Clear>(embedded[51])(context,rtv,rgba);
                             std::array<unsigned char,32*16*4> pixels{};
-                            HRESULT copied=SUCCEEDED(hr) ? layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048) : hr;
+                            HRESULT copied=SUCCEEDED(hr) ? layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048,nullptr) : hr;
                             bool equal=SUCCEEDED(copied);
                             for(UINT i=0;i<pixels.size();i+=4) equal=equal && pixels[i]==51 && pixels[i+1]==34 && pixels[i+2]==17+pass*17 && pixels[i+3]==68;
                             check(equal,"title clear executes on D3D12 and publishes every BGRA pixel after its fence, including reuse");
@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
                                 using Draw=void(STDMETHODCALLTYPE*)(void*,UINT64,INT);
                                 reinterpret_cast<Draw>(embedded[14])(context,6ull<<32,0);
                                 std::array<unsigned char,32*16*4> pixels{};
-                                const HRESULT copied=layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048);
+                                const HRESULT copied=layout.copy(layout.context.get(),false,pixels.data(),canonical,0,128,2048,nullptr);
                                 bool equal=SUCCEEDED(copied);
                                 // D3D FLOAT->UNORM allows 0.6 ULP on the integer side.
                                 for(UINT i=0;i<pixels.size();i+=4) equal=equal && std::abs(FLOAT(pixels[i])-255*constants[1][2])<=.6f &&
@@ -477,8 +477,8 @@ int main(int argc, char** argv) {
             if (FAILED(hr)) return 1;
             std::vector<unsigned char> tiled(layout.bytes + 32, 0x5a), input(32 * 16 * 4 * 4), output(input.size(), 0);
             for (UINT i = 0; i < input.size(); ++i) input[i] = static_cast<unsigned char>(i * 13 + i / 4 + 7);
-            hr = layout.copy(layout.context.get(), true, input.data(), tiled.data() + 16, 0, 512, 8192);
-            if (SUCCEEDED(hr)) hr = layout.copy(layout.context.get(), false, output.data(), tiled.data() + 16, 0, 512, 8192);
+            hr = layout.copy(layout.context.get(), true, input.data(), tiled.data() + 16, 0, 512, 8192,nullptr);
+            if (SUCCEEDED(hr)) hr = layout.copy(layout.context.get(), false, output.data(), tiled.data() + 16, 0, 512, 8192,nullptr);
             std::cout << "original XG MSAA4 copy hr=0x" << std::hex << hr << std::dec << " equal=" << (input == output) << '\n';
             check(SUCCEEDED(hr) && input == output, "MSAA CPU layout preserves four independent samples without resolve");
             check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
@@ -495,17 +495,17 @@ int main(int argc, char** argv) {
                     std::memcpy(samples.data()+at,&depth_bits,4);
                     samples[at+4]=static_cast<unsigned char>(at/8*17+3);
                 }
-                hr=layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1024,16384);
-                if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384);
+                hr=layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1024,16384,nullptr);
+                if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384,nullptr);
                 check(SUCCEEDED(hr) && samples==restored,"depth/stencil CPU roundtrip preserves every sample's depth bits and stencil byte");
                 check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
                     std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"depth/stencil tiling preserves allocation guards");
                 physical[16]^=1;
                 const auto before=restored;
-                check(layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384)==DXGI_ERROR_UNSUPPORTED && restored==before,
+                check(layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384,nullptr)==DXGI_ERROR_UNSUPPORTED && restored==before,
                     "unknown HTILE encoding refuses readback without modifying the linear destination");
                 const auto tiled_before=physical;
-                check(layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1,16384)==E_INVALIDARG && physical==tiled_before,
+                check(layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1,16384,nullptr)==E_INVALIDARG && physical==tiled_before,
                     "invalid depth/stencil pitch preserves every physical plane");
             }
             hr = create_xg_texture_layout(1920, 1080, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
                     std::vector<unsigned char> expected(slice),actual(expected.size());
                     for (UINT i=0;i<expected.size();++i) expected[i]=static_cast<unsigned char>(i*13+i/7);
                     std::vector<unsigned char> physical(layout.bytes+32,0x5a);
-                    hr=layout.copy(layout.context.get(),true,expected.data(),physical.data()+16,0,row,slice);
+                    hr=layout.copy(layout.context.get(),true,expected.data(),physical.data()+16,0,row,slice,nullptr);
                     using Address=UINT64(*)(void*,UINT,UINT,UINT64,UINT,UINT,UINT);
                     const auto address=reinterpret_cast<Address>(table[4]);
                     bool exact=SUCCEEDED(hr);
@@ -632,11 +632,41 @@ int main(int argc, char** argv) {
                         if (std::memcmp(physical.data()+16+at,expected.data()+(y*32+x)*element,element)) exact=false;
                     }
                     check(exact,"scalar depth adapter matches the independent original depth computer at every pixel address");
-                    if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice);
+                    if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,nullptr);
                     check(SUCCEEDED(hr) && actual==expected,"single-sample scalar depth preserves every physical bit through expanded HTILE");
                     physical[16]^=1; const auto before=actual;
-                    check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice)==DXGI_ERROR_UNSUPPORTED && actual==before,
+                    check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,nullptr)==DXGI_ERROR_UNSUPPORTED && actual==before,
                         "single-sample depth refuses unknown HTILE without publishing partial pixels");
+                    if(format==DXGI_FORMAT_R32_TYPELESS) {
+                        UINT64 metadata_bytes=0,metadata_offset=0;
+                        std::memcpy(&metadata_bytes,raw.data()+32,8);std::memcpy(&metadata_offset,raw.data()+40,8);
+                        auto* metadata=physical.data()+16+metadata_offset;
+                        std::memset(metadata,0,SIZE_T(metadata_bytes));
+                        const auto compressed=physical;
+                        TitleGpuClearState clear{0,0,1};
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear)==S_OK &&
+                            std::all_of(actual.begin(),actual.end(),[](auto byte){return byte==0;}) && physical==compressed,
+                            "uniform fast-clear zero uses explicit full clear state, ignores stale base pixels and preserves canonical bytes");
+                        const auto zero=actual;
+                        clear.known=0;
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear)==DXGI_ERROR_UNSUPPORTED && actual==zero,
+                            "HTILE zero without known clear state cannot fabricate zero depth");
+                        clear.known=1;clear.depth=0x358637bdu;
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear)==DXGI_ERROR_UNSUPPORTED && actual==zero,
+                            "quantized zero bounds cannot replace an unsupported nonzero full-precision clear value");
+                        clear.depth=0x3f800000;
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear)==DXGI_ERROR_UNSUPPORTED && actual==zero,
+                            "mismatched clear register and HTILE encoding reject without partial output");
+                        const UINT32 one_tag=0xfffffff0;
+                        for(SIZE_T at=0;at<metadata_bytes;at+=4) std::memcpy(metadata+at,&one_tag,4);
+                        hr=layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear);
+                        bool one=SUCCEEDED(hr);
+                        for(SIZE_T at=0;at<actual.size();at+=4) {UINT32 bits=0;std::memcpy(&bits,actual.data()+at,4);one=one && bits==0x3f800000;}
+                        check(one,"uniform fast-clear one restores the exact full-precision clear bits at every original sample address");
+                        const auto saved=actual;metadata[metadata_bytes-4]^=1;
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,&clear)==DXGI_ERROR_UNSUPPORTED && actual==saved,
+                            "mixed or one-bit-near fast-clear metadata is never accepted as a whole-surface clear");
+                    }
                     check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
                         std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"scalar depth conversion preserves canonical guards");
                 }
@@ -653,19 +683,19 @@ int main(int argc, char** argv) {
             const UINT blocks = ((std::max)(1u, 64u >> mip) + 3) / 4;
             linear[mip].resize(blocks * blocks * 16);
             for (UINT i = 0; i < linear[mip].size(); ++i) linear[mip][i] = static_cast<std::uint8_t>(mip * 31 + i * 13 + 7);
-            hr = layout.copy(layout.context.get(), true, linear[mip].data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16);
+            hr = layout.copy(layout.context.get(), true, linear[mip].data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16,nullptr);
             check(SUCCEEDED(hr), "original XG tiles an owned BC7 mip");
         }
         for (UINT mip = 0; mip < 7; ++mip) {
             const UINT blocks = ((std::max)(1u, 64u >> mip) + 3) / 4;
             std::vector<std::uint8_t> actual(linear[mip].size(), 0);
-            hr = layout.copy(layout.context.get(), false, actual.data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16);
+            hr = layout.copy(layout.context.get(), false, actual.data(), tiled.data() + 16, mip, blocks * 16, blocks * blocks * 16,nullptr);
             check(SUCCEEDED(hr) && actual == linear[mip], "original XG roundtrip preserves each owned mip's compressed blocks");
         }
         check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
             std::all_of(tiled.end() - 16, tiled.end(), [](auto x) { return x == 0x5a; }), "original XG copies preserve canonical range guards");
-        check(layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 7, 256, 4096) == E_INVALIDARG &&
-            layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 0, 1, 4096) == E_INVALIDARG,
+        check(layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 7, 256, 4096,nullptr) == E_INVALIDARG &&
+            layout.copy(layout.context.get(), false, linear[0].data(), tiled.data() + 16, 0, 1, 4096,nullptr) == E_INVALIDARG,
             "layout adapter rejects invalid subresources and undersized linear pitches");
         std::cout << "original XG CPU roundtrip " << (failures ? "FAILED" : "passed") << '\n';
         if (graphics && !failures) {
@@ -839,7 +869,7 @@ int main(int argc, char** argv) {
                       "MSAA clear uses the verified three-plane XG layout");
                 std::vector<BYTE> linear(16384);
                 const auto verify=[&](UINT bits,BYTE stencil) {
-                    bool exact=planes.copy && planes.copy(planes.context.get(),false,linear.data(),clear_base,0,1024,16384)==S_OK;
+                    bool exact=planes.copy && planes.copy(planes.context.get(),false,linear.data(),clear_base,0,1024,16384,nullptr)==S_OK;
                     for(SIZE_T at=0;exact && at<linear.size();at+=8) {UINT actual=0;std::memcpy(&actual,linear.data()+at,4);exact=actual==bits && linear[at+4]==stencil;}
                     check(exact,"native depth/stencil clear preserves exact depth bits and stencil in all four samples");
                 };
@@ -864,7 +894,7 @@ int main(int argc, char** argv) {
                 if(list) {
                     reinterpret_cast<Execute>(vt(context)[58])(context,list,FALSE);verify(0x3f400000,0xa7);
                     for(SIZE_T at=0;at<linear.size();at+=8) {const UINT bits=0x3e000000;std::memcpy(linear.data()+at,&bits,4);linear[at+4]=0x11;}
-                    check(planes.copy(planes.context.get(),true,linear.data(),clear_base,0,1024,16384)==S_OK,"MSAA clear reuse accepts fresh canonical data between fences");
+                    check(planes.copy(planes.context.get(),true,linear.data(),clear_base,0,1024,16384,nullptr)==S_OK,"MSAA clear reuse accepts fresh canonical data between fences");
                     reinterpret_cast<Execute>(vt(context)[58])(context,list,TRUE);verify(0x3f400000,0xa7);
                     reinterpret_cast<Count>(vt(list)[2])(list);
                 }
@@ -1156,6 +1186,52 @@ int main(int argc, char** argv) {
                         check(descriptor[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) &&
                             ((descriptor[1]>>26)&15)==(integer ? 4u : format==DXGI_FORMAT_R16G16_FLOAT ? 7u : 0u),"typed SRV/UAV SRDs keep physical identity and native numeric interpretation");
                     }
+                    if(kind==2 && (storage_format==DXGI_FORMAT_R8_TYPELESS || storage_format==DXGI_FORMAT_R10G10B10A2_TYPELESS) && format!=DXGI_FORMAT_R32_UINT) {
+                        using ClearUav=void(STDMETHODCALLTYPE*)(void*,void*,const void*);
+                        using DeferredUav=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
+                        using FinishUav=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                        using ExecuteUav=void(STDMETHODCALLTYPE*)(void*,void*,BOOL);
+                        const bool integer=format==formats[1];
+                        const UINT slot=integer ? 51 : 52;
+                        auto clear=reinterpret_cast<ClearUav>(vt(context)[slot]);
+                        UINT words[4]{0x12345037,0x12,0x34,0x56};FLOAT floats[4]{.5f,.25f,1,0};
+                        clear(context,view,integer ? static_cast<const void*>(words) : floats);
+                        void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
+                        const UINT element=storage_format==DXGI_FORMAT_R8_TYPELESS ? 1 : 4;
+                        TitleTextureLayout pixels;std::vector<unsigned char> pixel_result(512*element);
+                        const auto exact_pixels=[&](UINT expected) {
+                            if(pixels.copy(pixels.context.get(),false,pixel_result.data(),canonical,0,32*element,512*element,nullptr)!=S_OK) return false;
+                            for(SIZE_T at=0;at<pixel_result.size();at+=element) {
+                                UINT actual=0;std::memcpy(&actual,pixel_result.data()+at,element);
+                                if(actual!=expected) {std::fprintf(stderr,"UAV pixel format=%u expected=%08X actual=%08X at=%zu\n",format,expected,actual,at);return false;}
+                            }
+                            return true;
+                        };
+                        check(create_xg_texture_layout(32,16,1,1,storage_format,UINT_MAX,pixels,color.standard.BindFlags)==S_OK &&
+                            exact_pixels(element==1 ? (integer ? 0x37u : 128u) : (integer ? 0x83404837u : 0x3ff40200u)),
+                            "UAV clear executes original integer/float values through a real shader-visible descriptor and fence");
+                        const std::vector<unsigned char> before(static_cast<unsigned char*>(canonical),static_cast<unsigned char*>(canonical)+pixels.bytes);
+                        void* producer=nullptr;void* retained=nullptr;void* list=nullptr;
+                        check(reinterpret_cast<DeferredUav>(vt(device)[27])(device,0,&producer)==S_OK && producer &&
+                            factory(device,texture,input,&retained)==S_OK && retained,"UAV clear creates a deferred producer and owned view");
+                        if(producer && retained) {
+                            UINT value[4]{integer ? 0x61u : 0x3f400000u,0,0,0};
+                            auto record=reinterpret_cast<ClearUav>(vt(producer)[slot]);
+                            record(producer,nullptr,reinterpret_cast<const void*>(1)); // Original null view is a no-op.
+                            record(producer,retained,value);std::memset(value,0,sizeof value);
+                            check(reinterpret_cast<FinishUav>(vt(producer)[114])(producer,TRUE,&list)==S_OK && list &&
+                                !std::memcmp(before.data(),canonical,before.size()),"UAV recording and Finish preserve canonical bytes and capture the source words");
+                        }
+                        if(retained) reinterpret_cast<Count>(vt(retained)[2])(retained);
+                        if(producer) reinterpret_cast<Count>(vt(producer)[2])(producer);
+                        for(UINT pass=0;pass<2 && list;++pass) {
+                            clear(context,view,nullptr);
+                            reinterpret_cast<ExecuteUav>(vt(context)[58])(context,list,pass!=0);
+                            check(exact_pixels(integer ? 0x61u : element==1 ? 191u : 767u),
+                                "UAV list retains its view and source values after producer release and restores exact pixels on reuse");
+                        }
+                        if(list) reinterpret_cast<Count>(vt(list)[2])(list);
+                    }
                     if (kind==1 && format==formats[0]) {
                         using SetTargets=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
                         const auto bind_targets=reinterpret_cast<SetTargets>(vt(context)[33]);
@@ -1194,7 +1270,7 @@ int main(int argc, char** argv) {
                             const UINT element=storage_format==DXGI_FORMAT_R8_TYPELESS ? 1 : 4;
                             hr=create_xg_texture_layout(32,16,1,1,storage_format,UINT_MAX,pixels,color.standard.BindFlags);
                             std::vector<unsigned char> linear(32*16*element);
-                            check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32*element,32*16*element)==S_OK,
+                            check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32*element,32*16*element,nullptr)==S_OK,
                                   "legacy clear publishes real GPU pixels through the original XG layout");
                             bool exact=true;
                             for (SIZE_T at=0;at<linear.size();++at) exact=exact && linear[at]==(storage_format==DXGI_FORMAT_R16G16_FLOAT ? (at%2 ? 0x3c : 0) : 0xff);
@@ -1208,7 +1284,7 @@ int main(int argc, char** argv) {
                                 std::vector<unsigned char> upload(40*16,0xee);
                                 for(UINT y=0;y<16;++y) std::fill_n(upload.data()+40*y,32,0x51);
                                 update(context,texture,0,nullptr,upload.data(),40,640);
-                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                     std::all_of(linear.begin(),linear.end(),[](auto value){return value==0x51;}),
                                     "immediate UpdateSubresource preserves padded source rows through the original tiled layout");
                                 void* updater=nullptr;void* update_list=nullptr;
@@ -1223,20 +1299,20 @@ int main(int argc, char** argv) {
                                     check(reinterpret_cast<FinishUpdate>(vt(updater)[114])(updater,FALSE,&update_list)==S_OK && update_list,
                                           "deferred UpdateSubresource owns a snapshot of the source data");
                                     std::fill(upload.begin(),upload.end(),0);
-                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                         std::all_of(linear.begin(),linear.end(),[](auto value){return value==0x51;}),
                                         "recording and FinishCommandList do not update destination pixels");
                                     reinterpret_cast<Count>(vt(updater)[2])(updater);
                                     for(UINT pass=0;pass<2 && update_list;++pass) {
                                         reinterpret_cast<ExecuteUpdate>(vt(context)[58])(context,update_list,FALSE);
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[153])(context);
-                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto value){return value==0xb3;}),
                                             "clear then update executes in order and reuses the owned upload after producer release");
                                     }
                                     if(update_list) reinterpret_cast<Count>(vt(update_list)[2])(update_list);
                                 }
-                                struct UpdateBufferDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} update_desc{{16,D3D11_USAGE_DEFAULT,D3D11_BIND_VERTEX_BUFFER,0,0,0},0};
+                                struct UpdateBufferDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} update_desc{{16,D3D11_USAGE_DEFAULT,D3D11_BIND_VERTEX_BUFFER|D3D11_BIND_UNORDERED_ACCESS,0,D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,4},0};
                                 std::array<unsigned char,16> original{};original.fill(0x11);
                                 const D3D11_SUBRESOURCE_DATA update_initial{original.data(),0,0};
                                 void* update_buffer=nullptr;updater=nullptr;update_list=nullptr;
@@ -1244,6 +1320,21 @@ int main(int argc, char** argv) {
                                 check(reinterpret_cast<CreateUpdateBuffer>(vt(device)[3])(device,&update_desc,&update_initial,&update_buffer)==S_OK && update_buffer,
                                       "partial update creates a real default buffer");
                                 if(update_buffer) {
+                                    void* buffer_uav=nullptr;void* clear_list=nullptr;void* clear_producer=nullptr;
+                                    D3D11_UNORDERED_ACCESS_VIEW_DESC raw{};raw.Format=DXGI_FORMAT_UNKNOWN;raw.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;
+                                    raw.Buffer.FirstElement=1;raw.Buffer.NumElements=2;raw.Buffer.Flags=0;
+                                    using MakeRaw=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                                    check(reinterpret_cast<MakeRaw>(vt(device)[8])(device,update_buffer,&raw,&buffer_uav)==S_OK && buffer_uav &&
+                                        reinterpret_cast<Deferred>(vt(device)[27])(device,0,&clear_producer)==S_OK && clear_producer,
+                                        "partial structured UAV clear creates its view and deferred producer");
+                                    if(buffer_uav && clear_producer) {
+                                        UINT values[4]{0x12345678,3,4,5};
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(clear_producer)[51])(clear_producer,buffer_uav,values);
+                                        check(reinterpret_cast<FinishUpdate>(vt(clear_producer)[114])(clear_producer,FALSE,&clear_list)==S_OK && clear_list,
+                                            "partial structured UAV clear captures an executable list");
+                                    }
+                                    if(clear_producer) reinterpret_cast<Count>(vt(clear_producer)[2])(clear_producer);
+                                    if(buffer_uav) reinterpret_cast<Count>(vt(buffer_uav)[2])(buffer_uav);
                                     unsigned char* buffer_bytes=nullptr;
                                     std::memcpy(&buffer_bytes,static_cast<char*>(update_buffer)+48,sizeof buffer_bytes);
                                     check(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&updater)==S_OK && updater,
@@ -1262,8 +1353,18 @@ int main(int argc, char** argv) {
                                         bool exact_buffer=true;
                                         for(UINT i=0;i<16;++i) exact_buffer=exact_buffer && buffer_bytes[i]==(i>=4 && i<12 ? 0xa7 : 0x11);
                                         check(exact_buffer,"partial buffer list retains the destination, source snapshot and untouched bytes across reuse");
+                                        if(clear_list) {
+                                            reinterpret_cast<ExecuteUpdate>(vt(context)[58])(context,clear_list,FALSE);
+                                            UINT a=0,b=0;std::memcpy(&a,buffer_bytes+4,4);std::memcpy(&b,buffer_bytes+8,4);
+                                            check(a==0x12345678 && b==a && buffer_bytes[0]==0x11 && buffer_bytes[3]==0x11 && buffer_bytes[12]==0x11 && buffer_bytes[15]==0x11,
+                                                "structured UAV clear touches only its original byte range and repeats the first word without modifying neighboring bytes");
+                                        }
                                     }
                                     if(update_list) reinterpret_cast<Count>(vt(update_list)[2])(update_list);
+                                    if(clear_list) {
+                                        reinterpret_cast<ExecuteUpdate>(vt(context)[58])(context,clear_list,TRUE);
+                                        reinterpret_cast<Count>(vt(clear_list)[2])(clear_list);
+                                    }
                                 }
                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
                                 void* deferred=nullptr;
@@ -1294,12 +1395,12 @@ int main(int argc, char** argv) {
                                           "deferred clear survives ClearState and finishes without executing");
                                     if(list) {
                                         reinterpret_cast<Execute>(vt(context)[58])(context,list,FALSE);
-                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto v){return v==0;}),
                                             "ExecuteCommandList publishes the recorded clear after its real fence");
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,white);
                                         reinterpret_cast<Execute>(vt(context)[58])(context,list,TRUE);
-                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto v){return v==0;}),
                                             "reused clear list sees current resource ownership and clears again");
                                         reinterpret_cast<Count>(vt(list)[2])(list);
@@ -1369,7 +1470,7 @@ int main(int argc, char** argv) {
                                     for(UINT pass=0;pass<2;++pass) {
                                         std::memcpy(static_cast<char*>(context)+0x188,&shaders[1+pass],sizeof(void*));
                                         draw(context,3,0);
-                                        const HRESULT copied=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512);
+                                        const HRESULT copied=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr);
                                         check(SUCCEEDED(copied) && std::all_of(linear.begin(),linear.end(),[&](auto value){return value==(pass ? 191 : 64);}),
                                               "procedural draw publishes all pixels after its fence and refreshes inline shader changes");
                                     }
@@ -1384,7 +1485,7 @@ int main(int argc, char** argv) {
                                     const FLOAT black[]{0,0,0,0};
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                     draw(context,3,1);
-                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                         std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                         "non-indexed draw preserves first vertex, stride, appended input elements and inline layout changes");
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
@@ -1394,7 +1495,7 @@ int main(int argc, char** argv) {
                                     const UINT64 strip = 0x00000dffc0009e00ull;
                                     std::memcpy(static_cast<char*>(context)+0x170,&strip,sizeof strip);
                                     draw(context,4,0);
-                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                         std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                         "four-vertex strip covers both triangles and null vertex input reads native zeroes after its fence");
                                     std::memcpy(static_cast<char*>(context)+0x180,&shaders[3],sizeof(void*));
@@ -1469,7 +1570,7 @@ int main(int argc, char** argv) {
                                             for(UINT pass=0;pass<2;++pass) {
                                                 reinterpret_cast<Clear>(vt(context)[50])(context,view,black);
                                                 reinterpret_cast<Execute>(vt(context)[58])(context,list,pass!=0);
-                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                     std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
                                                     "deferred clears and original shader draws replay in order after producer release, with fenced exact pixels");
                                             }
@@ -1485,7 +1586,7 @@ int main(int argc, char** argv) {
                                                 if(merged_list) {
                                                     reinterpret_cast<Clear>(vt(context)[50])(context,view,black);
                                                     reinterpret_cast<Execute>(vt(context)[58])(context,merged_list,FALSE);
-                                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                    check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                         std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
                                                         "merged list retains commands and resources after both producer and source list release");
                                                     reinterpret_cast<Count>(vt(merged_list)[2])(merged_list);
@@ -1548,7 +1649,7 @@ int main(int argc, char** argv) {
                                     if(dynamic) reinterpret_cast<Count>(vt(dynamic)[2])(dynamic);
                                     for(UINT pass : {0u,1u,0u}) if(versions[pass]) {
                                         reinterpret_cast<ExecuteDeferred>(vt(context)[58])(context,versions[pass],FALSE);
-                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[&](auto value){return value==(pass ? 0 : 191);}),
                                             "separate WRITE_DISCARD versions replay exact pixels after producer/resource release and remain reusable");
                                     }
@@ -1599,7 +1700,7 @@ int main(int argc, char** argv) {
                                             std::vector<UINT> samples(32*16*4);constexpr UINT red[]{0x300,0x340,0x380,0x3c0}; // R11 .125, .25, .5, 1.
                                             for(SIZE_T i=0;i<samples.size();++i) samples[i]=red[i%4];
                                             check(create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R11G11B10_FLOAT,UINT_MAX,sample_layout,sample_desc.standard.BindFlags,4)==S_OK &&
-                                                sample_layout.copy(sample_layout.context.get(),true,samples.data(),sample_bytes,0,32*4*4,32*16*4*4)==S_OK,
+                                                sample_layout.copy(sample_layout.context.get(),true,samples.data(),sample_bytes,0,32*4*4,32*16*4*4,nullptr)==S_OK,
                                                 "MSAA fixture records four distinct canonical samples per pixel through original XG");
                                         }
                                         const char* vertex_source="Texture2DMS<float3> a:register(t4); Texture2D<float> b:register(t7); Texture2D<float4> n:register(t9); Texture2D<uint4> u:register(t10); Texture2DMS<float4> m:register(t11); Buffer<float4> q:register(t12); Texture2D<int4> s:register(t13); cbuffer C:register(b2){float amount;}; float4 main(float2 p:POSITION,float2 uv:TEXCOORD0):SV_Position {bool valid=a.Load(int2(0,0),0).x==.125 && a.Load(int2(0,0),1).x==.25 && a.Load(int2(0,0),2).x==.5 && a.Load(int2(0,0),3).x==1 && abs(b.Load(int3(0,0,0))+amount-.25)<.001 && all(n.Load(int3(0,0,0))==0) && all(u.Load(int3(0,0,0))==0) && all(m.Load(int2(0,0),0)==0) && all(q.Load(0)==0) && all(s.Load(int3(0,0,0))==0);return float4((p+uv)*(valid ? 1:0),0,1);}";
@@ -1622,7 +1723,7 @@ int main(int argc, char** argv) {
                                             };
                                             reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                             bind_vertex(context);draw(context,3,1);
-                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                 std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                                 "vertex shader reads four distinct MSAA samples, sparse t7 and b2 through real non-pixel resource barriers");
                                             void* vertex_producer=nullptr;void* vertex_list=nullptr;
@@ -1641,7 +1742,7 @@ int main(int argc, char** argv) {
                                             for(UINT pass=0;pass<2 && vertex_list;++pass) {
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                                 reinterpret_cast<ExecuteDeferred>(vt(context)[58])(context,vertex_list,FALSE);
-                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                     std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                                     "deferred sparse vertex descriptors retain exact fenced pixels after producer and shader release on reuse");
                                             }
@@ -1652,7 +1753,7 @@ int main(int argc, char** argv) {
                                         bind_compute(context);reinterpret_cast<Dispatch>(vt(context)[41])(context,4,2,1);
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[197])(context,0x407);
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(context)[152])(context,0x400000,nullptr,0);
-                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
                                             "immediate Dispatch samples the original texture and writes every UAV pixel after a fence");
                                         void* producer=nullptr;void* compute_list=nullptr;
@@ -1671,7 +1772,7 @@ int main(int argc, char** argv) {
                                             }
                                             check(reinterpret_cast<FinishDeferred>(vt(producer)[114])(producer,FALSE,&compute_list)==S_OK && compute_list,
                                                   "deferred Dispatch finishes without executing");
-                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                 std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),"deferred compute leaves canonical pixels unchanged during recording");
                                             reinterpret_cast<Count>(vt(producer)[2])(producer);
                                         }
@@ -1681,7 +1782,7 @@ int main(int argc, char** argv) {
                                             for(UINT pass=0;pass<2;++pass) {
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                                 reinterpret_cast<ExecuteDeferred>(vt(context)[58])(context,compute_list,FALSE);
-                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512)==S_OK &&
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                     std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                                     "deferred Dispatch retains CS/SRV/UAV/sampler and renamed constants after producer release, with exact pixels on reuse");
                                             }
@@ -1761,7 +1862,7 @@ int main(int argc, char** argv) {
                         for (UINT mip=0;SUCCEEDED(hr) && mip<faces*3;++mip) {
                             const UINT width=8>>(mip%3),pitch=width*4;
                             std::vector<unsigned char> linear(pitch*width);
-                            check(pixels.copy(pixels.context.get(),false,linear.data(),canonical,mip,pitch,pitch*width)==S_OK,
+                            check(pixels.copy(pixels.context.get(),false,linear.data(),canonical,mip,pitch,pitch*width,nullptr)==S_OK,
                                   "initialized texture exposes tiled mip pixels through original XG");
                             bool exact=true;
                             for (UINT y=0;y<width;++y) exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
@@ -1884,7 +1985,7 @@ int main(int argc, char** argv) {
                     TitleTextureLayout pixels;
                     hr=create_xg_texture3d_layout(16,16,16,1,volume_desc.standard.Format,volume_desc.standard.BindFlags,pixels);
                     std::vector<unsigned char> linear(16*16*16*4);
-                    check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),canonical,0,64,16*64)==S_OK,
+                    check(SUCCEEDED(hr) && pixels.copy(pixels.context.get(),false,linear.data(),canonical,0,64,16*64,nullptr)==S_OK,
                           "volume initial data is stored in the original XG physical layout");
                     bool exact=true;
                     for (UINT z=0;z<16;++z) for (UINT y=0;y<16;++y)
@@ -1974,7 +2075,7 @@ int main(int argc, char** argv) {
                             TitleTextureLayout mask_layout;
                             HRESULT mask_hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R8_UINT, UINT_MAX, mask_layout, D3D11_BIND_SHADER_RESOURCE);
                             std::array<unsigned char, 32 * 16> values{};
-                            if (SUCCEEDED(mask_hr)) mask_hr = mask_layout.copy(mask_layout.context.get(), false, values.data(), canonical, 0, 32, 512);
+                            if (SUCCEEDED(mask_hr)) mask_hr = mask_layout.copy(mask_layout.context.get(), false, values.data(), canonical, 0, 32, 512,nullptr);
                             UINT identity = 0;
                             for (UINT sample = 0; sample < actual.standard.SampleDesc.Count; ++sample) identity |= sample << (2 * sample);
                             check(SUCCEEDED(mask_hr) && std::all_of(values.begin(), values.end(), [identity](auto x) { return x == identity; }),
@@ -4053,6 +4154,17 @@ int main(int argc, char** argv) {
             {
                 using Users=HRESULT(STDMETHODCALLTYPE*)(void*,void**);
                 const auto users=reinterpret_cast<Users>((*reinterpret_cast<void***>(user_statics))[9]);
+                using UserString=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
+                const auto offline_id=[&](void* user) {
+                    HSTRING value=nullptr;
+                    check(reinterpret_cast<UserString>((*reinterpret_cast<void***>(user))[15])(user,&value)==S_OK,
+                          "XboxUserId returns the approved emulated offline identity");
+                    const auto id=text(value); WindowsDeleteString(value);
+                    check(!id.empty() && id.size()<=20 && id.find_first_not_of(L"0123456789")==std::wstring::npos && id!=L"0",
+                          "emulated identity preserves the nonzero decimal uint64 string ABI");
+                    return id;
+                };
+                std::wstring first_offline_id;
                 const auto previous_root=xboxone::era::title_storage_root();
                 wchar_t temporary[MAX_PATH]{}; GetTempPathW(MAX_PATH,temporary);
                 const auto root=std::filesystem::path(temporary)/(L"xone-profile-test-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
@@ -4102,11 +4214,14 @@ int main(int argc, char** argv) {
                               reinterpret_cast<Size>(it[12])(item,&location)==S_OK && location==0 &&
                               reinterpret_cast<Users>(it[13])(item,&sponsor)==S_OK && !sponsor,
                               "selected persistent user is locally signed in and has no guest sponsor");
-                        using UserString=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
-                        HSTRING online_id=reinterpret_cast<HSTRING>(1);
-                        check(reinterpret_cast<UserString>(it[15])(item,&online_id)==E_NOTIMPL && !online_id &&
-                              reinterpret_cast<UserString>(it[15])(item,nullptr)==E_POINTER,
-                              "local profile cannot manufacture an Xbox services identity");
+                        first_offline_id=offline_id(item);
+                        check(offline_id(item)==first_offline_id && reinterpret_cast<UserString>(it[15])(item,nullptr)==E_POINTER,
+                              "offline identity is stable across calls and rejects a null output");
+                        using Token=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING,HSTRING,HSTRING,HSTRING,void**);
+                        void* authentication=reinterpret_cast<void*>(1);
+                        check(reinterpret_cast<Token>(it[18])(item,nullptr,nullptr,nullptr,nullptr,&authentication)==HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) && !authentication &&
+                              reinterpret_cast<Token>(it[18])(item,nullptr,nullptr,nullptr,nullptr,nullptr)==E_POINTER,
+                              "offline token request reports no connection without fabricating authentication or an operation");
                         IInspectable* display=nullptr;
                         check(reinterpret_cast<Users>(it[9])(item,reinterpret_cast<void**>(&display))==S_OK && display,
                               "User.DisplayInfo retains the same local profile owner");
@@ -4141,15 +4256,35 @@ int main(int argc, char** argv) {
                     GUID second_identity{};
                     check(xboxone::era::title_local_user_identity(&second_identity,&local_id)==S_OK && second_identity!=identity,
                           "separate session storage cannot alias a different persisted profile");
+                    IInspectable* second_view=nullptr;
+                    check(users(user_statics,reinterpret_cast<void**>(&second_view))==S_OK && second_view,"second profile snapshot");
+                    if (second_view) {
+                        IInspectable* second_user=nullptr;
+                        check(reinterpret_cast<Get>((*reinterpret_cast<void***>(second_view))[6])(second_view,0,reinterpret_cast<void**>(&second_user))==S_OK && second_user,
+                              "second profile user");
+                        if (second_user) { check(offline_id(second_user)!=first_offline_id,"different profiles have different emulated identities");second_user->Release(); }
+                        second_view->Release();
+                    }
                     if (item) {
                         UINT id=0;check(reinterpret_cast<Size>((*reinterpret_cast<void***>(item))[6])(item,&id)==S_OK && id==1,
-                            "existing user snapshots remain alive after storage-root replacement");item->Release();
+                            "existing user snapshots remain alive after storage-root replacement");
+                        check(offline_id(item)==first_offline_id,"retained user cannot acquire the next session's offline identity");item->Release();
                     }
                     view->Release();
                 }
                 xboxone::era::set_title_storage_root(root.wstring());GUID reloaded{};
                 check(xboxone::era::title_local_user_identity(&reloaded,&local_id)==S_OK && reloaded==identity,
                       "profile identity survives cache reset and reopening its persistent record");
+                IInspectable* reloaded_view=nullptr;
+                check(users(user_statics,reinterpret_cast<void**>(&reloaded_view))==S_OK && reloaded_view,"reloaded profile snapshot");
+                if (reloaded_view) {
+                    IInspectable* reloaded_user=nullptr;
+                    using Get=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
+                    check(reinterpret_cast<Get>((*reinterpret_cast<void***>(reloaded_view))[6])(reloaded_view,0,reinterpret_cast<void**>(&reloaded_user))==S_OK && reloaded_user,
+                          "reloaded profile user");
+                    if (reloaded_user) { check(offline_id(reloaded_user)==first_offline_id,"offline identity survives reloading the persisted profile");reloaded_user->Release(); }
+                    reloaded_view->Release();
+                }
                 { std::ofstream corrupt(profile,std::ios::binary|std::ios::trunc);corrupt<<"invalid"; }
                 xboxone::era::set_title_storage_root(root.wstring());
                 check(users(user_statics,&missing)==HRESULT_FROM_WIN32(ERROR_INVALID_DATA) && !missing && std::filesystem::file_size(profile)==7,

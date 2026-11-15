@@ -6,7 +6,7 @@
   **Projeto aberto de pesquisa para executar componentes originais do Xbox One e jogos no PC, com a dashboard autêntica do SystemOS como objetivo central.**
 
   [![CI/CD](https://img.shields.io/github/actions/workflow/status/fabegalo/xone-native/build.yml?branch=main&event=push&label=CI%2FCD)](https://github.com/fabegalo/xone-native/actions/workflows/build.yml?query=branch%3Amain)
-  [![M0: apenas inspeção](https://img.shields.io/badge/marco-M0%20%7C%20inspe%C3%A7%C3%A3o-555)](#estado-atual)
+  [![Pesquisa do runtime](https://img.shields.io/badge/marco-pesquisa%20do%20runtime-555)](#estado-atual)
   [![Experimental](https://img.shields.io/badge/estado-experimental-orange)](#estado-atual)
   [![BSD-3-Clause](https://img.shields.io/badge/licen%C3%A7a-BSD--3--Clause-blue)](LICENSE)
 
@@ -14,6 +14,14 @@
 </div>
 
 > **Pesquisa em estágio inicial — ainda não existem jogos comerciais jogáveis, boot do SystemOS original nem Release para usuários.** Uma dashboard local, recriada no estilo do Xbox One, agora abre por padrão; ela **não** é o SystemOS original nem exibe a dashboard da Microsoft. O banner acima é uma ilustração conceitual, não uma captura do Xbox One em funcionamento. Compilar o projeto ou ler um cabeçalho XVD não comprova compatibilidade com o console.
+
+## Veja em execução
+
+| Sonic Mania · tela inicial do título original de Xbox One | Dashboard local · Início após retorno do título |
+|---|---|
+| ![Tela inicial original de Sonic Mania para Xbox One renderizada pelo xone-era](docs/assets/screenshots/sonic-mania-title.png) | ![Início da dashboard recriada localmente com Sonic Mania e o resultado da suspensão do título](docs/assets/screenshots/local-dashboard-home.png) |
+
+<sub>Capturas locais em Windows x64, 15 de novembro de 2026. Sonic Mania 1.0.4.2 chegou à tela inicial pelo runtime ERA; gameplay não está certificado. A Home é saída do renderer da dashboard recriada localmente (`local_recreation`), não do SystemOS original. As imagens dos jogos pertencem aos respectivos titulares. [Evidências da sessão e limitações atuais](docs/NEXT-TASK.md).</sub>
 
 ## O que é o xone-native?
 
@@ -29,7 +37,7 @@ A estratégia preferencial é executar x86-64 diretamente **quando isso for demo
 
 ## Estado atual
 
-**M0 — inspeção de arquivos somente leitura, no host.** O projeto contém CLI e biblioteca C++20/CMake, além de testes sintéticos. Nenhum executável original do Xbox One foi demonstrado funcionando aqui.
+**Pesquisa do runtime — execução de título ERA original e dashboard local em Windows x64.** Sonic Mania 1.0.4.2 chegou à sua tela inicial original. A dashboard local inicia títulos, compõe seu Guia sobre a saída do título e retorna à Home com o mesmo estado de perfil/armazenamento. Gameplay comercial e boot do SystemOS original continuam sem comprovação; o inspetor XVD/PE somente leitura também está disponível.
 
 | Componente | Implementado de fato | Não demonstrado |
 |---|---|---|
@@ -38,7 +46,7 @@ A estratégia preferencial é executar x86-64 diretamente **quando isso for demo
 | **Build e testes** | Targets CMake portáveis; testes locais M0 aprovados anteriormente | Compatibilidade de runtime; validação funcional por plataforma |
 | **Dashboard local (recriação, Windows x64)** | Entrada e perfis locais persistentes, Início, Meus jogos e apps, Guia, configurações (vídeo, áudio, controle, idioma, armazenamento), navegação por teclado e XInput, sons de interface; importação de pastas identificada por manifesto + SHA-256, `xone-era check`, início por `xone-era run`, fechar pelo Guia, retorno com o resultado real | Gameplay de títulos comerciais por ela; adaptadores Linux/macOS; validação com controle físico |
 | **SystemOS / dashboard original** | Arquitetura e obstáculos documentados | Primeira imagem original, boot, navegação, Guide, perfis |
-| **GameOS / ERA / gráficos** | Pesquisa e fronteiras de integração | Início de jogos, áudio, renderização, gameplay ou retorno à dashboard |
+| **GameOS / ERA / gráficos** | Execução de código x86-64 original, serviços parciais de KernelX/Xbox WinRT e tradução D3D11.X → D3D12; abertura/tela inicial de Sonic Mania; retorno supervisionado à dashboard local | Gameplay comercial certificado, áudio original audível, cobertura completa de APIs/gráficos |
 
 Há um workflow do GitHub Actions **configurado** para compilar/testar em Windows, Linux e macOS. Isso não comprova execução dos sistemas do console nessas plataformas. Windows x64/ARM64, Linux x64/ARM64 (incluindo Steam Deck no Linux x64) e macOS Intel/Apple Silicon são **objetivos futuros**, não downloads suportados.
 
@@ -46,7 +54,7 @@ O build documentado de SystemOS `10.0.10586.1029` é apenas **referência de ins
 
 ## Experimente o inspetor M0
 
-Esta é uma **ferramenta para desenvolvedores**, não um launcher. É necessário CMake e compilador C++20. Na raiz do repositório:
+O inspetor somente leitura é uma **ferramenta para desenvolvedores** disponível junto da dashboard local. É necessário CMake e compilador C++20. Na raiz do repositório:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -90,7 +98,7 @@ Futuro launcher desktop (somente gerenciamento/preparação)
 - **Uma única base de código:** isolar adaptadores de plataforma sem duplicar jogos, componentes de sistema, projetos ou caches enormes. Preservar entradas originais e usar cache por conteúdo e versão somente quando necessário.
 - **Evidência honesta:** distinguir identificado, carregado, inicializado, renderizando, interface interativa, gameplay, jogável e plenamente funcional. Testes sintéticos e compilação não comprovam execução do console.
 
-Os modos gráficos planejados são **Xbox** (fidelidade ao original) e **Native** (melhorias medidas no PC sem regressões de imagem ou tempo). Nenhum renderizador foi implementado ainda. Veja [docs/M0.md](docs/M0.md).
+Os modos gráficos planejados são **Xbox** (fidelidade ao original) e **Native** (melhorias medidas no PC sem regressões de imagem ou tempo). O backend ERA atual para Windows já traduz parte de D3D11.X para D3D12; a cobertura completa do renderizador segue pendente. Veja [docs/NEXT-TASK.md](docs/NEXT-TASK.md).
 
 ## Roadmap
 

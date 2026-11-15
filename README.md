@@ -6,7 +6,7 @@
   **An open research project to run original Xbox One system components and games on PCs, with the authentic SystemOS dashboard as its central goal.**
 
   [![CI/CD](https://img.shields.io/github/actions/workflow/status/fabegalo/xone-native/build.yml?branch=main&event=push&label=CI%2FCD)](https://github.com/fabegalo/xone-native/actions/workflows/build.yml?query=branch%3Amain)
-  [![M0: inspection only](https://img.shields.io/badge/milestone-M0%20%7C%20inspection-555)](#current-status)
+  [![Runtime research](https://img.shields.io/badge/milestone-runtime%20research-555)](#current-status)
   [![Experimental](https://img.shields.io/badge/status-experimental-orange)](#current-status)
   [![BSD-3-Clause](https://img.shields.io/badge/license-BSD--3--Clause-blue)](LICENSE)
 
@@ -14,6 +14,14 @@
 </div>
 
 > **Early research software — no playable commercial games, original SystemOS boot or end-user release yet.** A locally recreated Xbox One-style dashboard now opens by default; it is **not** the original SystemOS and does not show Microsoft's dashboard. The banner above is concept art, not a capture of running Xbox One software. A successful build or XVD header inspection is not proof of Xbox One compatibility.
+
+## See it running
+
+| Sonic Mania · original Xbox One title screen | Local dashboard · Home after title return |
+|---|---|
+| ![Original Sonic Mania Xbox One title screen rendered by xone-era](docs/assets/screenshots/sonic-mania-title.png) | ![Locally recreated dashboard Home with Sonic Mania and the title suspension result](docs/assets/screenshots/local-dashboard-home.png) |
+
+<sub>Local Windows x64 captures, 15 November 2026. Sonic Mania 1.0.4.2 reached its title screen through the ERA runtime; gameplay is not certified. Home is output from the locally recreated dashboard renderer (`local_recreation`), not original SystemOS. Game imagery belongs to its respective owners. [Session evidence and remaining limitations](docs/NEXT-TASK.md).</sub>
 
 ## What is xone-native?
 
@@ -29,7 +37,7 @@ The preferred strategy is direct x86-64 execution **when technically demonstrate
 
 ## Current status
 
-**M0 — host-side, read-only file inspection.** The project has a C++20/CMake CLI, library and synthetic regression tests. No original Xbox One executable has been demonstrated running.
+**Runtime research — original ERA title execution and a local dashboard on Windows x64.** Sonic Mania 1.0.4.2 has reached its original title screen. The local dashboard can launch a title, compose its Guide over the title output and return to Home with shared profile/storage state. Commercial gameplay and original SystemOS boot remain unproven; the read-only XVD/PE inspector is also available.
 
 | Component | Actually implemented | Not demonstrated |
 |---|---|---|
@@ -38,7 +46,7 @@ The preferred strategy is direct x86-64 execution **when technically demonstrate
 | **Build and tests** | Portable CMake targets; local M0 tests previously passed | Runtime compatibility; functional platform validation |
 | **Local dashboard (recreation, Windows x64)** | Sign-in and persistent local profiles, Home, My games & apps, Guide, settings (display, audio, controller, language, storage), keyboard and XInput navigation, UI sounds; folder import identified by manifest + SHA-256, `xone-era check`, launch through `xone-era run`, Guide quit, return with the real exit result | Commercial title gameplay through it; Linux/macOS host adapters; physical-controller validation |
 | **SystemOS / original dashboard** | Architecture and obstacles documented | Original frame, boot, navigation, Guide, profiles |
-| **GameOS / ERA / graphics** | Research and integration boundaries | Game startup, sound, rendering, gameplay or return to dashboard |
+| **GameOS / ERA / graphics** | Original x86-64 title execution, partial KernelX/Xbox WinRT services and D3D11.X → D3D12 translation; Sonic Mania startup/title screen; supervised return to the local dashboard | Certified commercial gameplay, audible original audio, complete API/graphics coverage |
 
 A GitHub Actions workflow **is configured** for Windows, Linux and macOS host builds/tests. Its existence does not establish runtime support on those systems. Windows x64/ARM64, Linux x64/ARM64 (including Steam Deck on Linux x64), and macOS Intel/Apple Silicon are **long-term targets**, not supported downloads.
 
@@ -46,7 +54,7 @@ The documented SystemOS build `10.0.10586.1029` is only an **inspection referenc
 
 ## Try the current M0 inspector
 
-This is a **developer tool**, not a launcher. You need CMake and a C++20 compiler. From the repository root:
+The read-only inspector is a **developer tool** alongside the local dashboard. You need CMake and a C++20 compiler. From the repository root:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -90,7 +98,7 @@ Future desktop launcher (management and preparation only)
 - **One shared codebase:** isolate OS-specific adapters without duplicating games, system components, projects or large caches. Keep original inputs unchanged and use version-aware, content-addressed caching only where justified.
 - **Honest evidence:** distinguish identified, loaded, initialized, rendering, interactive, gameplay, playable and fully functional. Test fixtures and successful compilation alone are not runtime evidence.
 
-The planned graphics directions are **Xbox** (original behavior and fidelity) and **Native** (measured PC enhancements without visual or timing regressions). Neither renderer is implemented yet. Further boundaries and blockers: [docs/M0.md](docs/M0.md).
+The planned graphics directions are **Xbox** (original behavior and fidelity) and **Native** (measured PC enhancements without visual or timing regressions). The current Windows ERA backend translates a subset of D3D11.X to D3D12; complete renderer coverage remains unfinished. Further boundaries and blockers: [docs/NEXT-TASK.md](docs/NEXT-TASK.md).
 
 ## Roadmap
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/inspection.h"
 #include "xboxone_native/inventory.h"
+#include "xboxone_native/dashboard.h"
 
 #include <charconv>
 #include <array>
@@ -82,8 +83,9 @@ void print_report(const xboxone::inspection::Report& report, bool json) {
 }
 
 void help() {
-    std::cout << "xone-native M0: read-only original content inspector\n"
-              << "Usage: xone-native inspect <file> [--json]\n"
+    std::cout << "xone-native: local Xbox One-style dashboard and read-only content inspector\n"
+              << "Usage: xone-native [dashboard]   (no arguments: open the local dashboard)\n"
+              << "       xone-native inspect <file> [--json]\n"
               << "       xone-native inventory <directory> [--json]\n"
               << "           [--max-file-bytes N] [--max-total-bytes N]\n"
               << "       xone-native inspect-xvd-header <declared-file-size> [--json]\n"
@@ -180,6 +182,7 @@ bool argument_is(const auto* text, std::string_view expected) {
 }
 
 int run(int argc, const auto* const* argv) {
+    if (argc == 1 || (argc == 2 && argument_is(argv[1], "dashboard"))) return xboxone::dashboard::run_host();
     if (argc == 2 && (argument_is(argv[1], "--help") || argument_is(argv[1], "-h"))) {
         help(); return 0;
     }

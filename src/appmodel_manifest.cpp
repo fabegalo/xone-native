@@ -149,6 +149,15 @@ bool read_manifest(const std::filesystem::path& path, const std::string& sha256,
         Com<IAppxManifestProperties> properties;
         require(reader->GetProperties(&properties), "GetProperties");
         candidate.resource_paths.push_back(string_value([&](auto p) { return properties->GetStringValue(L"Logo", p); }));
+        // Display strings never gate activation; absent or unsupported names stay empty.
+        const auto optional = [](auto get) {
+            LPWSTR value = nullptr;
+            const HRESULT hr = get(&value);
+            struct Free { LPWSTR p; ~Free() { CoTaskMemFree(p); } } free{value};
+            return SUCCEEDED(hr) ? utf8(value) : std::string{};
+        };
+        candidate.display_name = optional([&](auto p) { return properties->GetStringValue(L"DisplayName", p); });
+        candidate.publisher_display_name = optional([&](auto p) { return properties->GetStringValue(L"PublisherDisplayName", p); });
         Com<IAppxManifestPackageId> id;
         require(reader->GetPackageId(&id), "GetPackageId");
         candidate.name = string_value([&](auto p) { return id->GetName(p); });
@@ -170,6 +179,10 @@ bool read_manifest(const std::filesystem::path& path, const std::string& sha256,
             a.executable = string_value([&](auto p) { return app->GetStringValue(L"Executable", p); });
             a.entry_point = string_value([&](auto p) { return app->GetStringValue(L"EntryPoint", p); });
             a.aumid = string_value([&](auto p) { return app->GetAppUserModelId(p); });
+            a.display_name = optional([&](auto p) { return app->GetStringValue(L"DisplayName", p); });
+            a.logo = optional([&](auto p) { return app->GetStringValue(L"Square150x150Logo", p); });
+            if (a.logo.empty()) a.logo = optional([&](auto p) { return app->GetStringValue(L"Logo", p); });
+            a.background_color = optional([&](auto p) { return app->GetStringValue(L"BackgroundColor", p); });
             candidate.applications.push_back(std::move(a));
         });
         Com<IAppxManifestPackageDependenciesEnumerator> dependencies;

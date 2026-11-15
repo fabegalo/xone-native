@@ -8,6 +8,8 @@
 namespace xboxone::appmodel {
 struct Application {
     std::string id, executable, entry_point, aumid;
+    // Presentation metadata only; may be "ms-resource:" references or empty.
+    std::string display_name, logo, background_color;
 };
 struct PackageDependency {
     std::string name, publisher;
@@ -16,6 +18,7 @@ struct PackageDependency {
 struct Capability { std::string name, namespace_uri; };
 struct Manifest {
     std::string name, publisher, resource_id, full_name, family_name;
+    std::string display_name, publisher_display_name; // presentation metadata only
     std::uint64_t version = 0;
     std::uint32_t architecture = 0;
     std::vector<Application> applications;

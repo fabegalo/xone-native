@@ -72,3 +72,52 @@ endif()
 
 include(cmake/SystemOS.cmake)
 include(cmake/Era.cmake)
+
+# Shared console state, library catalog, session supervisor and the approved
+# local dashboard front-end (frames: local_recreation, never SystemOS).
+add_library(xboxone_console STATIC
+    src/console_state.cpp
+    src/title_catalog.cpp
+    src/session_supervisor.cpp
+    src/dashboard.cpp
+    src/dashboard_render.cpp
+)
+target_include_directories(xboxone_console PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_compile_features(xboxone_console PUBLIC cxx_std_20)
+target_link_libraries(xboxone_console PUBLIC xboxone_inspection PRIVATE xboxone_systemos)
+if(WIN32)
+    target_sources(xboxone_console PRIVATE src/dashboard_windows.cpp)
+    target_link_libraries(xboxone_console PRIVATE xboxone_presentation user32 gdi32 ole32 shell32 windowscodecs winmm)
+endif()
+if(MSVC)
+    target_compile_options(xboxone_console PRIVATE /W4 /permissive- /utf-8)
+    target_compile_definitions(xboxone_console PRIVATE _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(xboxone_console PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+target_link_libraries(xone-native PRIVATE xboxone_console)
+
+if(XBOXONE_NATIVE_BUILD_TESTS)
+    add_executable(xboxone_dashboard_tests tests/dashboard_tests.cpp)
+    target_include_directories(xboxone_dashboard_tests PRIVATE src)
+    target_link_libraries(xboxone_dashboard_tests PRIVATE xboxone_console)
+    if(MSVC)
+        target_compile_options(xboxone_dashboard_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME dashboard_regressions COMMAND xboxone_dashboard_tests)
+    set_tests_properties(dashboard_regressions PROPERTIES TIMEOUT 20 LABELS "synthetic;dashboard")
+    if(TARGET xone-era)
+        add_executable(xboxone_dashboard_era_tests tests/dashboard_era_tests.cpp)
+        target_include_directories(xboxone_dashboard_era_tests PRIVATE src)
+        target_link_libraries(xboxone_dashboard_era_tests PRIVATE xboxone_console gdi32 ole32)
+        target_compile_options(xboxone_dashboard_era_tests PRIVATE /utf-8)
+        add_dependencies(xboxone_dashboard_era_tests xone-era era_component)
+        add_test(NAME dashboard_era_lifecycle
+            COMMAND xboxone_dashboard_era_tests $<TARGET_FILE:xone-era> $<TARGET_FILE:era_component>
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/appmodel/AppxManifest.xml")
+        set_tests_properties(dashboard_era_lifecycle PROPERTIES TIMEOUT 60 LABELS "windows;synthetic;era;dashboard")
+    endif()
+endif()

@@ -12,9 +12,13 @@ void unpin_title_audio_memory(void* address);
 struct TitleGpuClearState {
     UINT32 depth = 0; // Full IEEE bits, not quantized HTILE bounds.
     UINT8 stencil = 0, known = 0; // D3D11_CLEAR_DEPTH / D3D11_CLEAR_STENCIL.
+    // Ingress only: read without the depth block (shader/copy). The GCN 2 texture unit
+    // does not consult HTILE (TC-compatible HTILE starts with GFX8), so it reads the base plane.
+    bool bypass_htile = false;
 };
 struct TitleTextureLayout {
     std::size_t bytes = 0, alignment = 0;
+    bool demand_coherence = false; // Provider is retained and supports publication through a private canonical image.
     UINT tile_mode = UINT_MAX;
     D3D12_RESOURCE_DESC resource_desc{};
     std::array<UINT32, 8> guest_descriptor{}; // Produced by the pinned XG revision, before memory binding.
@@ -54,9 +58,9 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
 HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* device, TitleGpuResource& out,
                                  D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE, bool aligned = false);
 HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layout, ID3D12Device* device, TitleGpuResource& out);
-// Aligned bindings retain storage, but GPU use is explicit. Begin uploads the
-// canonical range; end writes it back and restores COMMON. Complete must see a
-// real fence after that command list before CPU access or overlapping GPU use.
+// Aligned bindings retain storage; GPU use remains explicit. Tracked graphics
+// mappings keep native contents resident and publish canonical bytes on CPU
+// access or incompatible alias use. Completion still requires the real fence.
 // Overlapping representations cannot be active together. Never copy a live handle.
 // Return the representation to the state passed to begin before calling end.
 // read_only promises no writes or write-state transitions within this interval;
@@ -67,12 +71,13 @@ HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList
 HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents=false,
                                 const D3D12_SUBRESOURCE_DATA* first_subresource=nullptr,bool read_only=false);
 HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list);
-// A texture's GPU fence is internal: complete also retiles readback bytes into
-// canonical memory. Publish guest completion only after this returns S_OK.
+// Publish guest completion only after S_OK. For tracked mappings, protected CPU
+// reads/writes retire the canonical image before the faulting access resumes.
 HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value);
 // CPU maps share the canonical bytes and exclude GPU access to the parent.
-// E_PENDING means a GPU interval still needs its completion fence.
-HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address);
+// E_PENDING means a GPU interval still needs its completion fence. Blocking maps
+// wait for another submission thread's retirement, with the normal 5 s deadline.
+HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address, bool wait=false);
 HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer);
 // E_PENDING preserves the pin; retry after the last GPU use has completed.
 HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value);

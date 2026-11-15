@@ -150,6 +150,11 @@ HRESULT STDMETHODCALLTYPE activate_window(WinrtObject*) {
     else SetForegroundWindow(window);
     return S_OK;
 }
+HRESULT core_window_query(WinrtObject* self,REFIID iid,void** out) {
+    // Reference Window QI accepts the standard COM agility marker; methods keep their thread checks.
+    if(iid==__uuidof(IAgileObject)){*out=self;return S_OK;}
+    return self_query(self,iid,out);
+}
 
 void raise_suspending();
 constexpr UINT suspend_message = WM_APP + 0x53;
@@ -198,7 +203,7 @@ WinrtObject& core_window() {
         t[20] = reinterpret_cast<const void*>(&remove_closed);
         return t;
     }();
-    static WinrtObject object{vt.data(), window_class, iid_core_window, &self_query};
+    static WinrtObject object{vt.data(), window_class, iid_core_window, &core_window_query};
     return object;
 }
 

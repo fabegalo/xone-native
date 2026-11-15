@@ -147,6 +147,7 @@ struct alignas(64) Context : GraphicsObject {
     std::array<BufferView*,64> compute_uavs{}; // 11295 CS setter accepts 64 UAV slots.
     InputLayout* input_layout = nullptr;
     std::array<Sampler*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> pixel_samplers{};
+    std::array<Sampler*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> geometry_samplers{};
     std::array<std::array<BufferView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,6> shader_resources{}; // VS, HS, DS, GS, PS, CS.
     std::array<std::array<Buffer*,D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>,4> constants{}; // PS, VS, GS, CS.
     std::array<Buffer*,D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers{};
@@ -2924,6 +2925,7 @@ void clear_context_bindings(Context* self,bool preserve_layout=false) {
     for(auto*& view:self->compute_uavs) {if(view) view_release(view);view=nullptr;}
     if (!preserve_layout) { if (self->input_layout) input_layout_release(self->input_layout); self->input_layout=nullptr; }
     for (auto*& sampler:self->pixel_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
+    for (auto*& sampler:self->geometry_samplers) { if (sampler) sampler_release(sampler); sampler=nullptr; }
     for (auto& stage:self->shader_resources) for (auto*& view:stage) { if (view) view_release(view); view=nullptr; }
     for (auto& stage:self->constants) for (auto*& buffer:stage) { if (buffer) buffer_release(buffer); buffer=nullptr; }
     for (auto*& buffer:self->vertex_buffers) { if (buffer) buffer_release(buffer); buffer=nullptr; }
@@ -3060,6 +3062,11 @@ void STDMETHODCALLTYPE context_compute_samplers(Context* self,UINT start,UINT co
     if(!bind_range(self,self->compute_samplers,start,count,input,[&](Sampler* sampler) {
         return sampler->vtable==sampler_vtable().data() && sampler->device==self->device;
     },sampler_release)) default_trap("ID3D11DeviceContextX",70);
+}
+void STDMETHODCALLTYPE context_geometry_samplers(Context* self,UINT start,UINT count,Sampler* const* input) {
+    if(!bind_range(self,self->geometry_samplers,start,count,input,[&](Sampler* sampler) {
+        return sampler->vtable==sampler_vtable().data() && sampler->device==self->device;
+    },sampler_release)) default_trap("ID3D11DeviceContextX",32);
 }
 void STDMETHODCALLTYPE context_compute_uavs(Context* self,UINT start,UINT count,BufferView* const* input) {
     // 11295 1800153c0 takes four arguments; there is no desktop initial-counter array.
@@ -3215,6 +3222,7 @@ std::unique_ptr<Context> capture_draw_state(Context* self) {
     state->compute_shader=retain(self->compute_shader);
     range(state->compute_samplers,self->compute_samplers);range(state->compute_uavs,self->compute_uavs);
     range(state->pixel_samplers,self->pixel_samplers);
+    range(state->geometry_samplers,self->geometry_samplers);
     for(SIZE_T i=0;i<state->shader_resources.size();++i) range(state->shader_resources[i],self->shader_resources[i]);
     for(SIZE_T i=0;i<state->constants.size();++i) for(SIZE_T j=0;j<state->constants[i].size();++j)
         state->constants[i][j]=retain_buffer(self->constants[i][j]);
@@ -3423,12 +3431,13 @@ HRESULT refresh_graphics_bindings(Context* self) {
     std::memcpy(&shaders[0],self->inline_state.data()+0x188-32,sizeof(void*));
     std::memcpy(&shaders[1],self->inline_state.data()+0x180-32,sizeof(void*));
     std::memcpy(&shaders[2],self->inline_state.data()+0x1d0-32,sizeof(void*));
-    if(!shaders[0] || !shaders[1] || shaders[2]) return DXGI_ERROR_UNSUPPORTED;
+    if(!shaders[0] || !shaders[1]) return DXGI_ERROR_UNSUPPORTED;
     for(const UINT offset : {0x1c0u,0x1c8u,0x1d8u}) {
         void* stage=nullptr;std::memcpy(&stage,self->inline_state.data()+offset-32,sizeof stage);
         if(stage) return DXGI_ERROR_UNSUPPORTED;
     }
-    for(UINT stage=0;stage<2;++stage) {
+    for(UINT stage=0;stage<3;++stage) {
+        if(!shaders[stage]) continue;
         struct Prefix { const void* table; UINT refs,flags; Device* device; void* private_data; UINT native_flags,stage; } prefix{};
         static_assert(sizeof prefix==offsetof(Shader,code));
         SIZE_T read=0;
@@ -3446,7 +3455,7 @@ HRESULT refresh_graphics_bindings(Context* self) {
     // Native title helpers write these public fields without calling the vtable.
     if(self->shaders[0]!=shaders[0]) context_shader<0,11>(self,shaders[0]);
     if(self->shaders[1]!=shaders[1]) context_shader<1,13>(self,shaders[1]);
-    if(self->shaders[2]) context_shader<2,25>(self,nullptr);
+    if(self->shaders[2]!=shaders[2]) context_shader<2,25>(self,shaders[2]);
     if(self->input_layout!=layout) context_input_layout(self,layout);
     return S_OK;
 }
@@ -3454,11 +3463,11 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     std::lock_guard submission(self->device->list_execution);
     if(!self->deferred && self->device->suspended) return DXGI_ERROR_INVALID_CALL;
     const auto failed=[&](HRESULT hr,UINT line) {
-        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw failure at era_d3d11x.cpp:%u HRESULT=0x%08lX\n",line,hr);
+        std::fprintf(stderr,"xone-era: draw failure at era_d3d11x.cpp:%u HRESULT=0x%08lX\n",line,hr);
         return hr;
     };
     const auto unsupported=[&](UINT line) {
-        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported at era_d3d11x.cpp:%u\n",line);
+        std::fprintf(stderr,"xone-era: draw unsupported at era_d3d11x.cpp:%u\n",line);
         return DXGI_ERROR_UNSUPPORTED;
     };
     const HRESULT refreshed=refresh_graphics_bindings(self);
@@ -3487,35 +3496,41 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     }
     const UINT index_bytes=self->index_format==DXGI_FORMAT_R16_UINT ? 2 : 4;
     if(indexed && UINT64(first)+count>(self->index_buffer->desc.standard.ByteWidth-self->index_offset)/index_bytes) return E_INVALIDARG;
-    UINT counts[2][3]{}; // PS/VS: CBV, SRV, sampler.
-    std::array<std::array<std::array<bool,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,3>,2> used{};
-    struct ReflectedView {D3D_SRV_DIMENSION dimension{};D3D_RESOURCE_RETURN_TYPE type{};};
-    std::array<std::array<ReflectedView,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,2> reflected_views{};
-    for(UINT stage=0;stage<2;++stage) {
+    UINT counts[3][3]{}; // PS/VS/GS: CBV, SRV, sampler.
+    std::array<std::array<std::array<bool,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,3>,3> used{};
+    struct ReflectedView {D3D_SRV_DIMENSION dimension{};D3D_RESOURCE_RETURN_TYPE type{};D3D_SHADER_INPUT_TYPE input{};UINT stride=0;};
+    std::array<std::array<ReflectedView,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>,3> reflected_views{};
+    for(UINT stage=0;stage<3;++stage) {
+        if(!self->shaders[stage]) continue;
         // Shader bytecode is an owned immutable copy validated at creation.
         for(const auto& binding:self->shaders[stage]->bindings) {
             UINT kind=0,limit=D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
-            if(binding.Type==D3D_SIT_TEXTURE) {kind=1;limit=D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;}
+            // Structured and raw buffers are t# SRVs too; their views come from the same SRV path.
+            if(binding.Type==D3D_SIT_TEXTURE || binding.Type==D3D_SIT_STRUCTURED || binding.Type==D3D_SIT_BYTEADDRESS) {kind=1;limit=D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT;}
             else if(binding.Type==D3D_SIT_SAMPLER) {kind=2;limit=D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT;}
-            else if(binding.Type!=D3D_SIT_CBUFFER) return unsupported(__LINE__);
-            if((stage && kind==2) || !binding.BindCount || binding.BindPoint>=limit || binding.BindCount>limit-binding.BindPoint) {
+            else if(binding.Type!=D3D_SIT_CBUFFER) {
+                if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported shader binding stage=%u type=%u slot=%u count=%u dimension=%u\n",stage,binding.Type,binding.BindPoint,binding.BindCount,binding.Dimension);
+                return unsupported(__LINE__);
+            }
+            if((stage==1 && kind==2) || !binding.BindCount || binding.BindPoint>=limit || binding.BindCount>limit-binding.BindPoint) {
                 if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw unsupported shader binding stage=%u type=%u slot=%u count=%u\n",stage,binding.Type,binding.BindPoint,binding.BindCount);
                 return unsupported(__LINE__);
             }
             counts[stage][kind]=(std::max)(counts[stage][kind],binding.BindPoint+binding.BindCount);
             for(UINT slot=binding.BindPoint;slot<binding.BindPoint+binding.BindCount;++slot) {
                 used[stage][kind][slot]=true;
-                if(kind==1) reflected_views[stage][slot]={binding.Dimension,binding.ReturnType};
+                // For structured buffers reflection reports the element stride in NumSamples.
+                if(kind==1) reflected_views[stage][slot]={binding.Dimension,binding.ReturnType,binding.Type,binding.NumSamples};
             }
         }
     }
     struct Table {UINT stage,kind,offset;std::vector<UINT> slots;};
-    std::array<Table,6> tables{};
-    std::array<std::vector<D3D12_DESCRIPTOR_RANGE>,6> ranges{};
-    std::array<D3D12_ROOT_PARAMETER,6> parameters{};
+    std::array<Table,9> tables{};
+    std::array<std::vector<D3D12_DESCRIPTOR_RANGE>,9> ranges{};
+    std::array<D3D12_ROOT_PARAMETER,9> parameters{};
     UINT table_count=0,resources=0,samplers=0;
     constexpr D3D12_DESCRIPTOR_RANGE_TYPE types[]{D3D12_DESCRIPTOR_RANGE_TYPE_CBV,D3D12_DESCRIPTOR_RANGE_TYPE_SRV,D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER};
-    for(UINT stage=0;stage<2;++stage) for(UINT kind=0;kind<3;++kind) if(counts[stage][kind]) {
+    for(UINT stage=0;stage<3;++stage) for(UINT kind=0;kind<3;++kind) if(counts[stage][kind]) {
         auto& total=kind==2 ? samplers : resources;
         auto& table=tables[table_count];table.stage=stage;table.kind=kind;table.offset=total;
         auto& range=ranges[table_count];
@@ -3527,7 +3542,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
         total+=UINT(table.slots.size());
         parameters[table_count].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
         parameters[table_count].DescriptorTable={UINT(range.size()),range.data()};
-        parameters[table_count].ShaderVisibility=stage ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
+        parameters[table_count].ShaderVisibility=stage==2 ? D3D12_SHADER_VISIBILITY_GEOMETRY : stage==1 ? D3D12_SHADER_VISIBILITY_VERTEX : D3D12_SHADER_VISIBILITY_PIXEL;
         ++table_count;
     }
     const D3D12_ROOT_SIGNATURE_DESC root_desc{table_count,parameters.data(),0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
@@ -3540,6 +3555,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
     pipeline.pRootSignature=root.Get();
     pipeline.VS={self->shaders[1]->code.data(),self->shaders[1]->code.size()};
     pipeline.PS={self->shaders[0]->code.data(),self->shaders[0]->code.size()};
+    if(self->shaders[2]) pipeline.GS={self->shaders[2]->code.data(),self->shaders[2]->code.size()};
     if(self->input_layout) pipeline.InputLayout={self->input_layout->elements.data(),UINT(self->input_layout->elements.size())};
     pipeline.SampleMask=self->sample_mask;pipeline.SampleDesc={1,0};pipeline.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     if(indexed && primitive == D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
@@ -3610,11 +3626,19 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
                 const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{buffer->gpu.resource->GetGPUVirtualAddress()+buffer->gpu.offset,bytes};
                 self->device->d3d12->CreateConstantBufferView(&desc,handle);
             } else if(table.kind==1) {
-                auto* view=self->shader_resources[table.stage ? 0 : 4][i];
+                auto* view=self->shader_resources[table.stage==2 ? 3 : table.stage==1 ? 0 : 4][i];
                 if(!view) {
                     // Native 18001f6a0 clears null bindings. D3D12 null descriptors preserve zero reads.
                     const auto binding=reflected_views[table.stage][i];
                     D3D12_SHADER_RESOURCE_VIEW_DESC desc{};desc.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    if(binding.input==D3D_SIT_STRUCTURED || binding.input==D3D_SIT_BYTEADDRESS) {
+                        if(binding.input==D3D_SIT_STRUCTURED && !binding.stride) return unsupported(__LINE__);
+                        desc.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;desc.Buffer.NumElements=1;
+                        if(binding.input==D3D_SIT_STRUCTURED) {desc.Format=DXGI_FORMAT_UNKNOWN;desc.Buffer.StructureByteStride=binding.stride;}
+                        else {desc.Format=DXGI_FORMAT_R32_TYPELESS;desc.Buffer.Flags=D3D12_BUFFER_SRV_FLAG_RAW;}
+                        self->device->d3d12->CreateShaderResourceView(nullptr,&desc,handle);
+                        continue;
+                    }
                     if(binding.type==D3D_RETURN_TYPE_FLOAT || binding.type==D3D_RETURN_TYPE_UNORM || binding.type==D3D_RETURN_TYPE_SNORM) desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
                     else if(binding.type==D3D_RETURN_TYPE_UINT) desc.Format=DXGI_FORMAT_R32G32B32A32_UINT;
                     else if(binding.type==D3D_RETURN_TYPE_SINT) desc.Format=DXGI_FORMAT_R32G32B32A32_SINT;
@@ -3636,7 +3660,7 @@ HRESULT execute_draw(Context* self,UINT count,UINT first,INT base,bool indexed) 
                 } else return unsupported(__LINE__);
                 self->device->d3d12->CopyDescriptorsSimple(1,handle,view->host,type);
             } else {
-                auto* sampler=self->pixel_samplers[i];if(!sampler) {
+                auto* sampler=table.stage==2 ? self->geometry_samplers[i] : self->pixel_samplers[i];if(!sampler) {
                     if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: draw missing PS sampler slot=%u\n",i);
                     return unsupported(__LINE__);
                 }
@@ -3982,9 +4006,12 @@ void STDMETHODCALLTYPE context_unbind_shader_stage(Context* self, void* shader) 
     }
     context_state<UINT64, 0x218>(self, context_state<UINT64, 0x218>(self) | StageMask);
 }
-void STDMETHODCALLTYPE context_unbind_geometry_shader(Context* self, void* shader) {
-    context_unbind_shader_stage<24, 0x1d0, 0x2800, 8>(self, shader);
-    context_unbind_shader_stage<24, 0x1d8, 0x3000, 8>(self, shader);
+void STDMETHODCALLTYPE context_geometry_shader(Context* self, Shader* shader) {
+    if(!shader) {
+        context_unbind_shader_stage<24, 0x1d0, 0x2800, 8>(self, nullptr);
+        context_unbind_shader_stage<24, 0x1d8, 0x3000, 8>(self, nullptr);
+    }
+    context_shader<2,24>(self,shader);
 }
 void STDMETHODCALLTYPE context_clear_state(Context* self) {
     // 11295 18000d060 preserves the public input-layout cache at +0x178.
@@ -4323,7 +4350,7 @@ void STDMETHODCALLTYPE context_gpu_event(Context* self,UINT event) {
         (void)trap_slot<kind_context,197>(self,event);
     }
 }
-HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UINT subresource,
+HRESULT map_buffer(Context* self, Buffer* resource, UINT subresource,
         D3D11_MAP mode, UINT flags, D3D11_MAPPED_SUBRESOURCE* out) {
     if(graphics_diagnostics.load()) {
         static std::array<std::atomic<UINT>,2> observations{};
@@ -4364,7 +4391,7 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
         }
         auto* renamed=reinterpret_cast<Buffer*>(version.Get());
         void* address=nullptr;
-        const HRESULT hr=map_title_gpu_resource(renamed->gpu,&address);
+        const HRESULT hr=map_title_gpu_resource(renamed->gpu,&address,true);
         if(FAILED(hr)) return hr;
         try {
             DeferredBuffer entry;entry.original=reinterpret_cast<IUnknown*>(resource);entry.version=version;entry.mapped=true;
@@ -4387,11 +4414,25 @@ HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self, Buffer* resource, UI
     out->RowPitch = out->DepthPitch = resource->desc.standard.ByteWidth; // Original 180051690, buffer span from SRD stride/count.
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE context_map_buffer(Context* self,Buffer* resource,UINT subresource,D3D11_MAP mode,UINT flags,D3D11_MAPPED_SUBRESOURCE* out) {
+    const HRESULT hr=map_buffer(self,resource,subresource,mode,flags,out);
+    if(FAILED(hr)) {
+        const bool buffer=resource && resource->vtable==buffer_vtable().data();
+        static std::atomic<UINT> failures{0};
+        if(failures.fetch_add(1)<16) std::fprintf(stderr,"xone-era: Map buffer failed 0x%08lX caller=%p deferred=%u resource=%p subresource=%u mode=%u flags=0x%X usage=%u bind=0x%X cpu=0x%X bytes=%u\n",
+            hr,_ReturnAddress(),self->deferred,resource,subresource,mode,flags,buffer ? resource->desc.standard.Usage : 0,
+            buffer ? resource->desc.standard.BindFlags : 0,buffer ? resource->desc.standard.CPUAccessFlags : 0,buffer ? resource->desc.standard.ByteWidth : 0);
+    }
+    return hr;
+}
 void STDMETHODCALLTYPE context_unmap_buffer(Context* self, Buffer* resource) {
     // 11295 180009c80/1800104f0 take only context/resource; R8 is not a subresource.
     HRESULT hr=E_INVALIDARG;
     if(resource && resource->vtable==buffer_vtable().data() && resource->device==self->device) {
         if(self->deferred) {
+            // UMD 11295 1800104f0 returns immediately for dynamic resources; reference 140560710 is RET.
+            // Retire a real CPU mapping when present, but a redundant Unmap owns no work.
+            if(self->device->legacy && resource->desc.standard.Usage==D3D11_USAGE_DYNAMIC) hr=S_OK;
             auto version=self->buffer_versions.find(resource);
             if(version!=self->buffer_versions.end() && version->second.mapped) {
                 hr=unmap_title_gpu_resource(reinterpret_cast<Buffer*>(version->second.version.Get())->gpu);
@@ -4494,7 +4535,7 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[17] = reinterpret_cast<const void*>(&context_constants<0,17>); // 11295 180010f70, PS constant buffers.
         t[15] = reinterpret_cast<const void*>(&context_map_buffer); // Original 18000ff10, not desktop slot 14.
         t[16] = reinterpret_cast<const void*>(&context_unmap_buffer); // Original 1800104f0.
-        t[24] = reinterpret_cast<const void*>(&context_unbind_geometry_shader);
+        t[24] = reinterpret_cast<const void*>(&context_geometry_shader);
         t[60] = reinterpret_cast<const void*>(&context_unbind_shader_stage<60, 0x1c0, 0x2200, 2>);
         t[64] = reinterpret_cast<const void*>(&context_unbind_shader_stage<64, 0x1c8, 0x2400, 4>);
         // Native 6.2.11295 table: public reference headers differ by one here.
@@ -4511,6 +4552,8 @@ const std::array<const void*, vtable_slots>& legacy_context_vtable() {
         t[153] = reinterpret_cast<const void*>(&context_gpu_wait); // 11295 1800155f0 -> 1800071d0.
         t[209] = reinterpret_cast<const void*>(&context_fast_resources); // 11295 180019f00.
         t[25] = reinterpret_cast<const void*>(&context_resources<0,25>); // 11295 180010860 -> 18001f6a0.
+        t[31] = reinterpret_cast<const void*>(&context_resources<3,31>); // 11295 180010880 -> 18001fa80, GS SRVs.
+        t[32] = reinterpret_cast<const void*>(&context_geometry_samplers); // 11295 18000a930, GS samplers.
         t[9] = reinterpret_cast<const void*>(&context_resources<4,9>); // 11295 180010840 -> 18001f2c0.
         t[67] = reinterpret_cast<const void*>(&context_resources<5,67>); // 11295 1800108e0 -> 180020640.
         t[23] = reinterpret_cast<const void*>(&context_constants<2,23>); // 11295 180011350, GS constant buffers.
@@ -4808,11 +4851,25 @@ struct XgTextureContext {
     std::vector<unsigned char> offsets_state; // 0 unseen, 1 seen once, 2 verified, 3 refused
     struct Plane { UINT64 offset = 0, bytes = 0; } htile, depth, stencil;
     std::array<void*,2> typed_computers{};
+    std::array<std::vector<UINT32>,2> depth_offsets;
+    unsigned char depth_offsets_state = 0;
+    UINT htile_pitch_tiles = 0; // Nonzero only for the linear P4_16x16 HTILE map below.
     ~XgTextureContext() {
         for (auto* typed:typed_computers) if (typed) reinterpret_cast<ULONG (*)(void*)>((*static_cast<void***>(typed))[1])(typed);
         if (computer) reinterpret_cast<ULONG (*)(void*)>((*static_cast<void***>(computer))[1])(computer);
     }
 };
+// HTILE word of 8x8 tile (tx,ty) for a linear HTILE surface with PIPE_CONFIG P4_16x16 and
+// 256-byte pipe interleave: AMD addrlib SiLib::HwlComputeXmaskAddrFromCoord (factor 1, isLinear,
+// MIT). UMD 11295 18009de20 selects linear HTILE; XG 11295 reports the pipe configuration.
+// The per-tile map itself is the public AMD model, not verified against original code.
+UINT64 htile_linear_p4_16x16_word(UINT tx,UINT ty,UINT pitch_tiles) {
+    const auto bit=[](UINT v,UINT i){return (v>>i)&1u;};
+    UINT64 micro=(UINT64(tx>>2)+UINT64(ty>>2)*(pitch_tiles>>2))<<2;
+    micro+=(bit(tx,1)<<1)|(bit(tx,1)^bit(ty,0));
+    const UINT pipe=(bit(tx,0)^bit(ty,0)^bit(tx,1))|((bit(tx,1)^bit(ty,1))<<1);
+    return micro%64+UINT64(pipe)*64+(micro/64)*256; // 2048-bit interleave = 64 words, 4 pipes.
+}
 HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled,
                        UINT subresource, UINT row_pitch, UINT slice_pitch,const TitleGpuClearState* clear) {
     auto* context = static_cast<XgTextureContext*>(opaque);
@@ -4833,38 +4890,96 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
             if(first!=expanded && !context->stencil.bytes && context->bytes_per_block==4 && clear && (clear->known&1) &&
                 ((clear->depth==0 && first==0) || (clear->depth==0x3f800000u && first==0xfffffff0u))) {
                 // GCN ZMask=0 uses DB_DEPTH_CLEAR. Only proven exact 0/1 clears are decoded.
-                for(SIZE_T at=0;at<context->htile.bytes;at+=4) {
+                bool uniform=true;
+                for(SIZE_T at=0;uniform && at<context->htile.bytes;at+=4) {
                     UINT32 word=0;std::memcpy(&word,metadata+at,4);
-                    if(word!=first) return DXGI_ERROR_UNSUPPORTED;
+                    if(word!=first) {
+                        uniform=false;
+                        if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: non-uniform fast-clear HTILE first=0x%08X word=0x%08X offset=%llu clear=0x%08X\n",first,word,UINT64(at),clear->depth);
+                        // Mixed cleared/expanded tiles continue to the per-tile decoder when its map applies.
+                        if(!context->htile_pitch_tiles || context->samples!=1) return DXGI_ERROR_UNSUPPORTED;
+                    }
                 }
-                for(UINT y=0;y<height;++y) for(UINT x=0;x<width*context->samples;++x)
-                    std::memcpy(static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+SIZE_T(x)*4,&clear->depth,4);
-                return S_OK; // The compressed clear is authoritative; base-plane bytes may be stale.
+                if(uniform) {
+                    for(UINT y=0;y<height;++y) for(UINT x=0;x<width*context->samples;++x)
+                        std::memcpy(static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+SIZE_T(x)*4,&clear->depth,4);
+                    return S_OK; // The compressed clear is authoritative; base-plane bytes may be stale.
+                }
             }
         }
-        if (!into_tiled) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
+        // Tiles mixing a proven fast clear (ZMask 0) with expanded tiles: decode per tile.
+        const UINT32 cleared_tag=clear && (clear->known&1) ? (clear->depth==0 ? 0u : clear->depth==0x3f800000u ? 0xfffffff0u : expanded) : expanded;
+        const bool per_tile=!into_tiled && !(clear && clear->bypass_htile) && context->htile_pitch_tiles && cleared_tag!=expanded &&
+            !context->stencil.bytes && context->samples==1;
+        bool any_cleared=false;
+        // A proven fast clear above still wins; otherwise non-depth-block reads take the raw planes.
+        if (!into_tiled && !(clear && clear->bypass_htile)) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
             UINT32 word; std::memcpy(&word,metadata+at,4);
+            if (per_tile && word==cleared_tag) {any_cleared=true;continue;}
             if (word!=expanded) {
                 if(graphics_diagnostics.load()) std::fprintf(stderr,"xone-era: unsupported HTILE word=0x%08X expected expanded=0x%08X offset=%llu\n",word,expanded,UINT64(at));
                 return DXGI_ERROR_UNSUPPORTED;
             }
         }
-        // Validate every offset before touching the destination.
+        // Memoize the original immutable address getter, including every MSAA sample.
+        const std::array<std::vector<UINT32>,2>* tables=nullptr;
+        {
+            std::lock_guard lock(context->offsets_mutex);
+            auto& state=context->depth_offsets_state;
+            const SIZE_T count=SIZE_T(width)*height*context->samples;
+            const UINT planes=context->stencil.bytes ? 2 : 1;
+            if(state==1) {
+                state=3;
+                if(count<=((64u<<20)/sizeof(UINT32))/planes && context->bytes<=UINT32_MAX) try {
+                    std::array<std::vector<UINT32>,2> offsets;
+                    for(UINT plane=0;plane<planes;++plane) {
+                        const auto& bounds=plane ? context->stencil : context->depth;
+                        const UINT element=plane ? 1 : (context->stencil.bytes ? 4 : context->bytes_per_block);
+                        const auto address=reinterpret_cast<Address>((*static_cast<void***>(context->typed_computers[plane]))[4]);
+                        offsets[plane].resize(count);
+                        for(UINT y=0;y<height;++y) for(UINT x=0;x<width;++x) for(UINT sample=0;sample<context->samples;++sample) {
+                            const UINT64 relative=address(context->typed_computers[plane],0,0,x,y,0,sample);
+                            if(relative>bounds.bytes || element>bounds.bytes-relative) return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                            offsets[plane][(SIZE_T(y)*width+x)*context->samples+sample]=UINT32(bounds.offset+relative);
+                        }
+                    }
+                    context->depth_offsets=std::move(offsets);state=2;
+                } catch(const std::bad_alloc&) {} // Keep the original getter when the cache cannot fit.
+            } else if(state==0) state=1;
+            if(state==2) tables=&context->depth_offsets;
+        }
+        // Validate every offset before touching the destination; cached offsets were validated at publication.
         for (UINT pass=0;pass<2;++pass) for (UINT plane=1;plane<(context->stencil.bytes ? 3u : 2u);++plane) {
+            if(!pass && tables) continue;
             const auto& bounds = plane==1 ? context->depth : context->stencil;
             const UINT element = plane==1 ? (context->stencil.bytes ? 4 : context->bytes_per_block) : 1;
             auto* typed = context->typed_computers[plane-1];
             const auto address = reinterpret_cast<Address>((*static_cast<void***>(typed))[4]);
             for (UINT y=0;y<height;++y) for (UINT x=0;x<width;++x) for (UINT sample=0;sample<context->samples;++sample) {
-                const UINT64 relative = address(typed,0,0,x,y,0,sample);
-                if (relative>bounds.bytes || element>bounds.bytes-relative)
-                    return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-                const UINT64 at=bounds.offset+relative;
+                UINT64 at;
+                if(tables) at=(*tables)[plane-1][(SIZE_T(y)*width+x)*context->samples+sample];
+                else {
+                    const UINT64 relative = address(typed,0,0,x,y,0,sample);
+                    if (relative>bounds.bytes || element>bounds.bytes-relative)
+                        return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                    at=bounds.offset+relative;
+                }
                 if (!pass) continue;
                 auto* a = static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+(SIZE_T(x)*context->samples+sample)*context->bytes_per_block+(plane==1 ? 0 : 4);
                 auto* b = static_cast<unsigned char*>(tiled)+at;
                 std::memcpy(into_tiled ? b : a,into_tiled ? a : b,element);
                 if (!into_tiled && plane==2) std::memset(a+1,0,3);
+            }
+        }
+        if (any_cleared) {
+            // Cleared tiles read DB_DEPTH_CLEAR; their base-plane bytes are stale.
+            const UINT element=context->bytes_per_block;
+            const UINT32 value32=clear->depth;const UINT16 value16=clear->depth ? 0xffffu : 0u;
+            for (UINT ty=0;ty<(height+7)/8;++ty) for (UINT tx=0;tx<(width+7)/8;++tx) {
+                UINT32 word;std::memcpy(&word,metadata+SIZE_T(htile_linear_p4_16x16_word(tx,ty,context->htile_pitch_tiles))*4,4);
+                if (word!=cleared_tag) continue;
+                for (UINT y=ty*8;y<(std::min)(ty*8+8,height);++y) for (UINT x=tx*8;x<(std::min)(tx*8+8,width);++x)
+                    std::memcpy(static_cast<unsigned char*>(linear)+SIZE_T(y)*row_pitch+SIZE_T(x)*element,element==4 ? static_cast<const void*>(&value32) : &value16,element);
             }
         }
         if (into_tiled) for (SIZE_T at=0;at<context->htile.bytes;at+=4) {
@@ -5114,6 +5229,18 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
                     return DXGI_ERROR_UNSUPPORTED;
                 descriptor[0]+=static_cast<UINT32>(physical.offset>>8);
             }
+            if (depth_only && samples==1) {
+                // XG 11295 depth-plane record (computer+0xd8+plane*0x1c18): +0x18 pipes, +0x15c PIPE_CONFIG.
+                const auto* record=static_cast<const unsigned char*>(context->computer)+0xd8+0x1c18;
+                UINT pipes=0,pipe_config=0;std::memcpy(&pipes,record+0x18,4);std::memcpy(&pipe_config,record+0x15c,4);
+                // UMD 11295 18009de20: LINEAR when width*height/4 <= 0x80000 for one slice; size = tiles of
+                // width aligned to 128 and height to 64, 4 bytes each, rounded to 16 KiB.
+                const UINT pitch=(width+127)&~127u,rows=(height+63)&~63u;
+                const UINT64 umd_bytes=((UINT64(pitch/8)*(rows/8)*4)+0x3fff)&~UINT64(0x3fff);
+                if (pipes==4 && pipe_config==5 && UINT64(width)*height/4<=0x80000 && pitch==((width+31)&~31u) &&
+                    context->htile.bytes==umd_bytes)
+                    context->htile_pitch_tiles=pitch/8;
+            }
         }
         out.bytes = static_cast<SIZE_T>(bytes); out.alignment = static_cast<SIZE_T>(alignment);
         out.tile_mode=tile_mode;
@@ -5130,6 +5257,7 @@ static HRESULT create_xg_texture_layout_impl(UINT width, UINT height, UINT depth
             out.guest_descriptor=typed_descriptors[0]; out.stencil_descriptor=typed_descriptors[1];
         } else std::memcpy(out.guest_descriptor.data(), static_cast<unsigned char*>(context->computer) + 0x10, sizeof out.guest_descriptor);
         out.context = std::move(context); out.copy = &copy_xg_texture;out.offsets=&verified_xg_offsets;
+        out.demand_coherence=true;
         return S_OK;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }

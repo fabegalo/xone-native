@@ -12,6 +12,8 @@
 #include <vector>
 #include <filesystem>
 #include <cmath>
+#include <thread>
+#include <future>
 
 using Microsoft::WRL::ComPtr;
 using namespace xboxone::era;
@@ -27,10 +29,12 @@ void barrier(ID3D12GraphicsCommandList* list, ID3D12Resource* resource,
     b.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     list->ResourceBarrier(1, &b);
 }
-struct LinearTextureFixture { bool fail_writeback = false; };
+struct LinearTextureFixture { bool fail_writeback = false, fail_upload=false; UINT uploads=0,publications=0; };
 HRESULT linear_texture_copy(void* opaque, bool into_tiled, void* linear, void* canonical, UINT subresource, UINT pitch, UINT slice,const TitleGpuClearState*) {
     if (!opaque || !linear || !canonical || subresource >= 3) return E_INVALIDARG;
     auto* fixture = static_cast<LinearTextureFixture*>(opaque);
+    if(into_tiled)++fixture->publications;else ++fixture->uploads;
+    if(!into_tiled && fixture->fail_upload)return E_FAIL;
     if (into_tiled && fixture->fail_writeback && subresource == 1) return E_FAIL;
     UINT offset = 0;
     for (UINT mip = 0; mip < subresource; ++mip) offset += (std::max)(1u, 8u >> mip) * (std::max)(1u, 4u >> mip) * 4;
@@ -488,6 +492,8 @@ int main(int argc, char** argv) {
         void* cpu_address = storage;
         check(map_title_gpu_resource(pin, &cpu_address) == E_PENDING && !cpu_address,
               "CPU mapping cannot race an active GPU representation");
+        check(map_title_gpu_resource(pin, &cpu_address,true) == E_PENDING && !cpu_address,
+              "blocking maps refuse to wait on their own unsubmitted interval");
         check(begin_title_gpu_buffer(alias, list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
               "simultaneous overlapping shader/copy aliases are explicitly refused");
         check(begin_title_gpu_buffer(counter_pin, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
@@ -512,6 +518,14 @@ int main(int argc, char** argv) {
               "aligned use remains active until the actual completion fence");
         check(begin_title_gpu_buffer(alias, copy_list.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE) == HRESULT_FROM_WIN32(ERROR_BUSY),
               "overlapping use stays blocked after recording writeback and before completion");
+        auto waiting_map=std::async(std::launch::async,[&] {
+            void* address=nullptr;
+            const HRESULT result=map_title_gpu_resource(pin,&address,true);
+            const bool coherent=SUCCEEDED(result) && static_cast<UINT32*>(address)[0]==0xcafebabe;
+            return coherent && unmap_title_gpu_resource(pin)==S_OK;
+        });
+        check(waiting_map.wait_for(std::chrono::milliseconds(30))==std::future_status::timeout,
+              "blocking CPU map stays gated before the producer's real fence and publication");
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!event) return 1;
         hr = queue->Signal(fence.Get(), 5);
@@ -522,6 +536,7 @@ int main(int argc, char** argv) {
         if (!appended) return 1;
         check(complete_title_gpu_resource(pin, fence.Get(), 5) == S_OK && complete_title_gpu_resource(counter_pin, fence.Get(), 5) == S_OK,
               "storage ownership survives completed GPU use for another dispatch");
+        check(waiting_map.get(),"blocking CPU map resumes with coherent bytes after the submission thread retires");
         check(storage[4] == 0xcafebabe && storage[5] == 2 && storage[10] == 7 && storage[11] == 0x78787878 && *counter == 1,
               "native twenty-eight-byte append and hidden counter reach original unaligned CPU bytes");
         bool neighbors = true;
@@ -1417,6 +1432,112 @@ TextureCube<float4> image:register(t0);SamplerState point_sampler:register(s0);R
         check(SUCCEEDED(hr) && sample_fixture(std::move(pool_texture),220,mixed_depth),
             "original depth/stencil planes remain coherent across shared ESRAM and private DDR pages");
         check(!std::memcmp(mixed_depth+8192,pool_alias,65536),"depth/stencil writeback reaches every byte of its real ESRAM alias");
+    }
+    {
+        auto context=std::make_shared<LinearTextureFixture>();
+        TitleTextureLayout tracked;
+        tracked.bytes=128;tracked.alignment=16;tracked.context=context;tracked.copy=linear_texture_copy;tracked.demand_coherence=true;
+        tracked.resource_desc.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tracked.resource_desc.Width=8;tracked.resource_desc.Height=4;
+        tracked.resource_desc.DepthOrArraySize=tracked.resource_desc.MipLevels=1;
+        tracked.resource_desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;tracked.resource_desc.SampleDesc.Count=1;
+        tracked.resource_desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        auto* canonical=pool_memory+2*65536+4096;
+        auto* physical_alias=pool_alias+4096;
+        std::memset(canonical-16,0x5a,160);
+        TitleGpuResource texture,alias;
+        check(acquire_title_gpu_texture(canonical,tracked,device.Get(),texture)==S_OK &&
+            acquire_title_gpu_texture(physical_alias,tracked,device.Get(),alias)==S_OK,"tracked textures share one physical ESRAM page through distinct reservations");
+        const auto submit=[&](TitleGpuResource& resource,UINT64 value) {
+            if(FAILED(end_title_gpu_texture(resource,list.Get())) || FAILED(list->Close()))return false;
+            queue->ExecuteCommandLists(1,lists);
+            HANDLE ready=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!ready)return false;
+            HRESULT result=queue->Signal(fence.Get(),value);
+            if(SUCCEEDED(result))result=fence->SetEventOnCompletion(value,ready);
+            const bool done=SUCCEEDED(result) && WaitForSingleObject(ready,3000)==WAIT_OBJECT_0;CloseHandle(ready);
+            return done && complete_title_gpu_resource(resource,fence.Get(),value)==S_OK;
+        };
+        const auto begin=[&](TitleGpuResource& resource,bool read_only) {
+            return SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.Get(),nullptr)) &&
+                begin_title_gpu_texture(resource,list.Get(),read_only ? D3D12_RESOURCE_STATE_COPY_SOURCE : D3D12_RESOURCE_STATE_COPY_DEST,false,nullptr,read_only)==S_OK;
+        };
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT rows=0;UINT64 row_bytes=0,total=0;
+        device->GetCopyableFootprints(&tracked.resource_desc,0,1,0,&footprint,&rows,&row_bytes,&total);
+        const auto mutate=[&](BYTE value,bool discard=false) {
+            void* mapped=nullptr;if(FAILED(upload->Map(0,nullptr,&mapped)))return false;
+            std::memset(mapped,value,SIZE_T(total));upload->Unmap(0,nullptr);
+            if(discard) {
+                if(FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(),nullptr)) ||
+                    FAILED(begin_title_gpu_texture(texture,list.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,true)))return false;
+                barrier(list.Get(),texture.resource,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_DEST);
+            } else if(!begin(texture,false))return false;
+            D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=upload.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=footprint;
+            to.pResource=texture.resource;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+            if(discard)barrier(list.Get(),texture.resource,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_RENDER_TARGET);
+            return true;
+        };
+        if(!texture.resource || !alias.resource || !mutate(0xa7) || !submit(texture,500))return 1;
+        MEMORY_BASIC_INFORMATION state{};
+        check(VirtualQuery(canonical,&state,sizeof state) && state.Protect==PAGE_NOACCESS && context->publications==0,
+            "completed GPU texture stays resident; canonical reads remain protected until publication");
+        if(!begin(texture,true) || !submit(texture,501))return 1;
+        check(context->uploads==1 && context->publications==0,"unchanged GPU reuse skips CPU upload and publication");
+        BYTE first=0,second=0;
+        std::thread reader([&]{first=*static_cast<volatile BYTE*>(canonical);});
+        std::thread alias_reader([&]{second=*static_cast<volatile BYTE*>(physical_alias);});
+        reader.join();alias_reader.join();
+        check(first==0xa7 && second==0xa7 && context->publications==1 && canonical[-1]==0x5a && canonical[128]==0x5a,
+            "concurrent reads through both aliases publish one complete GPU image and preserve guards");
+        const UINT before_retry=context->uploads;
+        context->fail_upload=true;texture.clear.depth=1;
+        check(!begin(texture,true),"failed layout conversion does not publish new residency metadata");
+        if(FAILED(list->Close()))return 1;
+        context->fail_upload=false;
+        if(!begin(texture,true) || !submit(texture,502))return 1;
+        check(context->uploads==before_retry+2,"retry under changed clear metadata must perform the previously failed conversion");
+        const UINT before_cpu_write=context->uploads;
+        physical_alias[0]=0x39;
+        if(!begin(texture,true))return 1;
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=texture.resource;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        if(!submit(texture,503))return 1;
+        void* mapped=nullptr;if(FAILED(readback->Map(0,nullptr,&mapped)))return 1;
+        check(static_cast<BYTE*>(mapped)[0]==0x39 && static_cast<BYTE*>(mapped)[1]==0xa7 && context->uploads==before_cpu_write+1,
+            "CPU write through a physical alias invalidates the resident texture before the next GPU read");
+        readback->Unmap(0,nullptr);
+        if(!mutate(0xb8) || !submit(texture,504))return 1;
+        wchar_t temporary[MAX_PATH]{},file_name[MAX_PATH]{};
+        if(!GetTempPathW(MAX_PATH,temporary) || !GetTempFileNameW(temporary,L"xgw",0,file_name))return 1;
+        HANDLE file=CreateFileW(file_name,GENERIC_READ|GENERIC_WRITE,0,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
+        if(file==INVALID_HANDLE_VALUE){DeleteFileW(file_name);return 1;}
+        BYTE byte=0x6c;DWORD transferred=0;
+        const auto read_file=reinterpret_cast<decltype(&ReadFile)>(resolve_kernelx({"kernelx.dll","ReadFile",0}));
+        const bool io=WriteFile(file,&byte,1,&transferred,nullptr) && SetFilePointer(file,0,nullptr,FILE_BEGIN)==0 &&
+            read_file && read_file(file,physical_alias,1,&transferred,nullptr) && transferred==1;
+        CloseHandle(file);
+        check(io && canonical[0]==0x6c && canonical[1]==0xb8 && context->publications==2,
+            "kernel I/O flushes pending GPU bytes before writing a protected canonical alias");
+        if(!mutate(0xc9) || !submit(texture,505) || !begin(alias,true))return 1;
+        from.pResource=alias.resource;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        if(!submit(alias,506) || FAILED(readback->Map(0,nullptr,&mapped)))return 1;
+        check(static_cast<BYTE*>(mapped)[0]==0xc9 && context->publications==3,
+            "a distinct GPU representation synchronizes a pending writer through physical identity");
+        readback->Unmap(0,nullptr);
+        if(!mutate(0xda) || !submit(texture,507))return 1;
+        SetLastError(0x13579);
+        const BYTE observed=*static_cast<volatile BYTE*>(physical_alias);
+        check(observed==0xda && GetLastError()==0x13579,"fault-driven publication preserves the guest thread's last error");
+        if(!mutate(0xeb) || !submit(texture,508))return 1;
+        const UINT before_discard=context->publications;
+        if(!mutate(0xfc,true) || !submit(texture,509))return 1;
+        check(context->publications==before_discard,"full overwrite discards obsolete GPU contents without publishing them to CPU");
+        check(release_title_gpu_resource(texture,fence.Get(),509)==S_OK && physical_alias[0]==0xfc &&
+            release_title_gpu_resource(alias,fence.Get(),509)==S_OK,
+            "tracked representations detach after their real fences");
+        check(VirtualQuery(canonical,&state,sizeof state) && state.Protect==PAGE_READWRITE,"last tracked owner restores the guest page protection");
     }
     check(virtual_free(pool_memory, 0, MEM_RELEASE) && virtual_free(pool_alias, 0, MEM_RELEASE), "GPU ESRAM fixtures release every owned reservation after retirement");
     return failures ? 1 : 0;

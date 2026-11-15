@@ -103,6 +103,11 @@ HRESULT STDMETHODCALLTYPE display_name(DisplayInfo* self,HSTRING* out) {
     const auto& name=self->owner->name;
     return WindowsCreateString(name.c_str(),UINT(name.size()),out);
 }
+// AgeGroup 11: the local profile records no age, so UserAgeGroup::Unknown (0).
+HRESULT STDMETHODCALLTYPE display_age_group(DisplayInfo*,INT32* out) {
+    if (!out) return E_POINTER;
+    *out=0;return S_OK;
+}
 // Name of the profile the system UI signed in (console_state.cpp writes it beside the
 // record); without one, or if it is unusable, the session shows a generic local name.
 std::wstring load_profile_name(const std::wstring& root) {
@@ -194,7 +199,8 @@ HRESULT acquire_user(LocalUser** out) {
         static const auto display=[] { auto t=winrt_vtable();t[0]=reinterpret_cast<const void*>(&display_query);
             t[1]=reinterpret_cast<const void*>(&display_retain);t[2]=reinterpret_cast<const void*>(&display_release);t[6]=reinterpret_cast<const void*>(&display_name);
             // IUserDisplayInfo: 6 Gamertag, 9 GameDisplayName; offline both are the local profile name.
-            t[9]=reinterpret_cast<const void*>(&display_name);return t; }();
+            t[9]=reinterpret_cast<const void*>(&display_name);
+            t[11]=reinterpret_cast<const void*>(&display_age_group);return t; }();
         static_cast<WinrtObject&>(user->display)={display.data(),L"Windows.Xbox.System.UserDisplayInfo",iid_display,nullptr};user->display.owner=user.get();
         state.root=root;
         auto* previous=state.user; state.user=user.release();

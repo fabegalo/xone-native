@@ -498,6 +498,15 @@ int main(int argc, char** argv) {
                 hr=layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1024,16384,nullptr);
                 if (SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384,nullptr);
                 check(SUCCEEDED(hr) && samples==restored,"depth/stencil CPU roundtrip preserves every sample's depth bits and stencil byte");
+                for(unsigned repeat=0;repeat<3;++repeat) {
+                    for(SIZE_T at=0;at<samples.size();at+=8) {
+                        samples[at]^=static_cast<unsigned char>(repeat+1);
+                        samples[at+4]^=static_cast<unsigned char>(repeat+17);
+                    }
+                    hr=layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1024,16384,nullptr);
+                    if(SUCCEEDED(hr)) hr=layout.copy(layout.context.get(),false,restored.data(),physical.data()+16,0,1024,16384,nullptr);
+                    check(SUCCEEDED(hr) && samples==restored,"cached depth addresses preserve changed depth/stencil data for every MSAA sample");
+                }
                 check(std::all_of(physical.begin(),physical.begin()+16,[](auto x){return x==0x5a;}) &&
                     std::all_of(physical.end()-16,physical.end(),[](auto x){return x==0x5a;}),"depth/stencil tiling preserves allocation guards");
                 physical[16]^=1;
@@ -618,6 +627,46 @@ int main(int argc, char** argv) {
                 hr=create_xg_texture_layout(dimensions[0],dimensions[1],1,1,format,UINT_MAX,layout,
                     D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE);
                 check(SUCCEEDED(hr) && layout.bytes==bytes,"scalar depth adapter preserves the exact original physical depth allocation");
+                if (SUCCEEDED(hr) && dimensions[0]==1920) {
+                    // Linear P4_16x16 HTILE (UMD 18009de20 LINEAR rule, XG pipe config): hand-computed addrlib words.
+                    const UINT width=1920,height=1080,pitch=width*element,image=pitch*height;
+                    std::vector<unsigned char> base(image),actual(image);
+                    for (SIZE_T i=0;i<base.size();++i) base[i]=static_cast<unsigned char>((i*7+i/4099)|1); // never a clear value
+                    if (element==4) for (SIZE_T i=0;i<base.size();i+=4) {const UINT32 v=0x3f000000u|UINT32(i&0x7fffff);std::memcpy(base.data()+i,&v,4);}
+                    std::vector<unsigned char> physical(layout.bytes,0);
+                    hr=layout.copy(layout.context.get(),true,base.data(),physical.data(),0,pitch,image,nullptr);
+                    check(SUCCEEDED(hr),"scalar depth stores a 1920x1080 base plane with expanded HTILE");
+                    UINT64 metadata_bytes=0,metadata_offset=0;
+                    std::memcpy(&metadata_bytes,raw.data()+32,8);std::memcpy(&metadata_offset,raw.data()+40,8);
+                    check(metadata_bytes==131072,"FH2 depth HTILE matches the UMD linear size formula");
+                    auto* metadata=physical.data()+metadata_offset;
+                    const auto tile_ok=[&](UINT tx,UINT ty,bool kept,UINT32 clear_bits) {
+                        for (UINT y=ty*8;y<ty*8+8 && y<height;++y) for (UINT x=tx*8;x<tx*8+8;++x) {
+                            const SIZE_T at=SIZE_T(y)*pitch+SIZE_T(x)*element;
+                            if (kept ? std::memcmp(actual.data()+at,base.data()+at,element)!=0 :
+                                (element==4 ? std::memcmp(actual.data()+at,&clear_bits,4)!=0 :
+                                 (actual[at]!=(clear_bits ? 0xff : 0) || actual[at+1]!=(clear_bits ? 0xff : 0)))) return false;
+                        }
+                        return true;
+                    };
+                    for (const UINT32 clear_bits:{0u,0x3f800000u}) {
+                        const UINT32 tag=clear_bits ? 0xfffffff0u : 0u, expanded=0xfffc000fu;
+                        for (SIZE_T at=0;at<metadata_bytes;at+=4) std::memcpy(metadata+at,&tag,4);
+                        for (const UINT word:{195u,1841u}) std::memcpy(metadata+SIZE_T(word)*4,&expanded,4); // tiles (2,0), (17,9)
+                        TitleGpuClearState clear{clear_bits,0,1};
+                        hr=layout.copy(layout.context.get(),false,actual.data(),physical.data(),0,pitch,image,&clear);
+                        check(SUCCEEDED(hr) && tile_ok(2,0,true,clear_bits) && tile_ok(17,9,true,clear_bits) && tile_ok(0,0,false,clear_bits) &&
+                            tile_ok(1,0,false,clear_bits) && tile_ok(3,1,false,clear_bits) && tile_ok(239,134,false,clear_bits),
+                            "mixed fast-clear HTILE decodes per tile: expanded tiles keep the base plane, ZMask-0 tiles take the proven clear");
+                        const auto before=actual;
+                        clear.known=0;
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data(),0,pitch,image,&clear)==DXGI_ERROR_UNSUPPORTED && actual==before,
+                            "mixed HTILE without a proven clear value is refused without partial output");
+                        clear.known=1;const UINT32 compressed=0x12345670u;std::memcpy(metadata+64*4,&compressed,4);
+                        check(layout.copy(layout.context.get(),false,actual.data(),physical.data(),0,pitch,image,&clear)==DXGI_ERROR_UNSUPPORTED && actual==before,
+                            "other compressed HTILE states remain refused");
+                    }
+                }
                 if (SUCCEEDED(hr) && dimensions[0]==32) {
                     std::vector<unsigned char> expected(slice),actual(expected.size());
                     for (UINT i=0;i<expected.size();++i) expected[i]=static_cast<unsigned char>(i*13+i/7);
@@ -637,6 +686,15 @@ int main(int argc, char** argv) {
                     physical[16]^=1; const auto before=actual;
                     check(layout.copy(layout.context.get(),false,actual.data(),physical.data()+16,0,row,slice,nullptr)==DXGI_ERROR_UNSUPPORTED && actual==before,
                         "single-sample depth refuses unknown HTILE without publishing partial pixels");
+                    {
+                        TitleGpuClearState sampled{};sampled.bypass_htile=true;
+                        std::vector<unsigned char> raw_read(expected.size(),0xcc);
+                        check(layout.copy(layout.context.get(),false,raw_read.data(),physical.data()+16,0,row,slice,&sampled)==S_OK && raw_read==expected,
+                            "shader-only depth read ignores unknown HTILE and returns the exact base plane, as the GCN 2 texture unit does");
+                        const auto canonical=physical;
+                        check(physical==canonical && layout.copy(layout.context.get(),false,raw_read.data(),physical.data()+16,0,row,slice,nullptr)==DXGI_ERROR_UNSUPPORTED,
+                            "the depth-block path keeps refusing the same unknown HTILE");
+                    }
                     if(format==DXGI_FORMAT_R32_TYPELESS) {
                         UINT64 metadata_bytes=0,metadata_offset=0;
                         std::memcpy(&metadata_bytes,raw.data()+32,8);std::memcpy(&metadata_offset,raw.data()+40,8);
@@ -1063,6 +1121,7 @@ int main(int argc, char** argv) {
                     const auto bind_vertex=reinterpret_cast<BindResources>(vt(context)[25]);
                     const auto bind_pixel=reinterpret_cast<BindResources>(vt(context)[9]);
                     const auto bind_compute=reinterpret_cast<BindResources>(vt(context)[67]);
+                    const auto bind_geometry=reinterpret_cast<BindResources>(vt(context)[31]);
                     void* views[]{raw_view};
                     bind_vertex(context,127,1,views);bind_vertex(context,127,1,views);
                     check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,"legacy VS SRV last-slot binding and rebind retain the same view");
@@ -1073,7 +1132,9 @@ int main(int argc, char** argv) {
                     bind_vertex(context,0,1,views);
                     bind_pixel(context,0,1,views);
                     bind_compute(context,0,1,views);bind_compute(context,0,1,views);
-                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==5,"VS, PS and CS SRV bindings own independent references and balance rebinds");
+                    bind_geometry(context,127,1,views);bind_geometry(context,127,1,views);
+                    bind_geometry(context,128,0,nullptr);
+                    check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==6,"VS, PS, GS and CS SRV bindings own independent references and balance rebinds");
                     reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
                     check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==2,"ClearState releases VS SRVs with the other common bindings");
@@ -1476,6 +1537,37 @@ int main(int argc, char** argv) {
                                     }
                                     check(reinterpret_cast<Count>(vt(shaders[1])[1])(shaders[1])==2,"inline PS replacement releases the prior shader binding");
                                     reinterpret_cast<Count>(vt(shaders[1])[2])(shaders[1]);
+                                    {
+                                        const char* source="cbuffer C:register(b2){float4 shift;} struct V{float4 p:SV_Position;}; [maxvertexcount(3)] void main(triangle V input[3],inout TriangleStream<V> output){for(uint i=0;i<3;i++){V v=input[i];v.p+=shift;output.Append(v);}}";
+                                        Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                        void* geometry=nullptr;void* constants=nullptr;
+                                        const FLOAT shift[]{8,0,0,0};
+                                        struct ConstantDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} desc{{16,D3D11_USAGE_DEFAULT,D3D11_BIND_CONSTANT_BUFFER,0,0,0},0};
+                                        const D3D11_SUBRESOURCE_DATA initial{shift,0,0};
+                                        using MakeBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const ConstantDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                                        const bool made=SUCCEEDED(compile(source,std::strlen(source),nullptr,nullptr,nullptr,"main","gs_5_0",0,0,&code,nullptr)) &&
+                                            reinterpret_cast<CreateShader>(vt(device)[13])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&geometry)==S_OK &&
+                                            reinterpret_cast<MakeBuffer>(vt(device)[3])(device,&desc,&initial,&constants)==S_OK;
+                                        check(made,"geometry fixture creates an original-ABI shader and separate stage constant buffer");
+                                        if(made) {
+                                            using BindShader=void(STDMETHODCALLTYPE*)(void*,void*);
+                                            using BindConstants=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                                            const FLOAT black[]{0,0,0,0};
+                                            reinterpret_cast<BindConstants>(vt(context)[23])(context,2,1,&constants);
+                                            reinterpret_cast<BindShader>(vt(context)[24])(context,geometry);
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                            draw(context,3,0);
+                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
+                                                std::all_of(linear.begin(),linear.end(),[](auto value){return value==0;}),"real GS reads sparse b2 and clips the procedural triangle using geometry-stage visibility");
+                                            reinterpret_cast<BindShader>(vt(context)[24])(context,nullptr);
+                                            draw(context,3,0);
+                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
+                                                std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),"unbinding GS restores original VS/PS pixels");
+                                            reinterpret_cast<BindConstants>(vt(context)[23])(context,2,1,nullptr);
+                                        }
+                                        if(geometry) reinterpret_cast<Count>(vt(geometry)[2])(geometry);
+                                        if(constants) reinterpret_cast<Count>(vt(constants)[2])(constants);
+                                    }
                                     std::memcpy(static_cast<char*>(context)+0x180,&shaders[3],sizeof(void*));
                                     std::memcpy(static_cast<char*>(context)+0x178,&vertex_layout,sizeof vertex_layout);
                                     using BindVertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
@@ -1620,6 +1712,7 @@ int main(int argc, char** argv) {
                                             const auto map=reinterpret_cast<MapDeferred>(vt(mapper)[15]);
                                             const auto unmap=reinterpret_cast<UnmapDeferred>(vt(mapper)[16]);
                                             D3D11_MAPPED_SUBRESOURCE mapped{},nested{};
+                                            unmap(mapper,dynamic);
                                             check(map(mapper,dynamic,0,D3D11_MAP_WRITE_NO_OVERWRITE,0,&mapped)==DXGI_ERROR_INVALID_CALL && !mapped.pData,
                                                   "each deferred list requires WRITE_DISCARD before NO_OVERWRITE");
                                             const HRESULT result=map(mapper,dynamic,0,D3D11_MAP_WRITE_DISCARD,0,&mapped);
@@ -1632,6 +1725,7 @@ int main(int argc, char** argv) {
                                                 check(reinterpret_cast<FinishDeferred>(vt(mapper)[114])(mapper,FALSE,&invalid)==DXGI_ERROR_INVALID_CALL && !invalid,
                                                       "unfinished CPU writes cannot be published as a Command List");
                                                 if(pass) std::memset(mapped.pData,0,sizeof vertices);else std::memcpy(mapped.pData,vertices,sizeof vertices);
+                                                unmap(mapper,dynamic);
                                                 unmap(mapper,dynamic);
                                                 check(map(mapper,dynamic,0,D3D11_MAP_WRITE_NO_OVERWRITE,0,&nested)==S_OK && nested.pData==mapped.pData,
                                                       "deferred NO_OVERWRITE preserves the current version");
@@ -3196,6 +3290,10 @@ int main(int argc, char** argv) {
                         check(refs(sampler)==4,"legacy standard PS sampler binding shares fast state with balanced ownership");
                         bind_samplers(context,0,1,nullptr);bind_samplers(context,16,0,nullptr);
                         check(refs(sampler)==3,"legacy standard PS sampler unbind preserves the two fast-bound slots");
+                        const auto bind_geometry=reinterpret_cast<BindSamplers>(vt(context)[32]);
+                        bind_geometry(context,15,1,sampler_array);bind_geometry(context,15,1,sampler_array);
+                        bind_geometry(context,16,0,nullptr);
+                        check(refs(sampler)==4,"legacy GS sampler last-slot binding retains one independent reference across rebinds");
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
                         check(refs(sampler)==1,"ClearState releases fast sampler bindings without changing the descriptor");
                         check(reinterpret_cast<Count>(vt(sampler)[2])(sampler) == 0, "sampler descriptor slot retired");
@@ -4230,7 +4328,16 @@ int main(int argc, char** argv) {
                             using Name=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING*);
                             check(reinterpret_cast<Name>((*reinterpret_cast<void***>(display))[6])(display,&label)==S_OK && text(label)==L"Local Player",
                                   "offline display label uses the reference's HSTRING ABI without claiming an online identity");
-                            WindowsDeleteString(label);display->Release();
+                            WindowsDeleteString(label);label=nullptr;
+                            check(reinterpret_cast<Name>((*reinterpret_cast<void***>(display))[9])(display,&label)==S_OK && text(label)==L"Local Player",
+                                  "GameDisplayName slot 9 answers the same local profile name");
+                            WindowsDeleteString(label);
+                            using Age=HRESULT(STDMETHODCALLTYPE*)(void*,INT32*);
+                            INT32 age=-1;
+                            check(reinterpret_cast<Age>((*reinterpret_cast<void***>(display))[11])(display,&age)==S_OK && age==0 &&
+                                  reinterpret_cast<Age>((*reinterpret_cast<void***>(display))[11])(display,nullptr)==E_POINTER,
+                                  "AgeGroup slot 11 reports Unknown for a local profile without recorded age");
+                            display->Release();
                         }
                     }
                     constexpr GUID iterable_iid{0x1e1813fd,0xf62e,0x5198,{0xb2,0x07,0x9a,0xa8,0x77,0x14,0x7c,0x08}};
@@ -4396,6 +4503,23 @@ int main(int argc, char** argv) {
                 virtual HRESULT STDMETHODCALLTYPE SetWindow(IInspectable* window) {
                     owned_window = core_window_hwnd(window);
                     check(!IsWindowVisible(core_window_hwnd(window)), "window stays hidden during view setup");
+                    IAgileObject* agile=nullptr;
+                    check(window->QueryInterface(__uuidof(IAgileObject),reinterpret_cast<void**>(&agile))==S_OK && agile,
+                        "CoreWindow exposes the standard COM agility marker without inventing an Xbox interface");
+                    if(agile) {
+                        std::thread worker([&] {
+                            constexpr GUID iid_window{0x79b9d5f2,0x879e,0x4b89,{0xb7,0x98,0x79,0xe4,0x75,0x98,0x03,0x0c}};
+                            IInspectable* same=nullptr;
+                            check(agile->QueryInterface(iid_window,reinterpret_cast<void**>(&same))==S_OK && same==window,
+                                "agile window queries preserve the one session identity across threads");
+                            if(same) {
+                                auto** table=*reinterpret_cast<void***>(same);
+                                check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*)>(table[11])(same)==RPC_E_WRONG_THREAD,
+                                    "the agility marker does not remove Activate thread affinity");
+                                same->Release();
+                            }
+                        });worker.join();agile->Release();
+                    }
                     check(core_window_hwnd(nullptr) && core_window_hwnd(nullptr) == core_window_hwnd(window),
                         "Xbox null-window swapchain binding selects the same owned local window");
                     constexpr GUID iid_window_static{0x4d239005,0x3c2a,0x41b1,{0x90,0x22,0x53,0x6b,0xb9,0xcf,0x93,0xb1}};

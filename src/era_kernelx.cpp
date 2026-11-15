@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <climits>
 #include <iterator>
@@ -36,7 +38,7 @@ constexpr std::string_view forwarded[]{
     "GetFileAttributesExW", "GetFileInformationByHandleEx", "GetFileSizeEx", "GetOverlappedResultEx",
     "GetQueuedCompletionStatus", "GetThreadPriority", "GetThreadTimes", "LocaleNameToLCID",
     "MultiByteToWideChar", "OpenThread", "PostQueuedCompletionStatus", "RaiseException",
-    "ReadFile", "SetFilePointer", "SetFilePointerEx", "WaitForMultipleObjectsEx", "WideCharToMultiByte",
+    "SetFilePointer", "SetFilePointerEx", "WaitForMultipleObjectsEx", "WideCharToMultiByte",
     "AcquireSRWLockExclusive", "AcquireSRWLockShared", "CloseHandle", "CreateEventW", "CreateMutexW",
     "CreateSemaphoreW", "CreateThread", "DecodePointer", "DeleteCriticalSection", "DuplicateHandle",
     "EncodePointer", "EnterCriticalSection", "EventRegister", "EventUnregister", "EventWrite", "ExitProcess",
@@ -59,7 +61,9 @@ constexpr std::string_view forwarded[]{
 
 std::atomic<HMODULE> title_module{nullptr};
 std::mutex storage_mutex;
-std::mutex memory_mutex;
+std::recursive_mutex memory_mutex;
+std::condition_variable_any memory_changed;
+using WatchKey = std::pair<std::uintptr_t,SIZE_T>;
 struct GpuWindow {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     unsigned owners = 0;
@@ -84,8 +88,23 @@ struct GpuWindow {
     std::unique_ptr<TextureLayoutTransfer> layout_transfer;
     bool gpu_layout_active = false, gpu_layout_refused = false;
     std::array<bool, 512> physical_pages{};
+    bool tracked = false, resident = false, pending_cpu = false, reuse = false;
+    DWORD active_thread = 0;
+    TitleGpuResource tracked_resource;
+    TitleGpuClearState resident_clear, active_clear;
+    std::vector<WatchKey> watch_keys;
+    struct Segment { std::shared_ptr<void> view; SIZE_T offset, length, logical; };
+    std::vector<Segment> segments;
 };
 using GpuWindows = std::multimap<std::pair<SIZE_T, SIZE_T>, GpuWindow>;
+struct CoherenceReadback {
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::Wrappers::Event completed{CreateEventW(nullptr,FALSE,FALSE,nullptr)};
+    UINT64 value = 0;
+};
 struct GpuBacking {
     SIZE_T size;
     DWORD guest_protection = 0;
@@ -96,6 +115,8 @@ struct GpuBacking {
     Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
     Microsoft::WRL::ComPtr<IUnknown> device;
     Microsoft::WRL::Wrappers::FileHandle mapping{};
+    std::shared_ptr<void> mirror;
+    std::unique_ptr<CoherenceReadback> coherence;
     D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON;
     GpuWindows windows; // Canonical range; independent native aliases share ownership gates.
 };
@@ -114,6 +135,11 @@ struct EsramPool {
     Microsoft::WRL::Wrappers::FileHandle mapping;
     std::array<PhysicalGate, 512> pages{};
 } esram;
+HRESULT reset_gpu_tracking();
+HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write);
+HRESULT flush_gpu_window(GpuWindow& window);
+void detach_gpu_tracking(GpuWindow& window);
+void forget_tracked_addresses(std::uintptr_t start,SIZE_T size);
 constexpr UINT64 title_budget = 0x140000000ull;
 UINT64 title_committed = 0; // Guarded by memory_mutex, including retiring allocations.
 
@@ -321,11 +347,15 @@ bool coalesce_placeholder(void* address, SIZE_T size) {
     return VirtualFree(address, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
 }
 bool unmap_graphics_backing(std::uintptr_t address, GpuBacking& backing) {
+    const HRESULT synchronized=reset_gpu_tracking();
+    if(FAILED(synchronized)){SetLastError(ERROR_BUSY);return false;}
     backing.buffer.Reset(); backing.heap.Reset(); backing.device.Reset();
     const auto unmap = host_unmap2();
     if (!unmap) { SetLastError(ERROR_NOT_SUPPORTED); return false; }
     if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(address), MEM_PRESERVE_PLACEHOLDER)) return false;
+    forget_tracked_addresses(address,backing.size);
     backing.mapping.Close();
+    backing.mirror.reset();
     return true;
 }
 
@@ -515,7 +545,7 @@ BOOL WINAPI era_VirtualFree(LPVOID address, SIZE_T size, DWORD type) {
         title_committed -= released;
         region->second.physical_bytes -= released;
     }
-    if (ok && type == MEM_RELEASE) title_regions.erase(region);
+    if (ok && type == MEM_RELEASE) {forget_tracked_addresses(region->first,region->second.size);title_regions.erase(region);}
     return ok;
 }
 std::wstring storage_root; // Full path ending in '\'; empty = no writable storage.
@@ -690,7 +720,18 @@ HANDLE WINAPI era_CreateFile2(LPCWSTR path, DWORD access, DWORD share, DWORD dis
 
 BOOL WINAPI era_WriteFile(HANDLE file, LPCVOID buffer, DWORD size, LPDWORD written, LPOVERLAPPED operation) {
     if (!writable_handle(file)) return FALSE;
+    auto hr=cpu_memory_access(buffer,size,false);
+    if(SUCCEEDED(hr) && written)hr=cpu_memory_access(written,sizeof *written,true);
+    if(SUCCEEDED(hr) && operation)hr=cpu_memory_access(operation,sizeof *operation,true);
+    if(FAILED(hr)){SetLastError(hr==E_PENDING ? ERROR_BUSY : HRESULT_FACILITY(hr)==FACILITY_WIN32 ? HRESULT_CODE(hr) : ERROR_GEN_FAILURE);return FALSE;}
     return WriteFile(file, buffer, size, written, operation);
+}
+BOOL WINAPI era_ReadFile(HANDLE file,LPVOID buffer,DWORD size,LPDWORD read,LPOVERLAPPED operation) {
+    auto hr=cpu_memory_access(buffer,size,true);
+    if(SUCCEEDED(hr) && read)hr=cpu_memory_access(read,sizeof *read,true);
+    if(SUCCEEDED(hr) && operation)hr=cpu_memory_access(operation,sizeof *operation,true);
+    if(FAILED(hr)){SetLastError(hr==E_PENDING ? ERROR_BUSY : HRESULT_FACILITY(hr)==FACILITY_WIN32 ? HRESULT_CODE(hr) : ERROR_GEN_FAILURE);return FALSE;}
+    return ReadFile(file,buffer,size,read,operation);
 }
 
 BOOL WINAPI era_FlushFileBuffers(HANDLE file) {
@@ -846,6 +887,9 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
             // The entire retained pool is committed once; virtual aliases cost nothing.
             title_committed += esram_bytes;
         }
+        if(std::any_of(changes.begin(),changes.end(),[](const auto& change){return change.before!=change.after;})) {
+            const auto hr=reset_gpu_tracking();if(FAILED(hr))return hr;
+        }
         DWORD failure = 0;
         for (auto& change : changes) {
             if (change.before == change.after) continue;
@@ -893,6 +937,7 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
             if (change.after == UINT_MAX) region->second.commits.erase(change.address);
             else {
                 if (change.before == UINT_MAX) region->second.commits.insert(staged.extract(change.address));
+                if(change.before!=change.after) region->second.commits.at(change.address).mirror.reset();
                 auto& commit = region->second.commits.at(change.address);
                 commit.esram_page = change.after; commit.guest_protection = PAGE_READWRITE;
             }
@@ -1111,6 +1156,183 @@ void gpu_transition(ID3D12GraphicsCommandList* list, ID3D12Resource* resource, D
     barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, before, after};
     list->ResourceBarrier(1, &barrier);
 }
+struct WatchedPage {
+    std::vector<std::uintptr_t> aliases;
+    std::vector<GpuWindow*> windows;
+    DWORD protection = PAGE_READWRITE;
+};
+std::map<WatchKey,WatchedPage> watched_physical;
+std::map<std::uintptr_t,WatchKey> watched_virtual;
+HRESULT protect_watched(WatchedPage& page,DWORD protection) {
+    if(page.protection==protection)return S_OK;
+    for(auto address:page.aliases) {
+        DWORD before=0;
+        if(!VirtualProtect(reinterpret_cast<void*>(address),4096,protection,&before)) {
+            const DWORD error=GetLastError();page.protection=0;return HRESULT_FROM_WIN32(error);
+        }
+    }
+    page.protection=protection;
+    return S_OK;
+}
+HRESULT seal_watched(WatchedPage& page) {
+    bool inaccessible=false;
+    for(auto* window:page.windows) inaccessible|=window->pending_cpu || (window->active && !window->read_only);
+    return protect_watched(page,inaccessible ? PAGE_NOACCESS : PAGE_READONLY);
+}
+HRESULT access_watched(WatchedPage& page,bool write) {
+    for(auto* window:page.windows) {
+        if(window->active || window->preparing || window->completing) return E_PENDING;
+        const HRESULT hr=flush_gpu_window(*window);if(FAILED(hr))return hr;
+    }
+    if(write) {
+        for(auto* window:page.windows) window->resident=false;
+    }
+    return protect_watched(page,write ? PAGE_READWRITE : PAGE_READONLY);
+}
+LONG CALLBACK gpu_memory_fault(EXCEPTION_POINTERS* exception) {
+    struct LastError {DWORD value=GetLastError();~LastError(){SetLastError(value);}} last_error;
+    static thread_local bool handling=false;
+    if(handling)return EXCEPTION_CONTINUE_SEARCH;
+    const auto* record=exception->ExceptionRecord;
+    if(record->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || record->NumberParameters<2 || record->ExceptionInformation[0]>1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const auto address=std::uintptr_t(record->ExceptionInformation[1])&~std::uintptr_t(4095);
+    try {
+        std::unique_lock lock(memory_mutex);
+        auto entry=watched_virtual.find(address);if(entry==watched_virtual.end())return EXCEPTION_CONTINUE_SEARCH;
+        struct Handling {bool& value;Handling(bool& v):value(v){value=true;}~Handling(){value=false;}} guard(handling);
+        const auto retired_fault=[&] {
+            MEMORY_BASIC_INFORMATION info{};
+            return VirtualQuery(reinterpret_cast<void*>(address),&info,sizeof info) && info.State==MEM_COMMIT &&
+                (info.Protect==PAGE_READWRITE || (record->ExceptionInformation[0]==0 && info.Protect==PAGE_READONLY)) ?
+                EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+        };
+        // A second fault may already be queued when another thread retires the watch.
+        if(!entry->second.first)return retired_fault();
+        const auto ready=[&] {
+            const auto current=watched_virtual.find(address);if(current==watched_virtual.end() || !current->second.first)return true;
+            for(auto* window:watched_physical.at(current->second).windows)
+                if(window->active || window->preparing || window->completing)return false;
+            return true;
+        };
+        if(!ready()) {
+            for(auto* window:watched_physical.at(entry->second).windows)
+                if(window->active_thread==GetCurrentThreadId())return EXCEPTION_CONTINUE_SEARCH;
+            if(!memory_changed.wait_for(lock,std::chrono::seconds(5),ready))return EXCEPTION_CONTINUE_SEARCH;
+            entry=watched_virtual.find(address);if(entry==watched_virtual.end())return EXCEPTION_CONTINUE_SEARCH;
+            if(!entry->second.first)return retired_fault();
+        }
+        const HRESULT hr=access_watched(watched_physical.at(entry->second),record->ExceptionInformation[0]==1);
+        if(FAILED(hr)) {
+            std::fprintf(stderr,"xone-era: tracked CPU access failed 0x%08lX at %p\n",hr,reinterpret_cast<void*>(address));
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    } catch(...) { return EXCEPTION_CONTINUE_SEARCH; }
+}
+HRESULT initialize_gpu_tracking(TitleGpuResource& resource,GpuWindow& window) try {
+    if(window.tracked)return S_OK;
+    if(!window.texture.context || !window.texture.demand_coherence)return S_FALSE;
+    const auto base=reinterpret_cast<std::uintptr_t>(resource.allocation);
+    auto region=title_regions.upper_bound(base);if(region==title_regions.begin())return E_INVALIDARG;--region;
+    if(region->second.xmem)return S_FALSE; // Ordinary allocations retain the existing synchronous path.
+    struct Handler {
+        PVOID token=AddVectoredExceptionHandler(1,gpu_memory_fault);
+        ~Handler(){if(token)RemoveVectoredExceptionHandler(token);}
+    };
+    static Handler handler;
+    if(!handler.token)return HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY);
+    const auto start=base+resource.canonical_offset,end=start+resource.size;
+    window.tracked_resource=resource;
+    window.tracked=true;
+    for(auto cursor=start;cursor<end;) {
+        auto commit=region->second.commits.upper_bound(cursor);if(commit==region->second.commits.begin()){detach_gpu_tracking(window);return E_INVALIDARG;}--commit;
+        auto& backing=commit->second;
+        const SIZE_T inside=cursor-commit->first;
+        if(inside>=backing.size){detach_gpu_tracking(window);return E_INVALIDARG;}
+        const bool esram_backing=backing.esram_page!=UINT_MAX;
+        if(!backing.mirror) {
+            const UINT64 offset=esram_backing ? UINT64(backing.esram_page)*esram_page_bytes : 0;
+            HANDLE mapping=esram_backing ? esram.mapping.Get() : backing.mapping.Get();
+            void* view=MapViewOfFile(mapping,FILE_MAP_ALL_ACCESS,DWORD(offset>>32),DWORD(offset),backing.size);
+            if(!view){const DWORD error=GetLastError();detach_gpu_tracking(window);return HRESULT_FROM_WIN32(error);}
+            backing.mirror=std::shared_ptr<void>(view,[](void* p){UnmapViewOfFile(p);});
+        }
+        const SIZE_T length=(std::min)(SIZE_T(end-cursor),backing.size-inside);
+        window.segments.push_back({backing.mirror,inside,length,SIZE_T(cursor-start)});
+        for(auto page=cursor&~std::uintptr_t(4095);page<cursor+length;page+=4096) {
+            const SIZE_T physical=esram_backing ? SIZE_T(backing.esram_page)*esram_page_bytes+page-commit->first : page-commit->first;
+            const WatchKey key{reinterpret_cast<std::uintptr_t>(esram_backing ? static_cast<void*>(&esram) : static_cast<void*>(&backing)),physical};
+            // Commit boundaries are page-aligned; physical_pages already rejects repeated ESRAM pages.
+            window.watch_keys.push_back(key);
+            auto& watch=watched_physical[key];
+            if(watch.aliases.empty()) {
+                if(esram_backing) {
+                    for(auto& [reservation,parent]:title_regions) for(auto& [alias,span]:parent.commits)
+                        if(span.esram_page==backing.esram_page)watch.aliases.push_back(alias+(page-commit->first));
+                } else watch.aliases.push_back(page);
+                for(auto alias:watch.aliases)watched_virtual.insert_or_assign(alias,key);
+            }
+            watch.windows.push_back(&window);
+            const HRESULT hr=seal_watched(watch);if(FAILED(hr)){detach_gpu_tracking(window);return hr;}
+        }
+        cursor+=length;
+    }
+    return S_OK;
+} catch(const std::bad_alloc&) {detach_gpu_tracking(window);return E_OUTOFMEMORY;}
+void detach_gpu_tracking(GpuWindow& window) {
+    for(const auto& key:window.watch_keys) {
+        auto found=watched_physical.find(key);if(found==watched_physical.end())continue;
+        auto& page=found->second;std::erase(page.windows,&window);
+        if(page.windows.empty()) {
+            if(FAILED(protect_watched(page,PAGE_READWRITE)))__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+            for(auto alias:page.aliases)watched_virtual.at(alias)={};
+            watched_physical.erase(found);
+        } else if(FAILED(seal_watched(page)))__fastfail(FAST_FAIL_FATAL_APP_EXIT);
+    }
+    window.watch_keys.clear();window.segments.clear();window.tracked=false;window.resident=false;window.pending_cpu=false;
+}
+HRESULT reset_gpu_tracking() {
+    for(auto& [key,page]:watched_physical)for(auto* window:page.windows)
+        if(window->active || window->preparing || window->completing)return E_PENDING;
+    for(auto& [key,page]:watched_physical)for(auto* window:page.windows){const auto hr=flush_gpu_window(*window);if(FAILED(hr))return hr;}
+    for(auto& [key,page]:watched_physical){const auto hr=protect_watched(page,PAGE_READWRITE);if(FAILED(hr))return hr;}
+    for(auto& [key,page]:watched_physical)for(auto* window:page.windows){window->tracked=false;window->resident=false;window->watch_keys.clear();window->segments.clear();}
+    for(auto& [address,key]:watched_virtual)key={};
+    watched_physical.clear();memory_changed.notify_all();return S_OK;
+}
+void forget_tracked_addresses(std::uintptr_t start,SIZE_T size) {
+    for(auto entry=watched_virtual.lower_bound(start);entry!=watched_virtual.end() && entry->first-start<size;)
+        entry=watched_virtual.erase(entry);
+}
+HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write) {
+    if(!size)return S_OK;
+    const auto start=reinterpret_cast<std::uintptr_t>(address);if(size>UINTPTR_MAX-start)return E_INVALIDARG;
+    std::lock_guard lock(memory_mutex);
+    auto current=watched_virtual.lower_bound(start&~std::uintptr_t(4095));
+    for(;current!=watched_virtual.end() && current->first<start+size;++current) {
+        if(!current->second.first)continue;
+        const auto hr=access_watched(watched_physical.at(current->second),write);if(FAILED(hr))return hr;
+    }
+    return S_OK;
+}
+HRESULT prepare_gpu_tracking(TitleGpuResource& resource,GpuWindow& window,const TitleGpuClearState& clear,bool discard) {
+    const auto hr=initialize_gpu_tracking(resource,window);if(hr!=S_OK)return hr;
+    for(const auto& key:window.watch_keys)for(auto* alias:watched_physical.at(key).windows)
+        if(alias!=&window){const auto flushed=flush_gpu_window(*alias);if(FAILED(flushed))return flushed;}
+    window.reuse=window.resident && window.resident_clear.depth==clear.depth && window.resident_clear.stencil==clear.stencil &&
+        window.resident_clear.known==clear.known && window.resident_clear.bypass_htile==clear.bypass_htile;
+    if(!window.reuse && !discard){const auto flushed=flush_gpu_window(window);if(FAILED(flushed))return flushed;}
+    for(const auto& key:window.watch_keys){const auto sealed=seal_watched(watched_physical.at(key));if(FAILED(sealed))return sealed;}
+    window.active_clear=clear;return S_OK;
+}
+void mirror_copy(GpuWindow& window,void* data,bool into_mirror) {
+    for(const auto& span:window.segments) {
+        auto* mirror=static_cast<unsigned char*>(span.view.get())+span.offset;
+        auto* linear=static_cast<unsigned char*>(data)+span.logical;
+        std::memcpy(into_mirror ? mirror : linear,into_mirror ? linear : mirror,span.length);
+    }
+}
 }
 
 static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,
@@ -1153,6 +1375,7 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     for (UINT page = 0; page < window->physical_pages.size(); ++page)
         if (window->physical_pages[page]) esram.pages[page].gpu = &buffer;
     window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;
+    window->active_thread=GetCurrentThreadId();
     return S_OK;
 }
 
@@ -1316,6 +1539,118 @@ static void interleave_samples(GpuWindow& window, void* mapped, bool into_array)
     }
 }
 
+namespace {
+HRESULT record_texture_readback(GpuWindow* window,ID3D12GraphicsCommandList* list,D3D12_RESOURCE_STATES before) {
+    if(window->gpu_layout_active) {
+        gpu_transition(list,window->resource.Get(),before,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        window->layout_transfer->retile(list,window->resource.Get());
+        gpu_transition(list,window->resource.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+        return S_OK;
+    }
+    auto* copy_source = window->sample_array ? window->sample_array.Get() : window->resource.Get();
+    if (window->sample_array) {
+        gpu_transition(list, window->resource.Get(), before, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto target = window->sample_rtv->GetCPUDescriptorHandleForHeapStart();
+        auto source = window->sample_srv->GetGPUDescriptorHandleForHeapStart(); source.ptr += window->sample_srv_step;
+        const auto& desc = window->texture.resource_desc;
+        for (UINT sample = 0; sample < desc.SampleDesc.Count; ++sample) {
+            const HRESULT hr = window->sample_transfer->record(list, window->sample_srv.Get(), source, target,
+                UINT(desc.Width), desc.Height, sample, false);
+            if (FAILED(hr)) return hr;
+            target.ptr += window->sample_rtv_step;
+        }
+        gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    } else gpu_transition(list, window->resource.Get(), before, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for (UINT i = 0; i < window->footprints.size(); ++i) {
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = copy_source; source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = i;
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = window->readback.Get(); destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        destination.PlacedFootprint = window->footprints[i];
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    }
+    gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (window->sample_array) gpu_transition(list, window->resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    return S_OK;
+}
+
+HRESULT wait_coherence_copy(CoherenceReadback& copy) {
+    auto completed=copy.fence->GetCompletedValue();
+    if(completed==UINT64_MAX)return DXGI_ERROR_DEVICE_REMOVED;
+    if(completed>=copy.value)return S_OK;
+    HRESULT hr=copy.fence->SetEventOnCompletion(copy.value,copy.completed.Get());
+    if(FAILED(hr))return hr;
+    if(WaitForSingleObject(copy.completed.Get(),5000)!=WAIT_OBJECT_0)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    completed=copy.fence->GetCompletedValue();
+    return completed==UINT64_MAX ? DXGI_ERROR_DEVICE_REMOVED : completed>=copy.value ? S_OK : E_PENDING;
+}
+HRESULT capture_gpu_image(GpuWindow& window) {
+    auto* backing=gpu_backing(window.tracked_resource);if(!backing)return E_INVALIDARG;
+    if(!backing->coherence) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        auto hr=window.resource->GetDevice(IID_PPV_ARGS(&device));if(FAILED(hr))return hr;
+        auto copy=std::make_unique<CoherenceReadback>();
+        if(!copy->completed.IsValid())return HRESULT_FROM_WIN32(GetLastError());
+        const D3D12_COMMAND_QUEUE_DESC desc{D3D12_COMMAND_LIST_TYPE_DIRECT,0,D3D12_COMMAND_QUEUE_FLAG_NONE,0};
+        hr=device->CreateCommandQueue(&desc,IID_PPV_ARGS(&copy->queue));
+        if(SUCCEEDED(hr))hr=device->CreateCommandAllocator(desc.Type,IID_PPV_ARGS(&copy->allocator));
+        if(SUCCEEDED(hr))hr=device->CreateCommandList(0,desc.Type,copy->allocator.Get(),nullptr,IID_PPV_ARGS(&copy->list));
+        if(SUCCEEDED(hr))hr=copy->list->Close();
+        if(SUCCEEDED(hr))hr=device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&copy->fence));
+        if(FAILED(hr))return hr;
+        backing->coherence=std::move(copy);
+    }
+    auto& copy=*backing->coherence;
+    auto hr=wait_coherence_copy(copy);if(FAILED(hr))return hr;
+    hr=copy.allocator->Reset();if(SUCCEEDED(hr))hr=copy.list->Reset(copy.allocator.Get(),nullptr);
+    if(SUCCEEDED(hr))hr=record_texture_readback(&window,copy.list.Get(),D3D12_RESOURCE_STATE_COMMON);
+    if(SUCCEEDED(hr))hr=copy.list->Close();if(FAILED(hr))return hr;
+    ID3D12CommandList* lists[]{copy.list.Get()};copy.queue->ExecuteCommandLists(1,lists);
+    ++copy.value;hr=copy.queue->Signal(copy.fence.Get(),copy.value);if(FAILED(hr))return hr;
+    return wait_coherence_copy(copy);
+}
+HRESULT flush_gpu_window(GpuWindow& window) {
+    if(!window.pending_cpu)return S_OK;
+    if(window.completing)return E_PENDING;
+    window.completing=true;
+    HRESULT hr=S_OK;
+    std::vector<unsigned char> commit;
+    try {
+        hr=capture_gpu_image(window);
+        if(FAILED(hr)){window.completing=false;return hr;}
+        commit.resize(window.tracked_resource.size);mirror_copy(window,commit.data(),false);
+    }
+    catch(const std::bad_alloc&){window.completing=false;return E_OUTOFMEMORY;}
+    auto* readback=window.gpu_layout_active ? window.layout_transfer->readback() : window.readback.Get();
+    const D3D12_RANGE read{0,window.gpu_layout_active ? window.tracked_resource.size : SIZE_T(window.staging_bytes)};
+    void* mapped=nullptr;
+    hr=readback->Map(0,&read,&mapped);
+    if(SUCCEEDED(hr)) {
+        try {
+            if(window.gpu_layout_active)std::memcpy(commit.data(),mapped,commit.size());
+            else if(window.sample_array) {
+                interleave_samples(window,mapped,false);
+                const auto& desc=window.texture.resource_desc;
+                const UINT pitch=UINT(desc.Width)*desc.SampleDesc.Count*sample_pixel_bytes(desc.Format);
+                hr=window.texture.copy(window.texture.context.get(),true,window.sample_linear.data(),commit.data(),0,pitch,pitch*desc.Height,nullptr);
+            } else for(UINT i=0;i<window.footprints.size();++i) {
+                const auto& footprint=window.footprints[i];
+                hr=window.texture.copy(window.texture.context.get(),true,static_cast<unsigned char*>(mapped)+footprint.Offset,commit.data(),i,
+                    footprint.Footprint.RowPitch,footprint.Footprint.RowPitch*window.rows[i],nullptr);
+                if(FAILED(hr))break;
+            }
+        } catch(const std::bad_alloc&){hr=E_OUTOFMEMORY;}
+        const D3D12_RANGE no_write{0,0};readback->Unmap(0,&no_write);
+    }
+    if(SUCCEEDED(hr)) {
+        mirror_copy(window,commit.data(),true);window.pending_cpu=false;
+        for(const auto& key:window.watch_keys){hr=seal_watched(watched_physical.at(key));if(FAILED(hr))break;}
+    }
+    window.completing=false;memory_changed.notify_all();return hr;
+}
+}
 static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,const TitleGpuClearState& clear,bool discard_contents,
                                      const D3D12_SUBRESOURCE_DATA* input,bool gpu_allowed) {
     try {
@@ -1439,7 +1774,26 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
     }
     window->preparing = true;
     auto* canonical = static_cast<unsigned char*>(texture.allocation) + texture.canonical_offset;
-    const auto clear=texture.clear;
+    auto clear=texture.clear;
+    clear.bypass_htile=(window->texture.resource_desc.Flags&D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+        read_only && !(state&D3D12_RESOURCE_STATE_DEPTH_READ);
+    hr=prepare_gpu_tracking(texture,*window,clear,discard_contents && !input);
+    if(FAILED(hr)){release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();window->preparing=false;memory_changed.notify_all();return hr;}
+    if(window->tracked && input) {
+        hr=flush_gpu_window(*window);
+        if(FAILED(hr)){release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();window->preparing=false;memory_changed.notify_all();return hr;}
+    }
+    if(window->tracked && window->reuse && !discard_contents && !input) {
+        window->preparing=false;
+        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COMMON,state);
+        return S_OK;
+    }
+    std::vector<unsigned char> incoming;
+    if(window->tracked) try {
+        incoming.resize(texture.size);mirror_copy(*window,incoming.data(),false);canonical=incoming.data();
+    } catch(const std::bad_alloc&) {
+        release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();window->preparing=false;memory_changed.notify_all();return E_OUTOFMEMORY;
+    }
     // The ownership gate keeps this range alive and exclusive while CPU layout
     // conversion runs; original helpers may call allocation hooks themselves.
     lock.unlock();
@@ -1495,40 +1849,13 @@ HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandLi
         gpu_transition(list,texture.resource,window->state,D3D12_RESOURCE_STATE_COMMON);
         window->copied_back=true;return S_OK;
     }
-    if(window->gpu_layout_active) {
-        gpu_transition(list,texture.resource,window->state,D3D12_RESOURCE_STATE_COPY_SOURCE);
-        window->layout_transfer->retile(list,texture.resource);
-        gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+    if(window->tracked) {
+        gpu_transition(list,texture.resource,window->state,D3D12_RESOURCE_STATE_COMMON);
         window->copied_back=true;return S_OK;
     }
-    auto* copy_source = window->sample_array ? window->sample_array.Get() : texture.resource;
-    if (window->sample_array) {
-        gpu_transition(list, texture.resource, window->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        auto target = window->sample_rtv->GetCPUDescriptorHandleForHeapStart();
-        auto source = window->sample_srv->GetGPUDescriptorHandleForHeapStart(); source.ptr += window->sample_srv_step;
-        const auto& desc = window->texture.resource_desc;
-        for (UINT sample = 0; sample < desc.SampleDesc.Count; ++sample) {
-            const HRESULT hr = window->sample_transfer->record(list, window->sample_srv.Get(), source, target,
-                UINT(desc.Width), desc.Height, sample, false);
-            if (FAILED(hr)) return hr;
-            target.ptr += window->sample_rtv_step;
-        }
-        gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    } else gpu_transition(list, texture.resource, window->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    for (UINT i = 0; i < window->footprints.size(); ++i) {
-        D3D12_TEXTURE_COPY_LOCATION source{};
-        source.pResource = copy_source; source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        source.SubresourceIndex = i;
-        D3D12_TEXTURE_COPY_LOCATION destination{};
-        destination.pResource = window->readback.Get(); destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        destination.PlacedFootprint = window->footprints[i];
-        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
-    }
-    gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (window->sample_array) gpu_transition(list, texture.resource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    window->copied_back = true;
-    return S_OK;
+    const HRESULT hr=record_texture_readback(window,list,window->state);
+    if(SUCCEEDED(hr))window->copied_back=true;
+    return hr;
 }
 
 HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value) {
@@ -1539,6 +1866,17 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
     if (!window->copied_back || window->completing) return E_PENDING;
     const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;
+    if(window->tracked) {
+        window->tracked_resource=buffer;
+        if(!window->read_only) {
+            window->pending_cpu=true;
+            for(const auto& key:window->watch_keys)for(auto* alias:watched_physical.at(key).windows)alias->resident=false;
+        }
+        window->resident_clear=window->active_clear;window->resident=true;
+        release_physical(*window,&buffer,false);window->active=nullptr;window->list.Reset();window->copied_back=false;window->active_thread=0;
+        for(const auto& key:window->watch_keys){const auto sealed=seal_watched(watched_physical.at(key));if(FAILED(sealed))return sealed;}
+        memory_changed.notify_all();return S_OK;
+    }
     if(window->gpu_layout_active && !window->read_only) {
         // The GPU snapshot already contains every texel and padding byte.
         // Map may fail before publication; no fallible conversion follows it.
@@ -1587,32 +1925,47 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
     }
     release_physical(*window, &buffer, false);
     window->active = nullptr; window->list.Reset(); window->copied_back = false;
+    window->active_thread=0;memory_changed.notify_all();
     return S_OK;
 }
 
-HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address) {
+HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address,bool wait) {
     if (!address) return E_INVALIDARG;
     *address = nullptr;
-    std::lock_guard lock(memory_mutex);
-    auto* backing = gpu_backing(buffer);
-    auto* window = gpu_window(buffer, backing);
-    if (!window || backing->retiring) return E_INVALIDARG;
-    for (const auto& [range, alias] : backing->windows) {
-        if (alias.active) return E_PENDING;
-        if (alias.cpu && buffer.canonical_offset < range.first + range.second &&
-            range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
+    std::unique_lock lock(memory_mutex);
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+    for(;;) {
+        const auto attempt=[&]() -> HRESULT {
+            auto* backing = gpu_backing(buffer);
+            auto* window = gpu_window(buffer, backing);
+            if (!window || backing->retiring) return E_INVALIDARG;
+            const auto synchronized=cpu_memory_access(static_cast<unsigned char*>(buffer.allocation)+buffer.canonical_offset,buffer.size,true);
+            if(FAILED(synchronized))return synchronized;
+            for (const auto& [range, alias] : backing->windows) {
+                if (alias.active) return E_PENDING;
+                if (alias.cpu && buffer.canonical_offset < range.first + range.second &&
+                    range.first < buffer.canonical_offset + buffer.size) return HRESULT_FROM_WIN32(ERROR_BUSY);
+            }
+            HRESULT hr = physical_pages(buffer, window->physical_pages, false);
+            if (FAILED(hr)) return hr;
+            for (UINT page = 0; page < window->physical_pages.size(); ++page) if (window->physical_pages[page]) {
+                if (esram.pages[page].gpu) return E_PENDING;
+                if (esram.pages[page].cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
+            }
+            for (UINT page = 0; page < window->physical_pages.size(); ++page)
+                if (window->physical_pages[page]) esram.pages[page].cpu = &buffer;
+            window->cpu = &buffer;
+            *address = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
+            return S_OK;
+        };
+        const HRESULT hr=attempt();
+        if(hr!=E_PENDING || !wait)return hr;
+        // Waiting on this thread's own unsubmitted interval would deadlock.
+        auto* backing=gpu_backing(buffer);
+        for(const auto& [range,alias]:backing->windows)
+            if(alias.active && alias.active_thread==GetCurrentThreadId())return E_PENDING;
+        if(memory_changed.wait_until(lock,deadline)==std::cv_status::timeout)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
-    HRESULT hr = physical_pages(buffer, window->physical_pages, false);
-    if (FAILED(hr)) return hr;
-    for (UINT page = 0; page < window->physical_pages.size(); ++page) if (window->physical_pages[page]) {
-        if (esram.pages[page].gpu) return E_PENDING;
-        if (esram.pages[page].cpu) return HRESULT_FROM_WIN32(ERROR_BUSY);
-    }
-    for (UINT page = 0; page < window->physical_pages.size(); ++page)
-        if (window->physical_pages[page]) esram.pages[page].cpu = &buffer;
-    window->cpu = &buffer;
-    *address = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
-    return S_OK;
 }
 
 HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer) {
@@ -1621,6 +1974,8 @@ HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer) {
     if (!window || window->cpu != &buffer) return E_INVALIDARG;
     release_physical(*window, &buffer, true);
     window->cpu = nullptr;
+    if(window->tracked)for(const auto& key:window->watch_keys){const auto hr=seal_watched(watched_physical.at(key));if(FAILED(hr))return hr;}
+    memory_changed.notify_all();
     return S_OK;
 }
 HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil) {
@@ -1662,8 +2017,10 @@ HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence,
     const HRESULT hr = completed_fence(backing, fence, value);
     if (FAILED(hr)) return hr;
     if (window) {
+        const auto synchronized=flush_gpu_window(*window);if(FAILED(synchronized))return synchronized;
         window->active = nullptr; window->list.Reset(); window->copied_back = false;
         if (!--window->owners) {
+            detach_gpu_tracking(*window);
             const auto range = backing->windows.equal_range({buffer.canonical_offset, buffer.size});
             for (auto at = range.first; at != range.second; ++at)
                 if (&at->second == window) { retired_window = backing->windows.extract(at); break; }
@@ -1742,6 +2099,7 @@ void* resolve_kernelx(const ImportRequest& request) {
     if (request.name == "CreateFileA") return reinterpret_cast<void*>(&era_CreateFileA);
     if (request.name == "CreateFile2") return reinterpret_cast<void*>(&era_CreateFile2);
     if (request.name == "WriteFile") return reinterpret_cast<void*>(&era_WriteFile);
+    if (request.name == "ReadFile") return reinterpret_cast<void*>(&era_ReadFile);
     if (request.name == "FlushFileBuffers") return reinterpret_cast<void*>(&era_FlushFileBuffers);
     if (request.name == "SetEndOfFile") return reinterpret_cast<void*>(&era_SetEndOfFile);
     if (request.name == "CreateDirectoryW") return reinterpret_cast<void*>(&era_CreateDirectoryW);

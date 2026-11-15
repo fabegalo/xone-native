@@ -22,7 +22,11 @@ extern "C" BOOL WINAPI era_test_dll_main(HINSTANCE, DWORD reason, LPVOID) {
 }
 #else
 extern "C" unsigned long long era_test_entry() {
+#ifdef ERA_SUSPEND_FIXTURE
+    Sleep(INFINITE); // The real supervisor must end this through its suspend event.
+#else
     Sleep(0);
+#endif
     const DWORD pid = GetCurrentProcessId();
     return (static_cast<unsigned long long>(*pointer) << 32) | pid;
 }

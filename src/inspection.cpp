@@ -101,27 +101,27 @@ public:
         const auto at = locate(rva, out.size());
         return at && file.read(*at, out);
     }
-    std::optional<std::string> string(std::uint64_t rva, std::uint64_t limit = 256) const {
+    std::optional<std::string> string(std::uint64_t rva, std::uint64_t limit = 256, bool spaces = false) const {
         std::uint64_t available = rva < headers ? headers - rva : 0ULL;
         for (const auto& s : sections)
             if (rva >= s.virtual_address && rva - s.virtual_address < s.raw_size)
                 available = s.raw_size - (rva - s.virtual_address);
-        const auto count = static_cast<std::size_t>(std::min({limit, available, std::uint64_t{256}}));
-        std::array<std::uint8_t, 256> bytes{};
+        const auto count = static_cast<std::size_t>(std::min({limit, available, std::uint64_t{4096}}));
+        std::array<std::uint8_t, 4096> bytes{};
         if (!count || !read(rva, std::span(bytes).first(count))) return std::nullopt;
         const auto end = bytes.begin() + count;
         const auto zero = std::find(bytes.begin(), end, 0);
-        if (zero != end && std::all_of(bytes.begin(), zero, [](auto b) { return b >= 0x21 && b <= 0x7e; }))
+        if (zero != end && std::all_of(bytes.begin(), zero, [spaces](auto b) { return b >= (spaces ? 0x20 : 0x21) && b <= 0x7e; }))
             return std::string(bytes.begin(), zero);
         return std::nullopt;
     }
 };
 
-bool library_name(std::string_view name) {
+bool library_name(std::string_view name, bool spaces = false) {
     return !name.empty() && name != "." && name != ".." &&
-        std::all_of(name.begin(), name.end(), [](char c) {
+        std::all_of(name.begin(), name.end(), [spaces](char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || (spaces && c == ' ');
         });
 }
 
@@ -346,8 +346,9 @@ bool parse_pe(Reader& file, Report& report, std::string& error) {
         if (export_size < d.size() || !view.read(export_rva, d)) return fail("truncated export directory");
         const auto base = u32(d.data() + 16), count = u32(d.data() + 20), names = u32(d.data() + 24);
         const auto eat = u32(d.data() + 28), name_table = u32(d.data() + 32), ordinals = u32(d.data() + 36);
-        const auto dll_name = view.string(u32(d.data() + 12));
-        if (!dll_name || !library_name(*dll_name)) return fail("invalid export library name");
+        // This is module metadata, including executable filenames with spaces.
+        const auto dll_name = view.string(u32(d.data() + 12), 256, true);
+        if (!dll_name || !library_name(*dll_name, true)) return fail("invalid export library name");
         if (count > 65536 || names > 65536 || (count && base > UINT32_MAX - (count - 1)) ||
             (count && !view.locate(eat, count * 4ULL)) ||
             (names && (!view.locate(name_table, names * 4ULL) || !view.locate(ordinals, names * 2ULL)))) return fail("export table limit or range invalid");
@@ -367,11 +368,13 @@ bool parse_pe(Reader& file, Report& report, std::string& error) {
             })) return fail("unmapped export RVA"); // Exported data may live in zero-filled BSS.
         }
         std::set<std::string> unique_names;
+        std::size_t name_bytes = 0;
         for (std::uint32_t i = 0; i < names; ++i) {
             std::array<std::uint8_t, 4> n{}; std::array<std::uint8_t, 2> o{};
             if (!view.read(name_table + i * 4ULL, n) || !view.read(ordinals + i * 2ULL, o)) return fail("truncated export names");
-            const auto slot = u16(o.data()); const auto name = view.string(u32(n.data()));
+            const auto slot = u16(o.data()); const auto name = view.string(u32(n.data()), 4096);
             if (slot >= count || !slots[slot].rva || !name || name->empty() || !unique_names.insert(*name).second) return fail("invalid or duplicate export name/ordinal");
+            if ((name_bytes += name->size()) > (1u << 20)) return fail("oversized export names");
             slots[slot].names.push_back(*name);
         }
         for (auto& e : slots) if (e.rva) {

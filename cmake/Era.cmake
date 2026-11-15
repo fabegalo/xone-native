@@ -48,6 +48,14 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     target_link_options(era_component PRIVATE /NODEFAULTLIB /ENTRY:era_test_entry /SUBSYSTEM:CONSOLE
                         /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO)
 
+    add_executable(era_suspend_component ${PROJECT_SOURCE_DIR}/tests/era_component.cpp)
+    add_dependencies(era_suspend_component era_kernelx_imports)
+    target_compile_definitions(era_suspend_component PRIVATE ERA_SUSPEND_FIXTURE)
+    target_compile_options(era_suspend_component PRIVATE /GS- /Zl)
+    target_link_libraries(era_suspend_component PRIVATE "${era_kernelx_lib}")
+    target_link_options(era_suspend_component PRIVATE /NODEFAULTLIB /ENTRY:era_test_entry /SUBSYSTEM:CONSOLE
+                        /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO)
+
     add_library(era_module_component SHARED ${PROJECT_SOURCE_DIR}/tests/era_component.cpp)
     add_dependencies(era_module_component era_kernelx_imports)
     target_compile_definitions(era_module_component PRIVATE ERA_MODULE_FIXTURE)

@@ -380,6 +380,26 @@ int main(int argc, char** argv) {
                                 for(UINT i=0;i<pixels.size();i+=4) equal=equal && std::abs(FLOAT(pixels[i])-255*constants[1][2])<=.6f &&
                                     std::abs(FLOAT(pixels[i+1])-255*constants[1][1])<=.6f && std::abs(FLOAT(pixels[i+2])-255*constants[1][0])<=.6f && pixels[i+3]==255;
                                 check(equal,"native indexed draw produces expected textured pixels, separate stage constants and fresh CPU updates");
+                                using Suspend=HRESULT(STDMETHODCALLTYPE*)(void*,UINT);
+                                using Resume=HRESULT(STDMETHODCALLTYPE*)(void*);
+                                const auto suspend=reinterpret_cast<Suspend>(embedded[201]);
+                                const auto resume=reinterpret_cast<Resume>(embedded[202]);
+                                check(suspend(context,1)==E_NOTIMPL && resume(context)==DXGI_ERROR_INVALID_CALL,
+                                      "unknown suspend flags preserve the running device state");
+                                check(suspend(context,0)==S_OK && suspend(context,0)==DXGI_ERROR_INVALID_CALL,
+                                      "modern suspend retires the real queue and rejects a duplicate transition");
+                                const std::vector<unsigned char> before_suspend(static_cast<unsigned char*>(canonical),static_cast<unsigned char*>(canonical)+layout.bytes);
+                                static UINT suspended_draw_slot=0;suspended_draw_slot=0;
+                                set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{suspended_draw_slot=slot;return 0;});
+                                reinterpret_cast<Draw>(embedded[14])(context,6ull<<32,0);
+                                set_d3d11x_trap_handler(nullptr);
+                                check(suspended_draw_slot==14 && !std::memcmp(canonical,before_suspend.data(),before_suspend.size()),
+                                      "suspended draw is refused without changing canonical pixels");
+                                check(resume(context)==S_OK && resume(context)==DXGI_ERROR_INVALID_CALL,
+                                      "resume reopens the same queue and rejects an unmatched transition");
+                                reinterpret_cast<Draw>(embedded[14])(context,6ull<<32,0);
+                                check(!std::memcmp(canonical,before_suspend.data(),before_suspend.size()),
+                                      "resumed draw preserves shader, resource and pixel state");
                                 if(!equal) std::cerr << "draw pixels first BGRA " << UINT(pixels[0]) << ',' << UINT(pixels[1]) << ',' << UINT(pixels[2]) << ',' << UINT(pixels[3])
                                     << " center " << UINT(pixels[1024]) << ',' << UINT(pixels[1025]) << ',' << UINT(pixels[1026]) << ',' << UINT(pixels[1027]) << '\n';
                             }

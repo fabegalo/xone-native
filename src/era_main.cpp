@@ -267,7 +267,7 @@ int wmain(int argc, wchar_t** argv) {
     AddVectoredExceptionHandler(1, on_exception);
     std::atexit(on_exit);
     // Guide "quit" from a supervising dashboard: Suspending first, then termination.
-    if (!deadline) xboxone::era::start_suspend_watch();
+    xboxone::era::start_suspend_watch();
     if (deadline) {
         HANDLE dog = CreateThread(nullptr, 0, watchdog, reinterpret_cast<void*>(static_cast<std::uintptr_t>(timeout)), 0, nullptr);
         if (!dog) { std::cerr << "cannot start watchdog\n"; return 1; }

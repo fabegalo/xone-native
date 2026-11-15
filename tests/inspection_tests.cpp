@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "xboxone_native/inspection.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -103,6 +104,40 @@ int main() {
         check(report.pe.imports[0].library == "example.dll", "PE import name");
         check(report.pe.imports[0].functions.size() == 1 &&
               report.pe.imports[0].functions[0] == "Start", "PE imported symbol");
+    }
+    // An export-directory module name can be an executable filename with spaces.
+    for (const std::string name : {"Owned Game.exe", "../Owned Game.exe", "C:\\Owned Game.exe", "Owned\nGame.exe"}) {
+        auto exported = pe;
+        put32(exported, 0x98 + 0x70, 0x2100);
+        put32(exported, 0x98 + 0x74, 40);
+        put32(exported, 0x300 + 12, 0x2140);
+        std::copy(name.begin(), name.end(), exported.begin() + 0x340);
+        check(write_file(dir / "exported.exe", exported), "write export module name fixture");
+        const bool accepted = xboxone::inspection::inspect(dir / "exported.exe", report, err);
+        check(accepted == (name == "Owned Game.exe"), "export module filename validation: " + name);
+    }
+    for (const auto length : {354u, 4095u, 4096u}) {
+        auto exported = pe;
+        exported.resize(0x1800);
+        put32(exported, 0x98 + 0xf0 + 8, 0x1600);
+        put32(exported, 0x98 + 0xf0 + 16, 0x1600);
+        put32(exported, 0x98 + 0x70, 0x2100);
+        put32(exported, 0x98 + 0x74, 40);
+        put32(exported, 0x30c, 0x2080); // Existing module name.
+        put32(exported, 0x310, 1);
+        put32(exported, 0x314, 1);
+        put32(exported, 0x318, 1);
+        put32(exported, 0x31c, 0x2130);
+        put32(exported, 0x320, 0x2134);
+        put32(exported, 0x324, 0x2138);
+        put32(exported, 0x330, 0x2000);
+        put32(exported, 0x334, 0x2200);
+        std::fill_n(exported.begin() + 0x400, length, 'A');
+        check(write_file(dir / "long-export.exe", exported), "write long export name fixture");
+        const bool accepted = xboxone::inspection::inspect(dir / "long-export.exe", report, err);
+        check(accepted == (length < 4096), "export symbol length retains bounded termination");
+        if (accepted) check(report.pe.exports.size() == 1 && report.pe.exports[0].names[0].size() == length,
+                            "long export symbol is preserved intact");
     }
     check(xboxone::inspection::inspect(dir / "system.xvd", report, err), "valid synthetic XVD parses: " + err);
     check(report.kind == xboxone::inspection::Kind::xvd, "XVD classification");

@@ -114,10 +114,10 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
         target_include_directories(xboxone_dashboard_era_tests PRIVATE src)
         target_link_libraries(xboxone_dashboard_era_tests PRIVATE xboxone_console gdi32 ole32)
         target_compile_options(xboxone_dashboard_era_tests PRIVATE /utf-8)
-        add_dependencies(xboxone_dashboard_era_tests xone-era era_component)
+        add_dependencies(xboxone_dashboard_era_tests xone-era era_component era_suspend_component)
         add_test(NAME dashboard_era_lifecycle
             COMMAND xboxone_dashboard_era_tests $<TARGET_FILE:xone-era> $<TARGET_FILE:era_component>
-                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/appmodel/AppxManifest.xml")
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/appmodel/AppxManifest.xml" $<TARGET_FILE:era_suspend_component>)
         set_tests_properties(dashboard_era_lifecycle PROPERTIES TIMEOUT 60 LABELS "windows;synthetic;era;dashboard")
         add_executable(xboxone_era_system_ui_tests tests/era_system_ui_tests.cpp)
         target_include_directories(xboxone_era_system_ui_tests PRIVATE src)

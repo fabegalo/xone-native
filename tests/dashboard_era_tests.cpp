@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cwchar>
 #include <fstream>
 #include <iostream>
 #include <random>
@@ -77,13 +78,96 @@ void write_bmp(const fs::path& path, const dashboard::GdiSurface& surface) {
     out.write(reinterpret_cast<const char*>(&info), sizeof info);
     out.write(reinterpret_cast<const char*>(surface.bits()), size);
 }
+
+// Opt-in original input: exercise the same catalog/profile/launch/Guide path,
+// without treating a live process or a successful return as proof of gameplay.
+int original_lifecycle(const fs::path& runtime, const fs::path& package, const fs::path& root, unsigned duration_ms) {
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    auto host = session::create_host();
+    Platform platform;
+    dashboard::Dashboard ui(root, runtime, platform, *host);
+    std::string error;
+    if (!ui.start(error)) { std::cerr << error << '\n'; CoUninitialize(); return 1; }
+    if (ui.state.profiles.empty()) {
+        ui.input(dashboard::Button::a);
+        for (const char c : std::string("Local Player")) ui.text(static_cast<char32_t>(c));
+        ui.input(dashboard::Button::menu);
+    } else ui.sign_in(ui.state.profiles.front().id);
+    ui.import_folder(package);
+    if (!ui.profile() || ui.state.titles.size() != 1) {
+        std::cerr << "expected one title and a signed-in local profile\n";
+        for (const auto& dialog : ui.dialogs)
+            for (const auto& line : dialog.lines) std::cerr << line << '\n';
+        CoUninitialize(); return 1;
+    }
+    const auto id = ui.state.titles.front().id;
+    for (int i = 0; i < 400 && ui.title(id)->readiness == console::Readiness::unchecked; ++i) {
+        ui.tick(0.025); Sleep(25);
+    }
+    check(ui.title(id)->readiness == console::Readiness::ready, "original imports checked by ERA");
+    std::cout << "original SHA256 " << id << '\n' << std::flush;
+    dashboard::GdiSurface surface;
+    dashboard::Renderer renderer;
+    check(surface.resize(1920,1080), "local dashboard surface allocated");
+    const auto capture = [&](const char* name) {
+        auto canvas=surface.canvas();
+        for(int i=0;i<30;++i) renderer.draw(ui,canvas,surface,0.05);
+        write_bmp(root/name,surface);
+    };
+    capture("home.bmp");
+    // Exercise the finite session setting as well as a Guide quit before it expires.
+    ui.state.settings.time_limit_minutes = 2;
+    ui.launch(id);
+    check(ui.session_title == id, "original launched by dashboard");
+    const auto start = std::chrono::steady_clock::now();
+    while (!ui.session_title.empty() && elapsed_ms(start) < duration_ms) {
+        ui.tick(0.025); Sleep(25);
+        std::error_code ec;
+        if (fs::file_size(root / "logs/last-session.log", ec) > 2 * 1024 * 1024 && !ec) {
+            check(false, "original session log exceeded 2 MiB diagnostic budget");
+            ui.quit_title(); ui.quit_title(); break;
+        }
+    }
+    check(!ui.session_title.empty(), "original remains active until Guide quit");
+    ui.input(dashboard::Button::guide);
+    check(ui.guide_open && ui.profile(), "Guide retains the session profile");
+    capture("guide.bmp");
+    ui.quit_title();
+    for (int i = 0; i < 400 && !ui.session_title.empty(); ++i) { ui.tick(0.025); Sleep(25); }
+    check(ui.session_title.empty() && !host->active() && ui.page == dashboard::Page::home,
+          "original returns to Home after Guide quit");
+    ui.input(dashboard::Button::b);
+    capture("returned-home.bmp");
+    if (host->active()) { host->terminate(); session::Result result; wait(*host, result); }
+    const auto bytes = read(root / "logs/last-session.log");
+    const std::string log(bytes.begin(), bytes.end());
+    check(log.find("xone-era: system UI requested suspend") != std::string::npos,
+          "Guide request reached original runtime with a finite deadline");
+    check(log.find("xone-era: title suspended") != std::string::npos,
+          "original completed its Suspending handlers");
+    console::State persisted;
+    check(console::load(root, persisted, error) && persisted.profiles.size() == 1 && persisted.titles.size() == 1 &&
+          persisted.titles.front().play_count > 0, "original profile, catalog and play history persisted");
+    std::cout << ui.title(id)->last_result << '\n';
+    CoUninitialize();
+    return failures ? 1 : 0;
+}
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
     if (argc >= 3 && std::wstring(argv[1]) == L"run") return fake_runtime(argv[2]);
-    if (argc < 4) { std::cerr << "usage: dashboard_era_tests <xone-era> <era_component> <AppxManifest.xml> [--capture DIR]\n"; return 2; }
+    if ((argc == 5 || argc == 6) && std::wstring(argv[2]) == L"--original") {
+        wchar_t* end=nullptr;
+        const auto seconds=argc==6 ? std::wcstoul(argv[5],&end,10) : 15ul;
+        if(!seconds || seconds>90 || (argc==6 && (!*argv[5] || *end))) {
+            std::cerr << "original probe duration must be 1..90 seconds\n"; return 2;
+        }
+        return original_lifecycle(argv[1], argv[3], argv[4],static_cast<unsigned>(seconds*1000));
+    }
+    if (argc != 5 && argc != 7) { std::cerr << "usage: dashboard_era_tests <xone-era> <era_component> <AppxManifest.xml> <era_suspend_component> [--capture DIR]\n"
+        "       dashboard_era_tests <xone-era> --original <package> <owned-console-root> [seconds: 1..90, default 15]\n"; return 2; }
     const fs::path runtime = argv[1], component = argv[2], manifest = argv[3];
-    const fs::path capture = argc == 6 && std::wstring(argv[4]) == L"--capture" ? fs::path(argv[5]) : fs::path{};
+    const fs::path capture = argc == 7 && std::wstring(argv[5]) == L"--capture" ? fs::path(argv[6]) : fs::path{};
     std::random_device device;
     const auto scratch = fs::canonical(fs::temp_directory_path()) / ("xone-dashboard-era-" + std::to_string(device()));
     fs::create_directories(scratch / "library" / "Owned Package");
@@ -97,6 +181,26 @@ int wmain(int argc, wchar_t** argv) {
     session::Result result;
     check(host->start(run, error), "supervisor starts xone-era run");
     check(wait(*host, result) && result.normal && result.exit_code == 0 && result.mapped, "fixture title runs and returns");
+
+    // A deadline must not disable the Guide's suspend channel in the real launcher.
+    for (const auto deadline : {0u, 60000u}) {
+        auto suspend = run;
+        suspend.title = argv[4];
+        suspend.time_limit_ms = deadline;
+        suspend.suspend_grace_ms = 1000;
+        check(host->start(suspend, error), "start waiting fixture through ERA");
+        bool entered = false;
+        for (int i = 0; i < 400 && !entered; ++i) {
+            const auto output = read(suspend.log);
+            entered = std::string(output.begin(), output.end()).find("running title") != std::string::npos;
+            if (!entered) Sleep(10);
+        }
+        check(entered, "waiting fixture reached entry");
+        host->terminate();
+        check(wait(*host, result) && result.terminated &&
+              result.summary.find("no Suspending handler") != std::string::npos,
+              "ERA receives Guide suspend with and without a deadline");
+    }
     session::Request probe{session::Mode::check, runtime, component, {}, scratch / "logs" / "check.log", 0};
     check(host->start(probe, error) && wait(*host, result) && result.mapped && result.resolved == 2 && result.unresolved == 0,
           "check reports a ready fixture");

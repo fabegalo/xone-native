@@ -165,9 +165,10 @@ void on_exit() { report("xone-era: title called exit\n"); }
 
 int usage() {
     std::cerr << "Usage: xone-era check <title.exe>\n"
-                 "       xone-era run <title.exe> [--timeout-ms N] [--storage DIR] [--warp] [--stop-on-missing | --stop-on-missing-imports]\n"
+                 "       xone-era run <title.exe> [--timeout-ms N | --no-deadline] [--storage DIR] [--warp] [--stop-on-missing | --stop-on-missing-imports]\n"
                  "check maps the image and binds imports without calling the entry point.\n"
                  "run also executes the title natively in this process (default deadline 15000 ms).\n"
+                 "--no-deadline: the supervising session owner (dashboard) ends the process instead.\n"
                  "--stop-on-missing diagnoses missing imports, activations and service calls (exit 125).\n"
                  "--stop-on-missing-imports traps missing imports but returns real activation failures to the title.\n";
     std::cerr << "--warp selects the software GPU explicitly and enables bounded graphics diagnostics.\n";
@@ -186,6 +187,7 @@ int wmain(int argc, wchar_t** argv) {
     bool stop_on_missing = false;
     bool stop_on_activation = false;
     bool warp = false;
+    bool deadline = true;
     for (int i = 3; i < argc; ++i) {
         const std::wstring option = argv[i];
         if (option == L"--timeout-ms" && i + 1 < argc) timeout = static_cast<DWORD>(std::wcstoul(argv[++i], nullptr, 10));
@@ -193,6 +195,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (option == L"--stop-on-missing") { stop_on_missing = true; stop_on_activation = true; }
         else if (option == L"--stop-on-missing-imports") stop_on_missing = true;
         else if (option == L"--warp") warp = true;
+        else if (option == L"--no-deadline") deadline = false;
         else return usage();
     }
     if (run && (timeout == 0 || timeout > 600000)) { std::cerr << "timeout must be 1..600000 ms\n"; return 2; }
@@ -262,12 +265,13 @@ int wmain(int argc, wchar_t** argv) {
     title_end = title_base + image.size();
     AddVectoredExceptionHandler(1, on_exception);
     std::atexit(on_exit);
-    HANDLE dog = CreateThread(nullptr, 0, watchdog, reinterpret_cast<void*>(static_cast<std::uintptr_t>(timeout)), 0, nullptr);
-    if (!dog) { std::cerr << "cannot start watchdog\n"; return 1; }
-    CloseHandle(dog);
-
-    std::cout << "running title at 0x" << std::hex << title_base << std::dec << " (deadline " << timeout << " ms)\n"
-              << std::flush;
+    if (deadline) {
+        HANDLE dog = CreateThread(nullptr, 0, watchdog, reinterpret_cast<void*>(static_cast<std::uintptr_t>(timeout)), 0, nullptr);
+        if (!dog) { std::cerr << "cannot start watchdog\n"; return 1; }
+        CloseHandle(dog);
+        std::cout << "running title at 0x" << std::hex << title_base << std::dec << " (deadline " << timeout << " ms)\n";
+    } else std::cout << "running title at 0x" << std::hex << title_base << std::dec << " (supervised, no deadline)\n";
+    std::cout << std::flush;
     if (FAILED(xboxone::era::initialize_xg_module())) { report("xone-era: XG module initialization failed\n"); return 1; }
     image.process_attach();
     reinterpret_cast<void (*)()>(image.entry())();

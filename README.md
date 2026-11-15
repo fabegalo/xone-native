@@ -13,13 +13,15 @@
   [English](README.md) · [Português (Brasil)](README.pt-BR.md) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
 </div>
 
-> **Early research software — no playable games, original SystemOS boot, working dashboard, GUI launcher or end-user release yet.** The banner above is concept art, not a capture of running Xbox One software. A successful build or XVD header inspection is not proof of Xbox One compatibility.
+> **Early research software — no playable commercial games, original SystemOS boot or end-user release yet.** A locally recreated Xbox One-style dashboard now opens by default; it is **not** the original SystemOS and does not show Microsoft's dashboard. The banner above is concept art, not a capture of running Xbox One software. A successful build or XVD header inspection is not proof of Xbox One compatibility.
 
 ## What is xone-native?
 
 Xbox One software targets **x86-64**, but its original environment consists of separate HostOS, SystemOS and GameOS/ERA components, with Xbox-specific virtualization, services, devices, graphics interfaces and security. Matching the CPU architecture alone does **not** make its executables ordinary desktop Windows programs.
 
-The project's central objective is to launch the **original SystemOS shell and dashboard**, navigate it with a controller, access local profiles, Guide and library, launch a supported game **from that dashboard**, and return to the original shell. The future desktop launcher is only for content management and preparation; it must never imitate or replace the console's dashboard.
+The project's long-term objective is to launch the **original SystemOS shell and dashboard**, navigate it with a controller, access local profiles, Guide and library, launch a supported game **from that dashboard**, and return to the original shell.
+
+While authentic SystemOS stays unreadable, the default front-end is a **locally recreated dashboard** inspired by the 2015 New Xbox One Experience (maintainer-approved, see [AGENTS.md](AGENTS.md)). It uses the same console state, catalog, ERA runtime and session supervisor that an original SystemOS backend will use later. Its frames are labelled `local_recreation`, its art is drawn by the project, and it offers no online services, achievements or licenses.
 
 The preferred strategy is direct x86-64 execution **when technically demonstrated**, with a modular compatibility layer for Xbox services and a VM-based or hybrid SystemOS path only when required by real dependencies. GameOS/ERA and later GameCore need separate contracts. This is not a port of x360-native's PowerPC AOT/ReXGlue architecture.
 
@@ -34,6 +36,7 @@ The preferred strategy is direct x86-64 execution **when technically demonstrate
 | **XVD inspection** | Recognizes the header at `0x200` and reports structural metadata | Signature verification, readable payload, decryption, SystemOS boot |
 | **PE32+ x64 inspection** | Reports image properties, DLL imports and imported symbols | Xbox-specific provenance, NT/WinRT activation, executable launch |
 | **Build and tests** | Portable CMake targets; local M0 tests previously passed | Runtime compatibility; functional platform validation |
+| **Local dashboard (recreation, Windows x64)** | Sign-in and persistent local profiles, Home, My games & apps, Guide, settings (display, audio, controller, language, storage), keyboard and XInput navigation, UI sounds; folder import identified by manifest + SHA-256, `xone-era check`, launch through `xone-era run`, Guide quit, return with the real exit result | Commercial title gameplay through it; Linux/macOS host adapters; physical-controller validation |
 | **SystemOS / original dashboard** | Architecture and obstacles documented | Original frame, boot, navigation, Guide, profiles |
 | **GameOS / ERA / graphics** | Research and integration boundaries | Game startup, sound, rendering, gameplay or return to dashboard |
 
@@ -59,6 +62,10 @@ Run it on files that you lawfully possess and are authorized to analyze:
 ```
 
 With a Windows multi-config generator, the executable is typically `build\Release\xone-native.exe`; locate the executable in the selected generator's output directory. The inspector does **not** copy, unpack, decrypt, authenticate, modify or execute the input. A PE32+ result does not identify a binary as Xbox One software on its own.
+
+### Open the local dashboard (Windows x64)
+
+Run `xone-native` with no arguments (or `xone-native dashboard`). Create a local profile, then use **My games & apps → Import folder** to pick a folder with extracted title packages (each with its `AppxManifest.xml`). Titles start through `xone-era`, which must be built next to `xone-native` (MSVC x64). Keyboard: arrows, Enter = A, Esc = B, F2 = Menu, Del = X, Home = Guide (Ctrl+Home while a title has focus), PageUp/PageDown = bumpers. A title that cannot start shows the runtime's real error. Profiles, settings, the library and title saves live in `%LOCALAPPDATA%\xone-native` (override with `XONE_NATIVE_HOME`).
 
 There are **no downloadable user releases** at this stage. Do not present the repository source archive as a playable application.
 
@@ -93,7 +100,7 @@ Goals, not compatibility claims:
 2. **M1:** present the **first authentic frame** drawn by an original SystemOS component with recorded evidence.
 3. **M2–M3:** original shell, navigation, Guide, local profiles and persistent storage.
 4. **M4:** GameOS/ERA execution through verified KernelX, Xbox WinRT and graphics/audio/input contracts.
-5. **M5:** dashboard → game → Guide/dashboard, lifecycle and save/restore.
+5. **M5:** dashboard → game → Guide/dashboard, lifecycle and save/restore. The interim local dashboard already exercises this loop with the ERA runtime; the original SystemOS remains a separate future backend on the same contracts.
 6. **M6:** validated additional host architectures, optimized graphics/performance and user-friendly distributions.
 
 ## FAQ
@@ -103,7 +110,7 @@ No. The CPU architecture is similar, but the Xbox APIs, application model, VM se
 </details>
 
 <details><summary><strong>Can I boot my Xbox One dashboard or play games today?</strong></summary>
-No. M0 inspects limited file metadata. The original dashboard, launcher, games and graphics runtimes are not functional.
+Not the original dashboard: authentic SystemOS has not been executed. `xone-native` opens a locally recreated Xbox One-style dashboard that imports, checks and launches titles through the ERA runtime, but commercial games are not yet demonstrated as playable.
 </details>
 
 <details><summary><strong>Why not just copy WinDurango or the Xbox 360 project?</strong></summary>

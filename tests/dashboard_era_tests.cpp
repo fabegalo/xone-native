@@ -67,7 +67,7 @@ int wmain(int argc, wchar_t** argv) {
     const fs::path runtime = argv[1], component = argv[2], manifest = argv[3];
     const fs::path capture = argc == 6 && std::wstring(argv[4]) == L"--capture" ? fs::path(argv[5]) : fs::path{};
     std::random_device device;
-    const auto scratch = fs::temp_directory_path() / ("xone-dashboard-era-" + std::to_string(device()));
+    const auto scratch = fs::canonical(fs::temp_directory_path()) / ("xone-dashboard-era-" + std::to_string(device()));
     fs::create_directories(scratch / "library" / "Owned Package");
     struct Cleanup { fs::path p; ~Cleanup() { std::error_code ec; fs::remove_all(p, ec); } } cleanup{scratch};
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

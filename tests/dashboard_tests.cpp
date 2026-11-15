@@ -32,7 +32,7 @@ struct Scratch {
     fs::path path;
     Scratch() {
         std::random_device device;
-        path = fs::temp_directory_path() / ("xone-dashboard-test-" + std::to_string(device()));
+        path = fs::canonical(fs::temp_directory_path()) / ("xone-dashboard-test-" + std::to_string(device()));
         fs::create_directories(path);
     }
     ~Scratch() { std::error_code ec; fs::remove_all(path, ec); }

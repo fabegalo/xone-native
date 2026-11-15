@@ -481,6 +481,21 @@ int main(int argc, char** argv) {
             if (SUCCEEDED(hr)) hr = layout.copy(layout.context.get(), false, output.data(), tiled.data() + 16, 0, 512, 8192,nullptr);
             std::cout << "original XG MSAA4 copy hr=0x" << std::hex << hr << std::dec << " equal=" << (input == output) << '\n';
             check(SUCCEEDED(hr) && input == output, "MSAA CPU layout preserves four independent samples without resolve");
+            for(UINT repeat=0;repeat<3;++repeat) {
+                for(SIZE_T i=0;i<input.size();++i)input[i]^=static_cast<unsigned char>(repeat+i/4+1);
+                hr=layout.copy(layout.context.get(),true,input.data(),tiled.data()+16,0,512,8192,nullptr);
+                if(SUCCEEDED(hr))hr=layout.copy(layout.context.get(),false,output.data(),tiled.data()+16,0,512,8192,nullptr);
+                check(SUCCEEDED(hr) && input==output,"cached MSAA color addresses preserve changed bytes in all four samples");
+                TitleTextureLayout fresh;
+                auto oracle=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R11G11B10_FLOAT,UINT_MAX,fresh,
+                    D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,4);
+                std::vector<unsigned char> expected(tiled.size(),0x5a);
+                if(SUCCEEDED(oracle))oracle=fresh.copy(fresh.context.get(),true,input.data(),expected.data()+16,0,512,8192,nullptr);
+                check(SUCCEEDED(oracle) && tiled==expected,"cached MSAA physical bytes match an uncached original XG address getter");
+            }
+            const auto unchanged=tiled;
+            check(layout.copy(layout.context.get(),true,input.data(),tiled.data()+16,0,511,8192,nullptr)==E_INVALIDARG && tiled==unchanged,
+                "cached MSAA color copy rejects a short pitch without modifying canonical bytes");
             check(std::all_of(tiled.begin(), tiled.begin() + 16, [](auto x) { return x == 0x5a; }) &&
                 std::all_of(tiled.end() - 16, tiled.end(), [](auto x) { return x == 0x5a; }), "MSAA copies preserve canonical guards");
             hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,

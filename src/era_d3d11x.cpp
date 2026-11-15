@@ -4874,6 +4874,17 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
                        UINT subresource, UINT row_pitch, UINT slice_pitch,const TitleGpuClearState* clear) {
     auto* context = static_cast<XgTextureContext*>(opaque);
     if (!context || !linear || !tiled || subresource >= context->mips * context->arrays) return E_INVALIDARG;
+    struct CopyTiming {
+        XgTextureContext* context; bool into; LONGLONG started;
+        ~CopyTiming() {
+            if(!started) return;
+            const auto elapsed=timing_ms(timing_tick()-started);
+            static std::atomic<UINT> observations{0};
+            if(elapsed>50 && observations.fetch_add(1)<64)
+                std::fprintf(stderr,"xone-era: slow XG copy %ux%u samples=%u element=%u depth=%u into=%u %.3f ms\n",
+                    context->width,context->height,context->samples,context->bytes_per_block,context->htile.bytes!=0,into,elapsed);
+        }
+    } timing{context,into_tiled,frame_timing() ? timing_tick() : 0};
     const UINT mip = subresource % context->mips;
     const UINT width = (std::max)(1u, context->width >> mip), height = (std::max)(1u, context->height >> mip);
     const UINT row_bytes = ((width + context->block - 1) / context->block) * context->bytes_per_block * context->samples;
@@ -4992,8 +5003,33 @@ HRESULT copy_xg_texture(void* opaque, bool into_tiled, void* linear, void* tiled
         // Slot 4 (2a70) accepts the sample index and returns its exact byte offset.
         using Address = UINT64 (*)(void*, UINT, UINT, UINT64, UINT, UINT, UINT);
         const auto address = reinterpret_cast<Address>((*static_cast<void***>(context->computer))[context->modern ? 6 : 4]);
+        const std::vector<UINT32>* table=nullptr;
+        {
+            std::lock_guard lock(context->offsets_mutex);
+            if(context->offsets_state.empty()) {
+                context->offsets_state.assign(SIZE_T(context->mips)*context->arrays,0);
+                context->offsets.resize(context->offsets_state.size());
+            }
+            auto& state=context->offsets_state[subresource];
+            if(state==1) {
+                state=3;
+                const SIZE_T count=SIZE_T(width)*height*context->samples;
+                SIZE_T cached=0;for(const auto& offsets:context->offsets)cached+=offsets.size();
+                if(count<=((64u<<20)/sizeof(UINT32))-cached && context->bytes<=UINT32_MAX) try {
+                    std::vector<UINT32> offsets(count);
+                    for(UINT y=0;y<height;++y) for(UINT x=0;x<width;++x) for(UINT sample=0;sample<context->samples;++sample) {
+                        const UINT64 at=address(context->computer,0,mip,x,y,subresource/context->mips,sample);
+                        if(at>context->bytes || context->bytes-at<context->bytes_per_block)return E_INVALIDARG;
+                        offsets[(SIZE_T(y)*width+x)*context->samples+sample]=UINT32(at);
+                    }
+                    context->offsets[subresource]=std::move(offsets);state=2;
+                } catch(const std::bad_alloc&) {} // Keep the original getter when the bounded cache cannot fit.
+            } else if(state==0)state=1;
+            if(state==2)table=&context->offsets[subresource];
+        }
         for (UINT y = 0; y < height; ++y) for (UINT x = 0; x < width; ++x) for (UINT sample = 0; sample < context->samples; ++sample) {
-            const UINT64 offset = address(context->computer, 0, mip, x, y, subresource / context->mips, sample);
+            const UINT64 offset = table ? (*table)[(SIZE_T(y)*width+x)*context->samples+sample] :
+                address(context->computer, 0, mip, x, y, subresource / context->mips, sample);
             if (offset > context->bytes || context->bytes - offset < context->bytes_per_block) return E_INVALIDARG;
             auto* a = static_cast<unsigned char*>(linear) + SIZE_T(y) * row_pitch + (SIZE_T(x) * context->samples + sample) * context->bytes_per_block;
             auto* b = static_cast<unsigned char*>(tiled) + offset;

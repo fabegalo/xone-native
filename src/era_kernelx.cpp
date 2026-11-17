@@ -20,6 +20,7 @@
 #include <climits>
 #include <iterator>
 #include <map>
+#include <set>
 #include <mutex>
 #include <new>
 #include <string>
@@ -66,6 +67,7 @@ std::mutex storage_mutex;
 std::recursive_mutex memory_mutex;
 std::condition_variable_any memory_changed;
 using WatchKey = std::pair<std::uintptr_t,SIZE_T>;
+struct WatchedPage;
 struct GpuWindow {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     unsigned owners = 0;
@@ -88,18 +90,34 @@ struct GpuWindow {
     std::vector<unsigned char> sample_linear;
     bool staged_buffer = false;
     std::unique_ptr<TextureLayoutTransfer> layout_transfer;
+    std::unique_ptr<TextureLayoutTransfer> sample_layout_transfer;
+    bool gpu_sample_layout_active=false,sample_layout_refused=false;
     bool gpu_layout_active = false, gpu_layout_refused = false;
     std::array<bool, 512> physical_pages{};
     bool tracked = false, resident = false, pending_cpu = false, reuse = false;
+    // The resident image was written by the GPU; its publication stores expanded HTILE, so
+    // decoding it with or without the depth block yields the same image.
+    bool htile_neutral = false;
+    UINT64 pending_sequence = 0; // Publication order of overlapping pending GPU images.
+    std::set<WatchKey> superseded; // Shared ESRAM pages a newer image already published to CPU.
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> ordered_queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> queued_fence;
+    UINT64 queued_value=0;
+    bool upload_snapshot=false;
     DWORD active_thread = 0;
     TitleGpuResource tracked_resource;
     TitleGpuClearState resident_clear, active_clear;
     std::vector<WatchKey> watch_keys;
+    std::vector<std::pair<std::uintptr_t,WatchedPage*>> watch_aliases;
     struct Segment { std::shared_ptr<void> view; SIZE_T offset, length, logical; };
     std::vector<Segment> segments;
 };
 using GpuWindows = std::multimap<std::pair<SIZE_T, SIZE_T>, GpuWindow>;
 struct CoherenceReadback {
+    Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestamps;
+    Microsoft::WRL::ComPtr<ID3D12Resource> timing_readback;
+    UINT64 timestamp_frequency=0;
+    bool timing_attempted=false;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
@@ -132,14 +150,15 @@ struct TitleRegion : GpuBacking {
 };
 std::map<std::uintptr_t, TitleRegion> title_regions;
 constexpr SIZE_T esram_page_bytes = 65536, esram_bytes = 32u << 20;
-struct PhysicalGate { TitleGpuResource* gpu = nullptr; TitleGpuResource* cpu = nullptr; };
+struct PhysicalGate { TitleGpuResource* gpu = nullptr; TitleGpuResource* cpu = nullptr; DWORD gpu_thread = 0; };
 struct EsramPool {
     Microsoft::WRL::Wrappers::FileHandle mapping;
     std::array<PhysicalGate, 512> pages{};
 } esram;
-HRESULT reset_gpu_tracking();
-HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write);
-HRESULT flush_gpu_window(GpuWindow& window);
+HRESULT reset_gpu_tracking(std::uintptr_t start=0,SIZE_T size=SIZE_MAX);
+HRESULT reset_esram_tracking(const std::vector<UINT>& pages);
+HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write,bool wait=true);
+HRESULT flush_gpu_window(GpuWindow& window,const char* reason="retire");
 void detach_gpu_tracking(GpuWindow& window);
 void forget_tracked_addresses(std::uintptr_t start,SIZE_T size);
 constexpr UINT64 title_budget = 0x140000000ull;
@@ -223,7 +242,15 @@ void WINAPI era_XMemFree(void* address, ULONGLONG attributes) {
     era_XMemFreeDefault(address, attributes);
 }
 
+LPVOID WINAPI era_VirtualAlloc(LPVOID address, SIZE_T size, DWORD type, DWORD protection);
+BOOL WINAPI era_VirtualFree(LPVOID address, SIZE_T size, DWORD type);
+
 bool destroy_region(std::map<std::uintptr_t, TitleRegion>::iterator region) {
+    if(region->second.graphics) {
+        region->second.xmem=false;
+        if(era_VirtualFree(reinterpret_cast<void*>(region->first),0,MEM_RELEASE))return true;
+        region->second.xmem=true;return false;
+    }
     region->second.buffer.Reset();
     region->second.heap.Reset();
     region->second.device.Reset();
@@ -267,10 +294,14 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
     if (!allocate) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
     std::lock_guard lock(memory_mutex);
     if (!memory_capacity(bytes)) return nullptr;
-    void* result = allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, &parameter, 1);
+    // Reference 14009f370 -> 14009e4d0: graphics XMem shares the graphics/coherence registry.
+    const bool graphics=type && !audio;
+    void* result = allocate(GetCurrentProcess(), nullptr, bytes,
+        graphics ? MEM_RESERVE | MEM_RESERVE_PLACEHOLDER : MEM_RESERVE | MEM_COMMIT,
+        graphics ? PAGE_NOACCESS : PAGE_READWRITE, &parameter, 1);
     if (!result) return nullptr;
     TitleRegion region{bytes, type != 0 && !audio};
-    region.physical_bytes = bytes;
+    region.physical_bytes = graphics ? 0 : bytes;
     region.xmem = true;
     region.attributes = attributes;
     try {
@@ -279,7 +310,12 @@ void* WINAPI era_XMemAllocDefault(SIZE_T size, ULONGLONG attributes) {
         VirtualFree(result, 0, MEM_RELEASE);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr;
     }
-    title_committed += bytes;
+    if(graphics) {
+        if(!era_VirtualAlloc(result,bytes,0x30001000,PAGE_READWRITE)) {
+            const auto error=GetLastError();destroy_region(title_regions.find(reinterpret_cast<std::uintptr_t>(result)));
+            SetLastError(error);return nullptr;
+        }
+    } else title_committed += bytes;
     return result;
 }
 
@@ -293,7 +329,8 @@ void WINAPI era_XMemFreeDefault(void* address, ULONGLONG attributes) {
         ((attributes ^ region->second.attributes) & layout)) {
         SetLastError(ERROR_INVALID_PARAMETER); return;
     }
-    if (region->second.gpu_pins) region->second.retiring = true;
+    if (region->second.gpu_pins || std::any_of(region->second.commits.begin(),region->second.commits.end(),
+        [](const auto& entry){return entry.second.gpu_pins!=0;})) region->second.retiring = true;
     else (void)destroy_region(region);
 }
 
@@ -349,7 +386,7 @@ bool coalesce_placeholder(void* address, SIZE_T size) {
     return VirtualFree(address, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
 }
 bool unmap_graphics_backing(std::uintptr_t address, GpuBacking& backing) {
-    const HRESULT synchronized=reset_gpu_tracking();
+    const HRESULT synchronized=reset_gpu_tracking(address,backing.size);
     if(FAILED(synchronized)){SetLastError(ERROR_BUSY);return false;}
     backing.buffer.Reset(); backing.heap.Reset(); backing.device.Reset();
     const auto unmap = host_unmap2();
@@ -610,7 +647,12 @@ bool inside_storage(const std::wstring& full) {
     if (full.find(L':', 2) != std::wstring::npos) return false;
     for (std::size_t at = full.find(L'\\', 3); at != std::wstring::npos; at = full.find(L'\\', at + 1)) {
         const DWORD attributes = path_attributes(full.substr(0, at));
-        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            // Reference save recovery distinguishes an unpublished/missing path
+            // from denied access. Let the real file API report missing parents.
+            const DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return false;
+        } else if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return false;
     }
     const DWORD attributes = path_attributes(full);
     if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
@@ -883,38 +925,62 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
         if (page_list && std::any_of(input.begin(), input.end(), [unit](UINT page) { return page >= esram_bytes / unit; })) return E_INVALIDARG;
         const auto at = reinterpret_cast<std::uintptr_t>(address);
         const SIZE_T bytes = pages * unit;
-        std::lock_guard lock(memory_mutex);
-        auto region = title_regions.upper_bound(at);
-        if (region == title_regions.begin()) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
-        --region;
-        if (!region->second.graphics || region->second.xmem || at - region->first >= region->second.size ||
-            bytes > region->second.size - (at - region->first)) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
-        for (const auto& [range, window] : region->second.windows)
-            if ((window.active || window.cpu) && at - region->first < range.first + range.second &&
-                range.first < at - region->first + bytes) return HRESULT_FROM_WIN32(ERROR_BUSY);
+        std::unique_lock lock(memory_mutex);
         struct Change { std::uintptr_t address; UINT before, after; bool changed = false; };
         std::vector<Change> changes;
-        changes.reserve(bytes / esram_page_bytes);
         std::map<std::uintptr_t, GpuBacking> staged;
-        for (SIZE_T offset = 0; offset < bytes; offset += esram_page_bytes) {
-            const auto target = at + offset;
-            auto found = region->second.commits.upper_bound(target);
-            UINT before = UINT_MAX;
-            if (found != region->second.commits.begin()) {
-                --found;
-                if (target - found->first < found->second.size) {
-                    if (found->first != target || found->second.size != esram_page_bytes || found->second.esram_page == UINT_MAX)
-                        return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
-                    if (found->second.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
-                    before = found->second.esram_page;
+        decltype(title_regions)::iterator region;
+        // A GPU interval of another thread is transient; console creation does not fail for it.
+        bool waitable = false;
+        const auto validate = [&]() -> HRESULT {
+            changes.clear(); staged.clear(); waitable = false;
+            region = title_regions.upper_bound(at);
+            if (region == title_regions.begin()) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+            --region;
+            if (!region->second.graphics || region->second.xmem || at - region->first >= region->second.size ||
+                bytes > region->second.size - (at - region->first)) return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+            for (const auto& [range, window] : region->second.windows)
+                if ((window.active || window.cpu) && at - region->first < range.first + range.second &&
+                    range.first < at - region->first + bytes) {
+                    waitable = !window.cpu && window.active_thread != GetCurrentThreadId();
+                    return HRESULT_FROM_WIN32(ERROR_BUSY);
                 }
+            changes.reserve(bytes / esram_page_bytes);
+            for (SIZE_T offset = 0; offset < bytes; offset += esram_page_bytes) {
+                const auto target = at + offset;
+                auto found = region->second.commits.upper_bound(target);
+                UINT before = UINT_MAX;
+                if (found != region->second.commits.begin()) {
+                    --found;
+                    if (target - found->first < found->second.size) {
+                        if (found->first != target || found->second.size != esram_page_bytes || found->second.esram_page == UINT_MAX)
+                            return HRESULT_FROM_WIN32(ERROR_INVALID_ADDRESS);
+                        if (found->second.gpu_pins) return HRESULT_FROM_WIN32(ERROR_BUSY);
+                        before = found->second.esram_page;
+                    }
+                }
+                const UINT after = page_list ? UINT((SIZE_T(input[offset / unit]) * unit + offset % unit) / esram_page_bytes) : UINT_MAX;
+                for (const UINT physical : {before, after})
+                    if (physical != UINT_MAX && (esram.pages[physical].gpu || esram.pages[physical].cpu)) {
+                        waitable = !esram.pages[physical].cpu && esram.pages[physical].gpu_thread != GetCurrentThreadId();
+                        return HRESULT_FROM_WIN32(ERROR_BUSY);
+                    }
+                changes.push_back({target, before, after});
+                if (before == UINT_MAX && after != UINT_MAX) staged.emplace(target, GpuBacking{esram_page_bytes});
             }
-            const UINT after = page_list ? UINT((SIZE_T(input[offset / unit]) * unit + offset % unit) / esram_page_bytes) : UINT_MAX;
-            for (const UINT physical : {before, after})
-                if (physical != UINT_MAX && (esram.pages[physical].gpu || esram.pages[physical].cpu)) return HRESULT_FROM_WIN32(ERROR_BUSY);
-            changes.push_back({target, before, after});
-            if (before == UINT_MAX && after != UINT_MAX) staged.emplace(target, GpuBacking{esram_page_bytes});
-        }
+            std::vector<UINT> remapped;
+            for (const auto& change : changes) if (change.before != change.after)
+                for (const UINT physical : {change.before, change.after}) if (physical != UINT_MAX) remapped.push_back(physical);
+            if (remapped.empty()) return S_OK;
+            const auto reset = reset_esram_tracking(remapped);
+            waitable = reset == E_PENDING;
+            return reset;
+        };
+        HRESULT validated = validate();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (FAILED(validated) && waitable &&
+            memory_changed.wait_until(lock, deadline) != std::cv_status::timeout) validated = validate();
+        if (FAILED(validated)) return validated;
         const auto map = host_map3(); const auto unmap = host_unmap2();
         if (!map || !unmap) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
         if (page_list && !esram.mapping.IsValid()) {
@@ -924,9 +990,6 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
             esram.mapping.Attach(handle);
             // The entire retained pool is committed once; virtual aliases cost nothing.
             title_committed += esram_bytes;
-        }
-        if(std::any_of(changes.begin(),changes.end(),[](const auto& change){return change.before!=change.after;})) {
-            const auto hr=reset_gpu_tracking();if(FAILED(hr))return hr;
         }
         DWORD failure = 0;
         for (auto& change : changes) {
@@ -984,6 +1047,24 @@ HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 }
 
+// Reference 14056ada0: reuse a live native description bound to the same pinned range.
+static bool same_texture_description(const TitleTextureLayout& a,const TitleTextureLayout& b) {
+    if(!a.context || !b.context || a.bytes!=b.bytes || a.alignment!=b.alignment ||
+        a.tile_mode!=b.tile_mode || a.demand_coherence!=b.demand_coherence || a.copy!=b.copy ||
+        a.offsets!=b.offsets || a.sample_offsets!=b.sample_offsets ||
+        a.guest_descriptor!=b.guest_descriptor || a.stencil_descriptor!=b.stencil_descriptor)return false;
+    const auto& x=a.resource_desc;const auto& y=b.resource_desc;
+    return x.Dimension==y.Dimension && x.Alignment==y.Alignment && x.Width==y.Width && x.Height==y.Height &&
+        x.DepthOrArraySize==y.DepthOrArraySize && x.MipLevels==y.MipLevels && x.Format==y.Format &&
+        x.SampleDesc.Count==y.SampleDesc.Count && x.SampleDesc.Quality==y.SampleDesc.Quality &&
+        x.Layout==y.Layout && x.Flags==y.Flags;
+}
+static bool same_texture_storage(const TitleTextureLayout& a,const TitleTextureLayout& b) {
+    // Providers without original descriptors can only identify their own retained layout instance.
+    if(a.context!=b.context && !std::any_of(a.guest_descriptor.begin(),a.guest_descriptor.end(),[](UINT32 word){return word!=0;}))return false;
+    return same_texture_description(a,b);
+}
+
 static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Device* device, TitleGpuResource& out,
                                     D3D12_RESOURCE_FLAGS flags, bool aligned, const TitleTextureLayout* texture) {
     if (!address || !size || !device || out.resource) return E_INVALIDARG;
@@ -996,7 +1077,8 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
     auto base = found->first;
     auto* backing = static_cast<GpuBacking*>(&found->second);
     bool composite = false;
-    if (!found->second.xmem) {
+    if(found->second.retiring)return E_INVALIDARG;
+    if (!found->second.xmem || found->second.graphics) {
         const auto offset = at - found->first;
         if (!found->second.graphics || offset >= found->second.size || size > found->second.size - offset) return E_INVALIDARG;
         if (aligned) {
@@ -1065,11 +1147,13 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
         try {
             const auto key = std::make_pair(static_cast<SIZE_T>(offset), static_cast<SIZE_T>(size));
             auto window = region.windows.end();
-            if (!texture) {
-                const auto range = region.windows.equal_range(key);
-                for (auto candidate = range.first; candidate != range.second; ++candidate)
-                    if (!candidate->second.texture.context) { window = candidate; break; }
+            const auto range = region.windows.equal_range(key);
+            for(auto candidate=range.first;candidate!=range.second;++candidate) {
+                if(texture ? same_texture_storage(candidate->second.texture,*texture) : !candidate->second.texture.context) {
+                    window=candidate;break;
+                }
             }
+            const bool cached=window!=region.windows.end();
             if (window == region.windows.end()) {
                 D3D12_HEAP_PROPERTIES heap{};
                 heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -1088,6 +1172,13 @@ static HRESULT acquire_gpu_resource(void* address, std::size_t size, ID3D12Devic
                 window = region.windows.emplace(key, std::move(entry));
             } else if ((window->second.resource->GetDesc().Flags & flags) != flags) return DXGI_ERROR_UNSUPPORTED;
             ++window->second.owners;
+            if(texture) {
+                static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+                static std::atomic<UINT> observations[2]{};
+                if(timing && observations[cached ? 1:0].fetch_add(1)<16)
+                    std::fprintf(stderr,"xone-era: timing texture-storage cached=%u backing=%p offset=0x%llX bytes=%zu owners=%u\n",
+                        UINT(cached),reinterpret_cast<void*>(base),UINT64(offset),size,window->second.owners);
+            }
             ++region.gpu_pins;
             if (composite) region.device = identity;
             out.resource = window->second.resource.Get(); out.resource->AddRef();
@@ -1116,7 +1207,8 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
     if (!layout.context || !layout.copy || !layout.bytes || layout.bytes > (1u << 30) || !layout.alignment ||
         (layout.alignment & (layout.alignment - 1)) || reinterpret_cast<std::uintptr_t>(address) % layout.alignment) return E_INVALIDARG;
     if ((d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) ||
-        !d.Width || !d.Height || !d.DepthOrArraySize || !d.MipLevels || !d.SampleDesc.Count || d.SampleDesc.Quality ||
+        !d.Width || !d.Height || !d.DepthOrArraySize || !d.MipLevels || !d.SampleDesc.Count ||
+        (d.SampleDesc.Quality && (d.SampleDesc.Count==1 || d.SampleDesc.Quality!=UINT_MAX)) ||
         (d.Flags & ~(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) ||
         d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN) return DXGI_ERROR_UNSUPPORTED;
     if (d.SampleDesc.Count != 1 && (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.MipLevels != 1 ||
@@ -1136,8 +1228,8 @@ GpuBacking* gpu_backing(const TitleGpuResource& buffer) {
     auto found = title_regions.upper_bound(base);
     if (found == title_regions.begin()) return nullptr;
     --found;
-    if (buffer.composite) return found->first == base && found->second.graphics && !found->second.xmem ? &found->second : nullptr;
-    if (found->second.xmem) return found->first == base ? &found->second : nullptr;
+    if (buffer.composite) return found->first == base && found->second.graphics ? &found->second : nullptr;
+    if (found->second.xmem && !found->second.graphics) return found->first == base ? &found->second : nullptr;
     auto commit = found->second.commits.find(base);
     return commit == found->second.commits.end() ? nullptr : &commit->second;
 }
@@ -1201,10 +1293,12 @@ struct WatchedPage {
 };
 std::map<WatchKey,WatchedPage> watched_physical;
 std::map<std::uintptr_t,WatchKey> watched_virtual;
+std::uint64_t watched_protect_calls=0;
 HRESULT protect_watched(WatchedPage& page,DWORD protection) {
     if(page.protection==protection)return S_OK;
     for(auto address:page.aliases) {
         DWORD before=0;
+        ++watched_protect_calls;
         if(!VirtualProtect(reinterpret_cast<void*>(address),4096,protection,&before)) {
             const DWORD error=GetLastError();page.protection=0;return HRESULT_FROM_WIN32(error);
         }
@@ -1212,15 +1306,75 @@ HRESULT protect_watched(WatchedPage& page,DWORD protection) {
     page.protection=protection;
     return S_OK;
 }
-HRESULT seal_watched(WatchedPage& page) {
-    bool inaccessible=false;
-    for(auto* window:page.windows) inaccessible|=window->pending_cpu || (window->active && !window->read_only);
-    return protect_watched(page,inaccessible ? PAGE_NOACCESS : PAGE_READONLY);
+HRESULT wait_gpu_window(GpuWindow& window,bool wait=true) {
+    if(!window.queued_fence)return S_OK;
+    auto completed=window.queued_fence->GetCompletedValue();
+    if(completed==UINT64_MAX)return DXGI_ERROR_DEVICE_REMOVED;
+    if(completed<window.queued_value) {
+        if(!wait)return E_PENDING;
+        Microsoft::WRL::Wrappers::Event event(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+        if(!event.IsValid())return HRESULT_FROM_WIN32(GetLastError());
+        const auto hr=window.queued_fence->SetEventOnCompletion(window.queued_value,event.Get());
+        if(FAILED(hr))return hr;
+        if(WaitForSingleObject(event.Get(),5000)!=WAIT_OBJECT_0)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        completed=window.queued_fence->GetCompletedValue();
+        if(completed==UINT64_MAX)return DXGI_ERROR_DEVICE_REMOVED;
+        if(completed<window.queued_value)return E_PENDING;
+    }
+    window.queued_fence.Reset();window.ordered_queue.Reset();window.queued_value=0;
+    return S_OK;
 }
-HRESULT access_watched(WatchedPage& page,bool write) {
+DWORD sealed_protection(const WatchedPage& page) {
+    for(auto* window:page.windows)if(window->pending_cpu || (window->active && !window->read_only))return PAGE_NOACCESS;
+    return PAGE_READONLY;
+}
+HRESULT seal_watched(WatchedPage& page) {
+    return protect_watched(page,sealed_protection(page));
+}
+HRESULT seal_tracked_window(GpuWindow& window) {
+    const DWORD last_error=GetLastError();
+    static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+    static unsigned observations=0;
+    const auto before=watched_protect_calls;
+    const auto start=timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    HRESULT hr=S_OK;
+    // Reference 1401ddfa0 protects contiguous runs. A Windows run must also stay within one committed view.
+    for(size_t i=0;i<window.watch_aliases.size();) {
+        const auto [address,page]=window.watch_aliases[i];
+        const DWORD protection=sealed_protection(*page);
+        if(page->protection==protection){++i;continue;}
+        MEMORY_BASIC_INFORMATION region{};
+        if(!VirtualQuery(reinterpret_cast<void*>(address),&region,sizeof region)) {hr=HRESULT_FROM_WIN32(GetLastError());break;}
+        const auto limit=reinterpret_cast<std::uintptr_t>(region.BaseAddress)+region.RegionSize;
+        if(region.State!=MEM_COMMIT || limit<=address || limit-address<4096){hr=E_INVALIDARG;break;}
+        size_t end=i+1;
+        auto next=address+4096;
+        while(end<window.watch_aliases.size() && next<limit) {
+            const auto& alias=window.watch_aliases[end];
+            if(alias.first!=next || alias.second->protection==protection || sealed_protection(*alias.second)!=protection)break;
+            ++end;next+=4096;
+        }
+        DWORD previous=0;++watched_protect_calls;
+        if(!VirtualProtect(reinterpret_cast<void*>(address),next-address,protection,&previous)){hr=HRESULT_FROM_WIN32(GetLastError());break;}
+        i=end;
+    }
+    // Publish cached state only after every virtual alias has been protected.
+    for(const auto& key:window.watch_keys) {
+        auto& page=watched_physical.at(key);page.protection=SUCCEEDED(hr) ? sealed_protection(page) : 0;
+    }
+    if(timing && watched_protect_calls>before && window.watch_keys.size()>=4096 && observations<24) {
+        ++observations;
+        const auto elapsed=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+        std::fprintf(stderr,"xone-era: timing seal pages=%zu calls=%llu elapsed_ms=%.3f\n",window.watch_keys.size(),
+            static_cast<unsigned long long>(watched_protect_calls-before),elapsed);
+    }
+    SetLastError(last_error);return hr;
+}
+HRESULT access_watched(WatchedPage& page,bool write,bool wait=true) {
     for(auto* window:page.windows) {
+        const auto retired=wait_gpu_window(*window,wait);if(FAILED(retired))return retired;
         if(window->active || window->preparing || window->completing) return E_PENDING;
-        const HRESULT hr=flush_gpu_window(*window);if(FAILED(hr))return hr;
+        const HRESULT hr=flush_gpu_window(*window,write ? "cpu-write" : "cpu-read");if(FAILED(hr))return hr;
     }
     if(write) {
         for(auto* window:page.windows) window->resident=false;
@@ -1273,7 +1427,7 @@ HRESULT initialize_gpu_tracking(TitleGpuResource& resource,GpuWindow& window) tr
     if(!window.texture.context || !window.texture.demand_coherence)return S_FALSE;
     const auto base=reinterpret_cast<std::uintptr_t>(resource.allocation);
     auto region=title_regions.upper_bound(base);if(region==title_regions.begin())return E_INVALIDARG;--region;
-    if(region->second.xmem)return S_FALSE; // Ordinary allocations retain the existing synchronous path.
+    if(region->second.xmem && !region->second.graphics)return S_FALSE; // Ordinary CPU/audio allocations retain the synchronous path.
     struct Handler {
         PVOID token=AddVectoredExceptionHandler(1,gpu_memory_fault);
         ~Handler(){if(token)RemoveVectoredExceptionHandler(token);}
@@ -1316,6 +1470,11 @@ HRESULT initialize_gpu_tracking(TitleGpuResource& resource,GpuWindow& window) tr
         }
         cursor+=length;
     }
+    for(const auto& key:window.watch_keys) {
+        auto& page=watched_physical.at(key);
+        for(auto address:page.aliases)window.watch_aliases.emplace_back(address,&page);
+    }
+    std::sort(window.watch_aliases.begin(),window.watch_aliases.end(),[](const auto& a,const auto& b){return a.first<b.first;});
     return S_OK;
 } catch(const std::bad_alloc&) {detach_gpu_tracking(window);return E_OUTOFMEMORY;}
 void detach_gpu_tracking(GpuWindow& window) {
@@ -1328,40 +1487,101 @@ void detach_gpu_tracking(GpuWindow& window) {
             watched_physical.erase(found);
         } else if(FAILED(seal_watched(page)))__fastfail(FAST_FAIL_FATAL_APP_EXIT);
     }
-    window.watch_keys.clear();window.segments.clear();window.tracked=false;window.resident=false;window.pending_cpu=false;
+    window.watch_aliases.clear();window.watch_keys.clear();window.segments.clear();window.tracked=false;window.resident=false;window.pending_cpu=false;window.superseded.clear();
 }
-HRESULT reset_gpu_tracking() {
-    for(auto& [key,page]:watched_physical)for(auto* window:page.windows)
-        if(window->active || window->preparing || window->completing)return E_PENDING;
-    for(auto& [key,page]:watched_physical)for(auto* window:page.windows){const auto hr=flush_gpu_window(*window);if(FAILED(hr))return hr;}
-    for(auto& [key,page]:watched_physical){const auto hr=protect_watched(page,PAGE_READWRITE);if(FAILED(hr))return hr;}
-    for(auto& [key,page]:watched_physical)for(auto* window:page.windows){window->tracked=false;window->resident=false;window->watch_keys.clear();window->segments.clear();}
-    for(auto& [address,key]:watched_virtual)key={};
-    watched_physical.clear();memory_changed.notify_all();return S_OK;
+HRESULT reset_gpu_windows(const std::vector<GpuWindow*>& affected) {
+    for(auto* window:affected)if(window->active || window->preparing || window->completing)return E_PENDING;
+    for(auto* window:affected){const auto hr=flush_gpu_window(*window);if(FAILED(hr))return hr;}
+    for(auto* window:affected)detach_gpu_tracking(*window);
+    memory_changed.notify_all();return S_OK;
 }
+HRESULT reset_gpu_tracking(std::uintptr_t start,SIZE_T size) try {
+    // Reference 1401de820/1401deed0: invalidate only representations touching the changed range.
+    std::vector<GpuWindow*> affected;
+    for(auto entry=watched_virtual.lower_bound(start);entry!=watched_virtual.end() && entry->first-start<size;++entry) {
+        if(!entry->second.first)continue;
+        for(auto* window:watched_physical.at(entry->second).windows)
+            if(std::find(affected.begin(),affected.end(),window)==affected.end())affected.push_back(window);
+    }
+    return reset_gpu_windows(affected);
+} catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+// Remapping ESRAM changes the virtual aliases of its physical pages; only their watchers detach.
+HRESULT reset_esram_tracking(const std::vector<UINT>& pages) try {
+    std::vector<GpuWindow*> affected;
+    const auto pool=reinterpret_cast<std::uintptr_t>(&esram);
+    for(const auto page:pages) {
+        const SIZE_T first=SIZE_T(page)*esram_page_bytes;
+        for(auto entry=watched_physical.lower_bound({pool,first});entry!=watched_physical.end() &&
+            entry->first.first==pool && entry->first.second<first+esram_page_bytes;++entry)
+            for(auto* window:entry->second.windows)
+                if(std::find(affected.begin(),affected.end(),window)==affected.end())affected.push_back(window);
+    }
+    // The current thread cannot wait for its own open GPU interval.
+    for(auto* window:affected)if(window->active && window->active_thread==GetCurrentThreadId())return HRESULT_FROM_WIN32(ERROR_BUSY);
+    return reset_gpu_windows(affected);
+} catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+
 void forget_tracked_addresses(std::uintptr_t start,SIZE_T size) {
     for(auto entry=watched_virtual.lower_bound(start);entry!=watched_virtual.end() && entry->first-start<size;)
         entry=watched_virtual.erase(entry);
 }
-HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write) {
+HRESULT cpu_memory_access(const void* address,SIZE_T size,bool write,bool wait) {
     if(!size)return S_OK;
     const auto start=reinterpret_cast<std::uintptr_t>(address);if(size>UINTPTR_MAX-start)return E_INVALIDARG;
     std::lock_guard lock(memory_mutex);
     auto current=watched_virtual.lower_bound(start&~std::uintptr_t(4095));
     for(;current!=watched_virtual.end() && current->first<start+size;++current) {
         if(!current->second.first)continue;
-        const auto hr=access_watched(watched_physical.at(current->second),write);if(FAILED(hr))return hr;
+        const auto hr=access_watched(watched_physical.at(current->second),write,wait);if(FAILED(hr))return hr;
     }
     return S_OK;
 }
+// Reference 1401ca160/14056ada0: ESRAM storage is keyed by description and ESRAM range, and
+// 140570490 keeps ESRAM GPU-resident, so distinct texture descriptions keep their own native
+// contents. Shared DDR pages, buffers and equivalent ESRAM storage still publish between aliases.
+bool independent_esram_alias(const GpuWindow& a,const GpuWindow& b) {
+    if(!a.texture.context || !b.texture.context)return false;
+    return !same_texture_description(a.texture,b.texture) || a.watch_keys.size()!=b.watch_keys.size() ||
+        a.watch_keys.front()!=b.watch_keys.front() || a.segments.front().offset%4096!=b.segments.front().offset%4096;
+}
+std::vector<GpuWindow*> coherent_aliases(const GpuWindow& window) {
+    std::vector<GpuWindow*> aliases,esram_aliases;
+    for(const auto& key:window.watch_keys) {
+        auto& found=key.first==reinterpret_cast<std::uintptr_t>(&esram) ? esram_aliases : aliases;
+        for(auto* alias:watched_physical.at(key).windows)
+            if(alias!=&window && std::find(found.begin(),found.end(),alias)==found.end())found.push_back(alias);
+    }
+    for(auto* alias:esram_aliases)
+        if(!independent_esram_alias(window,*alias) && std::find(aliases.begin(),aliases.end(),alias)==aliases.end())aliases.push_back(alias);
+    return aliases;
+}
+void publish_pending_gpu_window(GpuWindow& window) {
+    static UINT64 sequence=0;
+    window.pending_cpu=true;window.pending_sequence=++sequence;window.superseded.clear();window.htile_neutral=true;
+    for(auto* alias:coherent_aliases(window))alias->resident=false;
+}
 HRESULT prepare_gpu_tracking(TitleGpuResource& resource,GpuWindow& window,const TitleGpuClearState& clear,bool discard) {
     const auto hr=initialize_gpu_tracking(resource,window);if(hr!=S_OK)return hr;
-    for(const auto& key:window.watch_keys)for(auto* alias:watched_physical.at(key).windows)
-        if(alias!=&window){const auto flushed=flush_gpu_window(*alias);if(FAILED(flushed))return flushed;}
+    for(auto* alias:coherent_aliases(window)) {
+        static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+        static std::atomic<UINT> observations{0};
+        if(timing && alias->pending_cpu && alias->texture.resource_desc.Width>=1280 && observations.fetch_add(1)<16) {
+            const auto& from=alias->texture.resource_desc;const auto& to=window.texture.resource_desc;
+            SIZE_T shared_esram=0,shared_ddr=0;
+            for(const auto& key:window.watch_keys)if(std::find(alias->watch_keys.begin(),alias->watch_keys.end(),key)!=alias->watch_keys.end())
+                ++(key.first==reinterpret_cast<std::uintptr_t>(&esram) ? shared_esram : shared_ddr);
+            std::fprintf(stderr,"xone-era: timing alias from=%p format=%u %llux%u samples=%u bytes=%zu to=%p format=%u %llux%u samples=%u bytes=%zu discard=%u shared_esram=%zu shared_ddr=%zu\n",
+                static_cast<unsigned char*>(alias->tracked_resource.allocation)+alias->tracked_resource.canonical_offset,
+                from.Format,from.Width,from.Height,from.SampleDesc.Count,alias->tracked_resource.size,
+                static_cast<unsigned char*>(resource.allocation)+resource.canonical_offset,
+                to.Format,to.Width,to.Height,to.SampleDesc.Count,resource.size,UINT(discard),shared_esram,shared_ddr);
+        }
+        const auto flushed=flush_gpu_window(*alias,"alias");if(FAILED(flushed))return flushed;
+    }
     window.reuse=window.resident && window.resident_clear.depth==clear.depth && window.resident_clear.stencil==clear.stencil &&
-        window.resident_clear.known==clear.known && window.resident_clear.bypass_htile==clear.bypass_htile;
-    if(!window.reuse && !discard){const auto flushed=flush_gpu_window(window);if(FAILED(flushed))return flushed;}
-    for(const auto& key:window.watch_keys){const auto sealed=seal_watched(watched_physical.at(key));if(FAILED(sealed))return sealed;}
+        window.resident_clear.known==clear.known && (window.htile_neutral || window.resident_clear.bypass_htile==clear.bypass_htile);
+    if(!window.reuse && !discard){const auto flushed=flush_gpu_window(window,"clear-state");if(FAILED(flushed))return flushed;}
+    const auto sealed=seal_tracked_window(window);if(FAILED(sealed))return sealed;
     window.active_clear=clear;return S_OK;
 }
 void mirror_copy(GpuWindow& window,void* data,bool into_mirror) {
@@ -1371,10 +1591,28 @@ void mirror_copy(GpuWindow& window,void* data,bool into_mirror) {
         std::memcpy(into_mirror ? mirror : linear,into_mirror ? linear : mirror,span.length);
     }
 }
+// ESRAM aliases may hold several pending images. Publishing one marks the shared pages of older
+// pending images as superseded, so CPU access keeps the newest bytes without forcing older readbacks.
+void publish_mirror(GpuWindow& window,const void* data) {
+    if(window.superseded.empty()){mirror_copy(window,const_cast<void*>(data),true);return;}
+    const SIZE_T lead=window.segments.front().offset%4096; // Commits are page-aligned; keys follow pages.
+    for(const auto& span:window.segments) for(SIZE_T at=0;at<span.length;) {
+        const SIZE_T logical=span.logical+at,run=(std::min)(span.length-at,SIZE_T(4096-(lead+logical)%4096));
+        if(!window.superseded.count(window.watch_keys[(lead+logical)/4096]))
+            std::memcpy(static_cast<unsigned char*>(span.view.get())+span.offset+at,static_cast<const unsigned char*>(data)+logical,run);
+        at+=run;
+    }
+}
+void supersede_older_esram_images(GpuWindow& window) {
+    for(const auto& key:window.watch_keys) if(key.first==reinterpret_cast<std::uintptr_t>(&esram) && !window.superseded.count(key))
+        for(auto* alias:watched_physical.at(key).windows)
+            if(alias!=&window && alias->pending_cpu && alias->pending_sequence<window.pending_sequence)alias->superseded.insert(key);
+    window.superseded.clear();
+}
 }
 
 static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,
-                                bool texture, GpuBacking*& backing, GpuWindow*& window) {
+                                bool texture, GpuBacking*& backing, GpuWindow*& window,ID3D12CommandQueue* ordered_queue=nullptr) {
     if (!list || list->GetType() == D3D12_COMMAND_LIST_TYPE_BUNDLE) return E_INVALIDARG;
     if (list->GetType() == D3D12_COMMAND_LIST_TYPE_COPY && state != D3D12_RESOURCE_STATE_COMMON &&
         state != D3D12_RESOURCE_STATE_COPY_SOURCE && state != D3D12_RESOURCE_STATE_COPY_DEST) return DXGI_ERROR_UNSUPPORTED;
@@ -1383,6 +1621,9 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     if (!window || static_cast<bool>(window->texture.context) != texture) return E_INVALIDARG;
     if (texture && window->texture.resource_desc.SampleDesc.Count > 1 && list->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return DXGI_ERROR_UNSUPPORTED;
+    if(window->queued_fence && (!ordered_queue || window->ordered_queue.Get()!=ordered_queue || (texture && !window->tracked))) {
+        const auto retired=wait_gpu_window(*window);if(FAILED(retired))return retired;
+    }
     if (backing->retiring) return E_INVALIDARG;
     Microsoft::WRL::ComPtr<IUnknown> device;
     HRESULT hr = list->GetDevice(IID_PPV_ARGS(&device));
@@ -1396,7 +1637,13 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
         return HRESULT_FROM_WIN32(ERROR_BUSY);
     };
     for (const auto& [range, alias] : backing->windows) {
-        if (alias.cpu) return busy("CPU",range.first,range.second,&alias);
+        // Tracked textures seal whole 4-KiB pages; independent CPU ranges remain usable.
+        const bool tracked_pages=texture && window->texture.demand_coherence && buffer.composite;
+        const bool cpu_overlap=tracked_pages ?
+            buffer.canonical_offset/4096<=(range.first+range.second-1)/4096 &&
+                range.first/4096<=(buffer.canonical_offset+buffer.size-1)/4096 :
+            buffer.canonical_offset<range.first+range.second && range.first<buffer.canonical_offset+buffer.size;
+        if(alias.cpu && cpu_overlap)return busy("CPU",range.first,range.second,&alias);
         // The canonical parent has one D3D12 state. Independent queues/lists
         // must finish their fence before another list can transition it.
         if (alias.active && alias.list.Get() != list) return busy("other list",range.first,range.second,&alias);
@@ -1412,7 +1659,8 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
     if (texture && (state & ~(D3D12_RESOURCE_STATE_COPY_SOURCE | D3D12_RESOURCE_STATE_COPY_DEST |
         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_RENDER_TARGET |
-        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ))) return DXGI_ERROR_UNSUPPORTED;
+        D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ |
+        D3D12_RESOURCE_STATE_RESOLVE_SOURCE | D3D12_RESOURCE_STATE_RESOLVE_DEST))) return DXGI_ERROR_UNSUPPORTED;
     hr = physical_pages(buffer, window->physical_pages, true);
     if (FAILED(hr)) return hr;
     for (UINT page = 0; page < window->physical_pages.size(); ++page)
@@ -1421,46 +1669,57 @@ static HRESULT claim_gpu_window(TitleGpuResource& buffer, ID3D12GraphicsCommandL
             return busy("ESRAM page",page,esram_page_bytes,nullptr);
         }
     for (UINT page = 0; page < window->physical_pages.size(); ++page)
-        if (window->physical_pages[page]) esram.pages[page].gpu = &buffer;
+        if (window->physical_pages[page]) {esram.pages[page].gpu = &buffer;esram.pages[page].gpu_thread = GetCurrentThreadId();}
     window->active = &buffer; window->list = list; window->state = state; window->copied_back = false;
     window->active_thread=GetCurrentThreadId();
     return S_OK;
 }
 
-static HRESULT prepare_staged_buffer(GpuWindow& window, const void* canonical, SIZE_T bytes) {
-    if (!bytes || bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
-    if (!window.upload) {
-        Microsoft::WRL::ComPtr<ID3D12Device> device;
-        HRESULT hr = window.resource->GetDevice(IID_PPV_ARGS(&device));
-        if (FAILED(hr)) return hr;
-        auto desc = window.resource->GetDesc(); desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-        D3D12_HEAP_PROPERTIES heap{}; heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-        Microsoft::WRL::ComPtr<ID3D12Resource> upload, readback;
-        hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&upload));
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        if (SUCCEEDED(hr)) hr = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
-        if (FAILED(hr)) return hr;
-        window.upload = std::move(upload); window.readback = std::move(readback); window.staging_bytes = bytes;
+static HRESULT prepare_staged_buffer(GpuWindow& window,const void* canonical,SIZE_T bytes,bool snapshot=false) {
+    if(!bytes || bytes>(1ull<<30))return DXGI_ERROR_UNSUPPORTED;
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    auto hr=window.resource->GetDevice(IID_PPV_ARGS(&device));if(FAILED(hr))return hr;
+    auto desc=window.resource->GetDesc();desc.Flags=D3D12_RESOURCE_FLAG_NONE;
+    D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_UPLOAD;
+    const auto completed=window.queued_fence ? window.queued_fence->GetCompletedValue() : 0;
+    if(window.queued_fence && completed==UINT64_MAX)return DXGI_ERROR_DEVICE_REMOVED;
+    const bool in_flight=window.queued_fence && completed<window.queued_value;
+    if(!window.upload || (snapshot && in_flight)) {
+        Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+        hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&upload));
+        if(FAILED(hr))return hr;
+        window.upload=std::move(upload);
     }
-    void* mapped = nullptr; const D3D12_RANGE no_read{0, 0};
-    const HRESULT hr = window.upload->Map(0, &no_read, &mapped);
-    if (FAILED(hr)) return hr;
-    std::memcpy(mapped, canonical, bytes);
-    const D3D12_RANGE written{0, bytes}; window.upload->Unmap(0, &written);
+    if(!snapshot && !window.readback) {
+        heap.Type=D3D12_HEAP_TYPE_READBACK;
+        hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&window.readback));
+        if(FAILED(hr))return hr;
+    }
+    window.staging_bytes=bytes;
+    void* mapped=nullptr;const D3D12_RANGE no_read{0,0};
+    hr=window.upload->Map(0,&no_read,&mapped);if(FAILED(hr))return hr;
+    std::memcpy(mapped,canonical,bytes);
+    const D3D12_RANGE written{0,bytes};window.upload->Unmap(0,&written);
+    window.upload_snapshot=snapshot;
     return S_OK;
 }
 
 static bool gpu_read_only(D3D12_RESOURCE_STATES state);
-HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only) {
+HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only,ID3D12CommandQueue* ordered_queue) {
     if(read_only && !gpu_read_only(state))return E_INVALIDARG;
     std::lock_guard lock(memory_mutex);
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
-    const HRESULT hr = claim_gpu_window(buffer, list, state, false, backing, window);
+    if(ordered_queue && !read_only) {
+        if(auto* previous=gpu_window(buffer,gpu_backing(buffer))) {const auto retired=wait_gpu_window(*previous);if(FAILED(retired))return retired;}
+    }
+    const HRESULT hr = claim_gpu_window(buffer, list, state, false, backing, window,ordered_queue);
     if (FAILED(hr)) return hr;
     window->read_only=read_only;
-    if (window->staged_buffer) {
+    const bool snapshot=ordered_queue && read_only;
+    window->upload_snapshot=false;
+    if (window->staged_buffer || snapshot) {
         const auto* canonical = static_cast<unsigned char*>(buffer.allocation) + buffer.canonical_offset;
-        const HRESULT prepared = prepare_staged_buffer(*window, canonical, buffer.size);
+        const HRESULT prepared = prepare_staged_buffer(*window, canonical, buffer.size,snapshot);
         if (FAILED(prepared)) {
             release_physical(*window, &buffer, false); window->active = nullptr; window->list.Reset();
             return prepared;
@@ -1516,7 +1775,7 @@ static HRESULT prepare_sample_array(GpuWindow& window, ID3D12Device* device, D3D
     const UINT64 bytes = desc.Width * desc.Height * samples * sample_pixel_bytes(desc.Format);
     if (!bytes || bytes > (1ull << 30)) return DXGI_ERROR_UNSUPPORTED;
     auto transfer = std::make_unique<SampleTransfer>();
-    HRESULT hr = transfer->initialize(device, desc.Format, samples);
+    HRESULT hr = transfer->initialize(device, desc.Format, samples, desc.SampleDesc.Quality);
     if (FAILED(hr)) return hr;
     desc.SampleDesc = {1, 0}; desc.DepthOrArraySize = static_cast<UINT16>(samples); desc.Alignment = 0;
     if (depth_stencil) { desc.Format=DXGI_FORMAT_R32G32_UINT; desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET; }
@@ -1588,11 +1847,13 @@ static void interleave_samples(GpuWindow& window, void* mapped, bool into_array)
 }
 
 namespace {
-HRESULT record_texture_readback(GpuWindow* window,ID3D12GraphicsCommandList* list,D3D12_RESOURCE_STATES before) {
+HRESULT record_texture_readback(GpuWindow* window,ID3D12GraphicsCommandList* list,D3D12_RESOURCE_STATES before,ID3D12QueryHeap* timestamps=nullptr) {
     if(window->gpu_layout_active) {
+        if(timestamps)list->EndQuery(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,1);
         gpu_transition(list,window->resource.Get(),before,D3D12_RESOURCE_STATE_COPY_SOURCE);
         window->layout_transfer->retile(list,window->resource.Get());
         gpu_transition(list,window->resource.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+        if(timestamps)list->EndQuery(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,2);
         return S_OK;
     }
     auto* copy_source = window->sample_array ? window->sample_array.Get() : window->resource.Get();
@@ -1610,7 +1871,9 @@ HRESULT record_texture_readback(GpuWindow* window,ID3D12GraphicsCommandList* lis
         }
         gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
     } else gpu_transition(list, window->resource.Get(), before, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    for (UINT i = 0; i < window->footprints.size(); ++i) {
+    if(timestamps)list->EndQuery(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,1);
+    if(window->gpu_sample_layout_active)window->sample_layout_transfer->retile_samples(list,copy_source);
+    else for (UINT i = 0; i < window->footprints.size(); ++i) {
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = copy_source; source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         source.SubresourceIndex = i;
@@ -1621,6 +1884,7 @@ HRESULT record_texture_readback(GpuWindow* window,ID3D12GraphicsCommandList* lis
     }
     gpu_transition(list, copy_source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     if (window->sample_array) gpu_transition(list, window->resource.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if(timestamps)list->EndQuery(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,2);
     return S_OK;
 }
 
@@ -1652,32 +1916,83 @@ HRESULT capture_gpu_image(GpuWindow& window) {
     }
     auto& copy=*backing->coherence;
     auto hr=wait_coherence_copy(copy);if(FAILED(hr))return hr;
+    static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+    static std::atomic<UINT> observations{0};
+    const auto& desc=window.texture.resource_desc;
+    const bool observe=timing && desc.Width>=1280 && desc.SampleDesc.Count>1 && observations.fetch_add(1)<24;
+    if(observe && !copy.timing_attempted) {
+        copy.timing_attempted=true;
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        HRESULT measured=window.resource->GetDevice(IID_PPV_ARGS(&device));
+        const D3D12_QUERY_HEAP_DESC query{D3D12_QUERY_HEAP_TYPE_TIMESTAMP,3,0};
+        if(SUCCEEDED(measured))measured=device->CreateQueryHeap(&query,IID_PPV_ARGS(&copy.timestamps));
+        D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;buffer.Width=3*sizeof(UINT64);
+        buffer.Height=buffer.DepthOrArraySize=buffer.MipLevels=1;buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;
+        if(SUCCEEDED(measured))measured=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&copy.timing_readback));
+        if(SUCCEEDED(measured))measured=copy.queue->GetTimestampFrequency(&copy.timestamp_frequency);
+        if(FAILED(measured) || !copy.timestamp_frequency) {
+            copy.timestamps.Reset();copy.timing_readback.Reset();
+            std::fprintf(stderr,"xone-era: coherence GPU timing unavailable 0x%08lX\n",measured);
+        }
+    }
+    auto* timestamps=observe ? copy.timestamps.Get():nullptr;
     hr=copy.allocator->Reset();if(SUCCEEDED(hr))hr=copy.list->Reset(copy.allocator.Get(),nullptr);
-    if(SUCCEEDED(hr))hr=record_texture_readback(&window,copy.list.Get(),D3D12_RESOURCE_STATE_COMMON);
+    if(SUCCEEDED(hr) && timestamps)copy.list->EndQuery(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,0);
+    if(SUCCEEDED(hr))hr=record_texture_readback(&window,copy.list.Get(),D3D12_RESOURCE_STATE_COMMON,timestamps);
+    if(SUCCEEDED(hr) && timestamps)copy.list->ResolveQueryData(timestamps,D3D12_QUERY_TYPE_TIMESTAMP,0,3,copy.timing_readback.Get(),0);
     if(SUCCEEDED(hr))hr=copy.list->Close();if(FAILED(hr))return hr;
     ID3D12CommandList* lists[]{copy.list.Get()};copy.queue->ExecuteCommandLists(1,lists);
     ++copy.value;hr=copy.queue->Signal(copy.fence.Get(),copy.value);if(FAILED(hr))return hr;
-    return wait_coherence_copy(copy);
+    hr=wait_coherence_copy(copy);
+    if(SUCCEEDED(hr) && timestamps) {
+        void* mapped=nullptr;const D3D12_RANGE read{0,3*sizeof(UINT64)};
+        if(SUCCEEDED(copy.timing_readback->Map(0,&read,&mapped))) {
+            UINT64 ticks[3]{};std::memcpy(ticks,mapped,sizeof ticks);
+            const D3D12_RANGE no_write{0,0};copy.timing_readback->Unmap(0,&no_write);
+            if(ticks[0]<=ticks[1] && ticks[1]<=ticks[2])std::fprintf(stderr,
+                "xone-era: timing coherence-gpu host_ms=%llu format=%u export=%.3f transport=%.3f total=%.3f ms\n",GetTickCount64(),desc.Format,
+                double(ticks[1]-ticks[0])*1000/copy.timestamp_frequency,double(ticks[2]-ticks[1])*1000/copy.timestamp_frequency,
+                double(ticks[2]-ticks[0])*1000/copy.timestamp_frequency);
+        }
+    }
+    return hr;
 }
-HRESULT flush_gpu_window(GpuWindow& window) {
+HRESULT flush_gpu_window(GpuWindow& window,const char* reason) {
+    const auto retired=wait_gpu_window(window);if(FAILED(retired))return retired;
     if(!window.pending_cpu)return S_OK;
     if(window.completing)return E_PENDING;
+    static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+    static std::atomic<UINT> observations{0};
+    const auto& observed=window.texture.resource_desc;
+    const bool measure=timing && observed.Width>=1280 && observed.SampleDesc.Count>1 && observations.fetch_add(1)<24;
+    const auto started=measure ? std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    auto captured=started,mirrored=started;
+    if(measure)
+        std::fprintf(stderr,"xone-era: timing coherence reason=%s backing=%p %llux%u format=%u samples=%u bytes=%zu resident=%u\n",
+            reason,static_cast<unsigned char*>(window.tracked_resource.allocation)+window.tracked_resource.canonical_offset,
+            observed.Width,observed.Height,observed.Format,observed.SampleDesc.Count,window.tracked_resource.size,window.resident);
     window.completing=true;
     HRESULT hr=S_OK;
+    const bool gpu_layout=window.gpu_layout_active || window.gpu_sample_layout_active;
     std::vector<unsigned char> commit;
     try {
         hr=capture_gpu_image(window);
         if(FAILED(hr)){window.completing=false;return hr;}
-        commit.resize(window.tracked_resource.size);mirror_copy(window,commit.data(),false);
+        if(measure)captured=std::chrono::steady_clock::now();
+        if(!gpu_layout){commit.resize(window.tracked_resource.size);mirror_copy(window,commit.data(),false);}
+        if(measure)mirrored=std::chrono::steady_clock::now();
     }
     catch(const std::bad_alloc&){window.completing=false;return E_OUTOFMEMORY;}
-    auto* readback=window.gpu_layout_active ? window.layout_transfer->readback() : window.readback.Get();
-    const D3D12_RANGE read{0,window.gpu_layout_active ? window.tracked_resource.size : SIZE_T(window.staging_bytes)};
+    auto* readback=window.gpu_layout_active ? window.layout_transfer->readback() :
+        window.gpu_sample_layout_active ? window.sample_layout_transfer->readback() : window.readback.Get();
+    const D3D12_RANGE read{0,gpu_layout ? window.tracked_resource.size : SIZE_T(window.staging_bytes)};
     void* mapped=nullptr;
     hr=readback->Map(0,&read,&mapped);
     if(SUCCEEDED(hr)) {
         try {
-            if(window.gpu_layout_active)std::memcpy(commit.data(),mapped,commit.size());
+            // Raw GPU transport already includes canonical padding; no fallible conversion follows Map.
+            if(gpu_layout)publish_mirror(window,mapped);
             else if(window.sample_array) {
                 interleave_samples(window,mapped,false);
                 const auto& desc=window.texture.resource_desc;
@@ -1693,8 +2008,16 @@ HRESULT flush_gpu_window(GpuWindow& window) {
         const D3D12_RANGE no_write{0,0};readback->Unmap(0,&no_write);
     }
     if(SUCCEEDED(hr)) {
-        mirror_copy(window,commit.data(),true);window.pending_cpu=false;
-        for(const auto& key:window.watch_keys){hr=seal_watched(watched_physical.at(key));if(FAILED(hr))break;}
+        if(!gpu_layout)publish_mirror(window,commit.data());
+        supersede_older_esram_images(window);
+        window.pending_cpu=false;
+        hr=seal_tracked_window(window);
+    }
+    if(measure) {
+        const auto finished=std::chrono::steady_clock::now();
+        const auto ms=[](auto interval){return std::chrono::duration<double,std::milli>(interval).count();};
+        std::fprintf(stderr,"xone-era: timing coherence-copy reason=%s format=%u capture=%.3f mirror=%.3f publish=%.3f total=%.3f ms gpu=%u hr=0x%08lX\n",
+            reason,observed.Format,ms(captured-started),ms(mirrored-captured),ms(finished-mirrored),ms(finished-started),UINT(gpu_layout),hr);
     }
     window.completing=false;memory_changed.notify_all();return hr;
 }
@@ -1734,7 +2057,45 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,const T
             window.upload = std::move(upload); window.readback = std::move(readback);
         }
         window.gpu_layout_active=false;
+        window.gpu_sample_layout_active=false;
         static const bool cpu_layout=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_CPU_LAYOUT",value,2)==1 && value[0]==L'1';}();
+        {
+            static const bool timing=[] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}();
+            static std::atomic<UINT> observations{0};
+            const auto& d=window.texture.resource_desc;
+            if(timing && d.SampleDesc.Count>1 && d.Width>=1280 && observations.fetch_add(1)<8)
+                std::fprintf(stderr,"xone-era: timing sample-ingress format=%u gpu_allowed=%u input=%u array=%u offsets=%u refused=%u transfer=%u discard=%u bypass=%u\n",
+                    d.Format,UINT(gpu_allowed),UINT(input!=nullptr),UINT(window.sample_array!=nullptr),UINT(window.texture.sample_offsets!=nullptr),
+                    UINT(window.sample_layout_refused),UINT(window.sample_layout_transfer!=nullptr),UINT(discard_contents),UINT(clear.bypass_htile));
+        }
+        if(gpu_allowed && !cpu_layout && !input && window.sample_array && window.texture.sample_offsets && !window.sample_layout_refused) {
+            if(!window.sample_layout_transfer) {
+                TitleTextureSampleOffsets offsets;
+                const auto ready=window.texture.sample_offsets(window.texture.context.get(),&offsets);
+                if(FAILED(ready))return ready;
+                if(ready!=S_OK && [] {wchar_t value[2]{};return GetEnvironmentVariableW(L"XONE_ERA_TIMING",value,2)==1 && value[0]==L'1';}())std::fprintf(stderr,"xone-era: timing sample-layout unavailable hr=0x%08lX\n",ready);
+                if(ready==S_OK) {
+                    Microsoft::WRL::ComPtr<ID3D12Device> device;
+                    const auto bound=window.resource->GetDevice(IID_PPV_ARGS(&device));if(FAILED(bound))return bound;
+                    auto transfer=std::make_unique<TextureLayoutTransfer>();
+                    const auto& d=window.texture.resource_desc;
+                    const auto result=transfer->initialize_samples(device.Get(),offsets,UINT(d.Width),d.Height,window.footprints,window.texture.bytes,window.texture.context);
+                    if(result==S_OK)window.sample_layout_transfer=std::move(transfer);else window.sample_layout_refused=true;
+                    wchar_t timing[2]{};
+                    if(GetEnvironmentVariableW(L"XONE_ERA_TIMING",timing,2)==1 && timing[0]==L'1')
+                        std::fprintf(stderr,"xone-era: timing sample-layout=%s %llux%u samples=%u format=%u bytes=%zu hr=0x%08lX\n",
+                            result==S_OK ? "gpu" : "cpu",d.Width,d.Height,d.SampleDesc.Count,d.Format,window.texture.bytes,result);
+                }
+            }
+            if(window.sample_layout_transfer) {
+                if(!discard_contents) {
+                    const auto valid=window.sample_layout_transfer->validate_samples(canonical,clear.bypass_htile);if(FAILED(valid))return valid;
+                }
+                const auto result=window.sample_layout_transfer->prepare(canonical);if(FAILED(result))return result;
+                window.gpu_sample_layout_active=true;
+                if(!discard_contents)return S_OK;
+            }
+        }
         if(gpu_allowed && !cpu_layout && !input && !window.sample_array && window.footprints.size()==1 &&
             window.texture.offsets && !window.gpu_layout_refused) {
             if(!window.layout_transfer) {
@@ -1805,18 +2166,19 @@ static HRESULT prepare_texture_upload(GpuWindow& window, void* canonical,const T
 }
 
 HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents,
-                                const D3D12_SUBRESOURCE_DATA* input,bool read_only) {
+                                const D3D12_SUBRESOURCE_DATA* input,bool read_only,ID3D12CommandQueue* ordered_queue) {
     if(discard_contents && input) return E_INVALIDARG;
     if(read_only && (discard_contents || input || !gpu_read_only(state)))return E_INVALIDARG;
     std::unique_lock lock(memory_mutex);
     GpuBacking* backing = nullptr; GpuWindow* window = nullptr;
-    HRESULT hr = claim_gpu_window(texture, list, state, true, backing, window);
+    HRESULT hr = claim_gpu_window(texture, list, state, true, backing, window,ordered_queue);
     if (FAILED(hr)) {std::fprintf(stderr,"xone-era: texture ingress claim failed 0x%08lX\n",hr);return hr;}
     window->read_only=read_only;
     if(discard_contents) {
         const auto& desc=window->texture.resource_desc;
-        if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels!=1 || desc.DepthOrArraySize!=1 ||
-            (state!=D3D12_RESOURCE_STATE_RENDER_TARGET && state!=D3D12_RESOURCE_STATE_DEPTH_WRITE)) {
+        const bool full_copy=state==D3D12_RESOURCE_STATE_COPY_DEST || state==D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        if(!full_copy && (desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.MipLevels!=1 || desc.DepthOrArraySize!=1 ||
+            (state!=D3D12_RESOURCE_STATE_RENDER_TARGET && state!=D3D12_RESOURCE_STATE_DEPTH_WRITE))) {
             release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();return E_INVALIDARG;
         }
     }
@@ -1831,10 +2193,17 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
         hr=flush_gpu_window(*window);
         if(FAILED(hr)){release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();window->preparing=false;memory_changed.notify_all();return hr;}
     }
-    if(window->tracked && window->reuse && !discard_contents && !input) {
+    // Reference 14055c940/1401bdea0: a full native clear does not re-upload an unchanged resident image.
+    if(window->tracked && !input && (discard_contents ? window->resident && window->upload : window->reuse)) {
         window->preparing=false;
         gpu_transition(list,texture.resource,D3D12_RESOURCE_STATE_COMMON,state);
         return S_OK;
+    }
+    window->htile_neutral=false; // The upload below decodes canonical bytes with this interval's HTILE mode.
+    if(discard_contents) {
+        // Only the staging refresh below must wait before overwriting an earlier submission's upload.
+        hr=wait_gpu_window(*window);
+        if(FAILED(hr)){release_physical(*window,&texture,false);window->active=nullptr;window->list.Reset();window->preparing=false;memory_changed.notify_all();return hr;}
     }
     std::vector<unsigned char> incoming;
     if(window->tracked) try {
@@ -1861,7 +2230,8 @@ HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommand
     }
     auto* copy_target = window->sample_array ? window->sample_array.Get() : texture.resource;
     gpu_transition(list, copy_target, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    for (UINT i = 0; i < window->footprints.size(); ++i) {
+    if(window->gpu_sample_layout_active)window->sample_layout_transfer->detile_samples(list,copy_target);
+    else for (UINT i = 0; i < window->footprints.size(); ++i) {
         D3D12_TEXTURE_COPY_LOCATION source{};
         source.pResource = window->upload.Get(); source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         source.PlacedFootprint = window->footprints[i];
@@ -1906,6 +2276,90 @@ HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandLi
     return hr;
 }
 
+namespace {
+struct QueuedGpuResources {
+    std::vector<TitleGpuResource> pins;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> uploads;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    UINT64 value=0;
+    ~QueuedGpuResources() {
+        if(fence) {
+            const auto completed=fence->GetCompletedValue();
+            bool retired=completed!=UINT64_MAX;
+            if(retired && completed<value) {
+                Microsoft::WRL::Wrappers::Event event(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+                retired=event.IsValid() && SUCCEEDED(fence->SetEventOnCompletion(value,event.Get())) &&
+                    WaitForSingleObject(event.Get(),5000)==WAIT_OBJECT_0 && fence->GetCompletedValue()!=UINT64_MAX;
+            }
+            if(!retired) {
+                std::fputs("xone-era: queued resource retirement failed; retaining in-flight ownership\n",stderr);
+                RaiseFailFastException(nullptr,nullptr,0);std::abort();
+            }
+            for(auto& pin:pins)if(FAILED(release_title_gpu_resource(pin,fence.Get(),value))) {
+                std::fputs("xone-era: queued resource release failed\n",stderr);
+                RaiseFailFastException(nullptr,nullptr,0);std::abort();
+            }
+        } else {
+            std::lock_guard lock(memory_mutex);
+            for(auto& pin:pins) {
+                auto* backing=gpu_backing(pin);auto* window=gpu_window(pin,backing);
+                --window->owners;--backing->gpu_pins;pin.resource->Release();
+            }
+        }
+    }
+};
+}
+HRESULT prepare_title_gpu_submission(std::span<TitleGpuResource* const> resources,std::shared_ptr<void>& lease) try {
+    lease.reset();
+    std::lock_guard lock(memory_mutex);
+    for(SIZE_T i=0;i<resources.size();++i) {
+        auto* resource=resources[i];
+        if(!resource || std::find(resources.begin(),resources.begin()+i,resource)!=resources.begin()+i)return E_INVALIDARG;
+        auto* window=gpu_window(*resource,gpu_backing(*resource));
+        if(!window || window->active!=resource || !window->copied_back)return E_INVALIDARG;
+        if(window->texture.context ? (!window->tracked && !window->read_only) : (!window->read_only || !window->upload_snapshot))return S_FALSE;
+    }
+    auto retained=std::make_shared<QueuedGpuResources>();
+    retained->pins.reserve(resources.size());retained->uploads.reserve(resources.size());
+    for(auto* resource:resources) {
+        auto* backing=gpu_backing(*resource);auto* window=gpu_window(*resource,backing);
+        retained->pins.push_back(*resource);++window->owners;++backing->gpu_pins;resource->resource->AddRef();
+        if(!window->texture.context)retained->uploads.push_back(window->upload);
+    }
+    lease=std::move(retained);return S_OK;
+} catch(const std::bad_alloc&) {return E_OUTOFMEMORY;}
+HRESULT publish_title_gpu_submission(const std::shared_ptr<void>& lease,ID3D12CommandQueue* queue,ID3D12Fence* fence,UINT64 value) {
+    if(!lease || !queue || !fence)return E_INVALIDARG;
+    const auto retained=std::static_pointer_cast<QueuedGpuResources>(lease);
+    std::lock_guard lock(memory_mutex);
+    if(retained->fence)return E_INVALIDARG;
+    Microsoft::WRL::ComPtr<IUnknown> queue_device,fence_device;
+    auto hr=queue->GetDevice(IID_PPV_ARGS(&queue_device));if(SUCCEEDED(hr))hr=fence->GetDevice(IID_PPV_ARGS(&fence_device));
+    if(FAILED(hr))return hr;
+    if(queue_device.Get()!=fence_device.Get())return DXGI_ERROR_INVALID_CALL;
+    for(auto& pin:retained->pins) {
+        auto* backing=gpu_backing(pin);auto* window=gpu_window(pin,backing);
+        if(!window || !window->active || !window->copied_back)return E_INVALIDARG;
+        if(backing->device.Get()!=queue_device.Get())return DXGI_ERROR_INVALID_CALL;
+    }
+    retained->fence=fence;retained->value=value;
+    for(auto& pin:retained->pins) {
+        auto* window=gpu_window(pin,gpu_backing(pin));
+        if(!window || !window->active || !window->copied_back)return E_INVALIDARG;
+        if(window->tracked) {
+            window->tracked_resource=pin;
+            if(!window->read_only) {
+                publish_pending_gpu_window(*window);
+            }
+            window->resident_clear=window->active_clear;window->resident=true;
+        }
+        window->queued_fence=fence;window->queued_value=value;window->ordered_queue=queue;
+        release_physical(*window,window->active,false);window->active=nullptr;window->list.Reset();window->copied_back=false;window->active_thread=0;
+        if(window->tracked) {const auto hr=seal_tracked_window(*window);if(FAILED(hr))return hr;}
+    }
+    memory_changed.notify_all();return S_OK;
+}
+
 HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value) {
     std::unique_lock lock(memory_mutex);
     auto* backing = gpu_backing(buffer);
@@ -1917,18 +2371,17 @@ HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence
     if(window->tracked) {
         window->tracked_resource=buffer;
         if(!window->read_only) {
-            window->pending_cpu=true;
-            for(const auto& key:window->watch_keys)for(auto* alias:watched_physical.at(key).windows)alias->resident=false;
+            publish_pending_gpu_window(*window);
         }
         window->resident_clear=window->active_clear;window->resident=true;
         release_physical(*window,&buffer,false);window->active=nullptr;window->list.Reset();window->copied_back=false;window->active_thread=0;
-        for(const auto& key:window->watch_keys){const auto sealed=seal_watched(watched_physical.at(key));if(FAILED(sealed))return sealed;}
+        const auto sealed=seal_tracked_window(*window);if(FAILED(sealed))return sealed;
         memory_changed.notify_all();return S_OK;
     }
-    if(window->gpu_layout_active && !window->read_only) {
+    if((window->gpu_layout_active || window->gpu_sample_layout_active) && !window->read_only) {
         // The GPU snapshot already contains every texel and padding byte.
         // Map may fail before publication; no fallible conversion follows it.
-        window->completing=true;auto* readback=window->layout_transfer->readback();
+        window->completing=true;auto* readback=window->gpu_layout_active ? window->layout_transfer->readback() : window->sample_layout_transfer->readback();
         const D3D12_RANGE read{0,buffer.size};void* mapped=nullptr;
         lock.unlock();const HRESULT mapped_result=readback->Map(0,&read,&mapped);lock.lock();
         if(FAILED(mapped_result)){window->completing=false;return mapped_result;}
@@ -1987,7 +2440,10 @@ HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address,bool wai
             auto* backing = gpu_backing(buffer);
             auto* window = gpu_window(buffer, backing);
             if (!window || backing->retiring) return E_INVALIDARG;
-            const auto synchronized=cpu_memory_access(static_cast<unsigned char*>(buffer.allocation)+buffer.canonical_offset,buffer.size,true);
+            if(window->texture.context || !window->read_only || !window->upload_snapshot) {
+                const auto retired=wait_gpu_window(*window,wait);if(FAILED(retired))return retired;
+            }
+            const auto synchronized=cpu_memory_access(static_cast<unsigned char*>(buffer.allocation)+buffer.canonical_offset,buffer.size,true,wait);
             if(FAILED(synchronized))return synchronized;
             for (const auto& [range, alias] : backing->windows) {
                 if (alias.active) return E_PENDING;
@@ -2016,17 +2472,31 @@ HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address,bool wai
     }
 }
 
+HRESULT title_gpu_resources_overlap(const TitleGpuResource& first,const TitleGpuResource& second,bool& overlap) {
+    overlap=false;
+    std::lock_guard lock(memory_mutex);
+    auto* a=gpu_backing(first);auto* b=gpu_backing(second);
+    if(!gpu_window(first,a) || !gpu_window(second,b))return E_INVALIDARG;
+    if(a==b && first.canonical_offset<second.canonical_offset+second.size && second.canonical_offset<first.canonical_offset+first.size) {
+        overlap=true;return S_OK;
+    }
+    std::array<bool,512> left{},right{};
+    auto hr=physical_pages(first,left,false);if(SUCCEEDED(hr))hr=physical_pages(second,right,false);
+    if(FAILED(hr))return hr;
+    for(UINT page=0;page<left.size();++page)if(left[page] && right[page]){overlap=true;break;}
+    return S_OK;
+}
 HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer) {
     std::lock_guard lock(memory_mutex);
     auto* window = gpu_window(buffer, gpu_backing(buffer));
     if (!window || window->cpu != &buffer) return E_INVALIDARG;
     release_physical(*window, &buffer, true);
     window->cpu = nullptr;
-    if(window->tracked)for(const auto& key:window->watch_keys){const auto hr=seal_watched(watched_physical.at(key));if(FAILED(hr))return hr;}
+    if(window->tracked){const auto hr=seal_tracked_window(*window);if(FAILED(hr))return hr;}
     memory_changed.notify_all();
     return S_OK;
 }
-HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil) {
+HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil,bool native_write) {
     FLOAT value=0;std::memcpy(&value,&depth,sizeof value);
     if(!aspects || (aspects&~3u) || ((aspects&1) && !(value>=0.f && value<=1.f))) return E_INVALIDARG;
     std::lock_guard lock(memory_mutex);
@@ -2038,20 +2508,23 @@ HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth
     if(aspects&1) resource.clear.depth=depth;
     if(aspects&2) resource.clear.stencil=stencil;
     resource.clear.known|=UINT8(aspects);
+    // A recorded native clear changes the resident image as well as its logical clear register.
+    if(native_write && window->tracked && window->resident)window->resident_clear=resource.clear;
     return S_OK;
 }
 
-HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value) {
+HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value,bool retained_owner) {
     if (!buffer.resource || !fence) return E_INVALIDARG;
+    std::shared_ptr<void> allocation_owner; // Release callbacks only after pins and tracked views have retired.
     GpuWindows::node_type retired_window; // Destroy original layout helpers after releasing the registry lock.
     std::lock_guard lock(memory_mutex);
     const auto base = reinterpret_cast<std::uintptr_t>(buffer.allocation);
     auto found = title_regions.upper_bound(base);
     if (found == title_regions.begin()) return E_INVALIDARG;
     --found;
-    if (buffer.composite && (found->first != base || !found->second.graphics || found->second.xmem)) return E_INVALIDARG;
+    if (buffer.composite && (found->first != base || !found->second.graphics)) return E_INVALIDARG;
     auto* backing = static_cast<GpuBacking*>(&found->second);
-    if (!found->second.xmem && !buffer.composite) {
+    if ((!found->second.xmem || found->second.graphics) && !buffer.composite) {
         const auto commit = found->second.commits.find(base);
         if (commit == found->second.commits.end()) return E_INVALIDARG;
         backing = &commit->second;
@@ -2059,14 +2532,17 @@ HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence,
     if (!backing->gpu_pins) return E_INVALIDARG;
     auto* window = gpu_window(buffer, backing);
     if (buffer.representation ? !window : backing->buffer.Get() != buffer.resource) return E_INVALIDARG;
-    if (window && window->cpu) return E_PENDING;
-    if (window && (window->texture.context || window->staged_buffer) && window->active) return E_PENDING;
-    if (window && window->active && (window->active != &buffer || !window->copied_back)) return E_PENDING;
+    // A cached logical owner can retire without canceling another alias's active use.
+    const bool shared_use=retained_owner && window && window->owners>1 && (window->active || window->cpu) &&
+        window->active!=&buffer && window->cpu!=&buffer;
+    if (window && window->cpu && !shared_use) return E_PENDING;
+    if (window && (window->texture.context || window->staged_buffer) && window->active && !shared_use) return E_PENDING;
+    if (window && window->active && (window->active != &buffer || !window->copied_back) && !shared_use) return E_PENDING;
     const HRESULT hr = completed_fence(backing, fence, value);
-    if (FAILED(hr)) return hr;
+    if(FAILED(hr) && !(hr==E_PENDING && retained_owner && window && window->owners>1 && window->queued_fence))return hr;
     if (window) {
-        const auto synchronized=flush_gpu_window(*window);if(FAILED(synchronized))return synchronized;
-        window->active = nullptr; window->list.Reset(); window->copied_back = false;
+        if(window->owners==1) {const auto synchronized=flush_gpu_window(*window);if(FAILED(synchronized))return synchronized;}
+        if(!shared_use){window->active=nullptr;window->list.Reset();window->copied_back=false;}
         if (!--window->owners) {
             detach_gpu_tracking(*window);
             const auto range = backing->windows.equal_range({buffer.canonical_offset, buffer.size});
@@ -2075,9 +2551,12 @@ HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence,
         }
     }
     buffer.resource->Release();
+    allocation_owner=std::move(buffer.allocation_owner);
     buffer = {};
     --backing->gpu_pins;
-    if (backing->retiring && !backing->gpu_pins && !destroy_region(found))
+    if (found->second.retiring && !found->second.gpu_pins &&
+        std::none_of(found->second.commits.begin(),found->second.commits.end(),[](const auto& entry){return entry.second.gpu_pins!=0;}) &&
+        !destroy_region(found))
         return HRESULT_FROM_WIN32(GetLastError());
     return S_OK;
 }
@@ -2113,20 +2592,30 @@ void unpin_title_audio_memory(void* address) {
 
 void set_title_module(void* base) { title_module.store(static_cast<HMODULE>(base)); }
 
-void set_title_storage_root(const std::wstring& root) {
+[[noreturn]] void WINAPI era_ExitProcess(UINT code) {
+    const HRESULT result=close_connected_storage();
+    if(FAILED(result))std::fprintf(stderr,"xone-era: storage close failed before ExitProcess: 0x%08lX\n",static_cast<unsigned long>(result));
+    ::ExitProcess(code);
+}
+
+HRESULT set_title_storage_root(const std::wstring& root) {
     std::wstring full = root.empty() ? std::wstring{} : full_path(root.c_str());
+    if(!root.empty() && full.empty()){const DWORD error=GetLastError();return HRESULT_FROM_WIN32(error?error:ERROR_INVALID_NAME);}
+    const HRESULT closed=close_connected_storage();if(FAILED(closed))return closed;
     if (!full.empty() && full.back() != L'\\') full += L'\\';
     {
         std::lock_guard lock(storage_mutex);
         storage_root = std::move(full);
     }
     reset_title_users();
+    return begin_connected_storage(!root.empty());
 }
 std::wstring title_storage_root() { std::lock_guard lock(storage_mutex); return storage_root; }
 bool title_writable_path(const std::wstring& path) { return writable_path(path.c_str()); }
 
 void* resolve_kernelx(const ImportRequest& request) {
     if (!same_library(request.library, "kernelx.dll") || request.name.empty()) return nullptr;
+    if(request.name=="ExitProcess")return reinterpret_cast<void*>(&era_ExitProcess);
     if (request.name == "GetFileAttributesExA") return reinterpret_cast<void*>(&era_GetFileAttributesExA);
     if (request.name == "GetFileAttributesExW") return reinterpret_cast<void*>(&era_GetFileAttributesExW);
     if (request.name == "GetDiskFreeSpaceExW") return reinterpret_cast<void*>(&era_GetDiskFreeSpaceExW);

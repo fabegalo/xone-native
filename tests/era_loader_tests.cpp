@@ -5,6 +5,7 @@
 #include "../src/era_winrt_object.h"
 #include "../src/era_memory.h"
 #include "../src/era_display.h"
+#include "../src/era_graphics_stream.h"
 #include "xboxone_native/appmodel.h"
 #include "xboxone_native/inventory.h"
 
@@ -20,7 +21,9 @@
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>
 #include <activation.h>
+#include <asyncinfo.h>
 #include <roapi.h>
 #include <winstring.h>
 #include <weakreference.h>
@@ -32,12 +35,105 @@
 #include <iterator>
 #include <utility>
 #include <thread>
+#include <atomic>
 #include <cstring>
 #include <array>
 #include <algorithm>
+#include <memory>
 
 namespace {
 int failures = 0;
+// Independent D3D12 control for reference native clears, without HLE descriptors or conversion.
+struct NativeUavClear {
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer,readback;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> cpu,gpu;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    HANDLE event=nullptr;UINT64 value=0;
+    ~NativeUavClear(){if(event)CloseHandle(event);}
+    HRESULT initialize(bool warp) {
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+        HRESULT hr=CreateDXGIFactory1(IID_PPV_ARGS(&factory));if(FAILED(hr))return hr;
+        if(warp && FAILED(hr=factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter))))return hr;
+        if(FAILED(hr=D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device))))return hr;
+        const D3D12_COMMAND_QUEUE_DESC q{};if(FAILED(hr=device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue))))return hr;
+        if(FAILED(hr=device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator))))return hr;
+        if(FAILED(hr=device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))))return hr;
+        if(FAILED(hr=list->Close()) || FAILED(hr=device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence))))return hr;
+        event=CreateEventW(nullptr,FALSE,FALSE,nullptr);if(!event)return HRESULT_FROM_WIN32(GetLastError());
+        D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=256;
+        desc.Height=desc.DepthOrArraySize=desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        if(FAILED(hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&buffer))))return hr;
+        heap.Type=D3D12_HEAP_TYPE_READBACK;desc.Flags=D3D12_RESOURCE_FLAG_NONE;desc.Width=65536;
+        if(FAILED(hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback))))return hr;
+        D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+        if(FAILED(hr=device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&cpu))))return hr;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        return device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&gpu));
+    }
+    HRESULT clear(DXGI_FORMAT format,UINT bytes,const std::array<UINT,4>& values,bool floating,std::vector<BYTE>& out,bool raw=false,UINT count=4) {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};view.Format=format;view.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;view.Buffer.FirstElement=raw ? 4:2;view.Buffer.NumElements=count;
+        if(raw)view.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;
+        device->CreateUnorderedAccessView(buffer.Get(),nullptr,&view,cpu->GetCPUDescriptorHandleForHeapStart());
+        device->CopyDescriptorsSimple(1,gpu->GetCPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        HRESULT hr=allocator->Reset();if(SUCCEEDED(hr))hr=list->Reset(allocator.Get(),nullptr);if(FAILED(hr))return hr;
+        ID3D12DescriptorHeap* heaps[]{gpu.Get()};list->SetDescriptorHeaps(1,heaps);
+        FLOAT color[4];std::memcpy(color,values.data(),sizeof color);
+        if(floating)list->ClearUnorderedAccessViewFloat(gpu->GetGPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),buffer.Get(),color,0,nullptr);
+        else list->ClearUnorderedAccessViewUint(gpu->GetGPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),buffer.Get(),values.data(),0,nullptr);
+        D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={buffer.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE};list->ResourceBarrier(1,&barrier);
+        list->CopyBufferRegion(readback.Get(),0,buffer.Get(),view.Buffer.FirstElement*bytes,count*bytes);
+        std::swap(barrier.Transition.StateBefore,barrier.Transition.StateAfter);list->ResourceBarrier(1,&barrier);
+        if(FAILED(hr=list->Close()))return hr;ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+        if(FAILED(hr=queue->Signal(fence.Get(),++value)) || FAILED(hr=fence->SetEventOnCompletion(value,event)))return hr;
+        if(WaitForSingleObject(event,5000)!=WAIT_OBJECT_0)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        const D3D12_RANGE read{0,count*bytes};void* data=nullptr;if(FAILED(hr=readback->Map(0,&read,&data)))return hr;
+        out.assign(static_cast<BYTE*>(data),static_cast<BYTE*>(data)+count*bytes);const D3D12_RANGE no_write{0,0};readback->Unmap(0,&no_write);return S_OK;
+    }
+    HRESULT texture(const D3D12_RESOURCE_DESC& desc,DXGI_FORMAT format,UINT bytes,const std::array<UINT,4>& values,bool floating,std::vector<BYTE>& out,bool render_target=false) {
+        const bool volume=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if(desc.MipLevels!=1 || desc.SampleDesc.Count!=1 || (!volume && desc.DepthOrArraySize!=1))return E_INVALIDARG;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};Microsoft::WRL::ComPtr<ID3D12Resource> image;
+        const auto state=render_target ? D3D12_RESOURCE_STATE_RENDER_TARGET:D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        HRESULT hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,state,nullptr,IID_PPV_ARGS(&image));if(FAILED(hr))return hr;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv;
+        if(render_target) {
+            if(volume)return E_INVALIDARG;
+            const D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_RTV,1,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+            if(FAILED(hr=device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&rtv))))return hr;
+            D3D12_RENDER_TARGET_VIEW_DESC target{};target.Format=format;target.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+            device->CreateRenderTargetView(image.Get(),&target,rtv->GetCPUDescriptorHandleForHeapStart());
+        } else {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};view.Format=format;view.ViewDimension=volume ? D3D12_UAV_DIMENSION_TEXTURE3D:D3D12_UAV_DIMENSION_TEXTURE2D;
+        if(volume)view.Texture3D.WSize=desc.DepthOrArraySize;
+        device->CreateUnorderedAccessView(image.Get(),nullptr,&view,cpu->GetCPUDescriptorHandleForHeapStart());
+        device->CopyDescriptorsSimple(1,gpu->GetCPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+        if(FAILED(hr=allocator->Reset()) || FAILED(hr=list->Reset(allocator.Get(),nullptr)))return hr;
+        ID3D12DescriptorHeap* heaps[]{gpu.Get()};list->SetDescriptorHeaps(1,heaps);FLOAT color[4];std::memcpy(color,values.data(),sizeof color);
+        if(render_target)list->ClearRenderTargetView(rtv->GetCPUDescriptorHandleForHeapStart(),color,0,nullptr);
+        else if(floating)list->ClearUnorderedAccessViewFloat(gpu->GetGPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),image.Get(),color,0,nullptr);
+        else list->ClearUnorderedAccessViewUint(gpu->GetGPUDescriptorHandleForHeapStart(),cpu->GetCPUDescriptorHandleForHeapStart(),image.Get(),values.data(),0,nullptr);
+        D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition={image.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,state,D3D12_RESOURCE_STATE_COPY_SOURCE};list->ResourceBarrier(1,&barrier);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};UINT64 total=0;device->GetCopyableFootprints(&desc,0,1,0,&footprint,nullptr,nullptr,&total);
+        if(total>readback->GetDesc().Width)return E_INVALIDARG;
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=image.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        to.pResource=readback.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=footprint;list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+        if(FAILED(hr=list->Close()))return hr;ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);
+        if(FAILED(hr=queue->Signal(fence.Get(),++value)) || FAILED(hr=fence->SetEventOnCompletion(value,event)))return hr;
+        if(WaitForSingleObject(event,5000)!=WAIT_OBJECT_0)return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        void* data=nullptr;const D3D12_RANGE read{0,SIZE_T(total)};if(FAILED(hr=readback->Map(0,&read,&data)))return hr;
+        const UINT depth=volume ? desc.DepthOrArraySize:1;const SIZE_T row=SIZE_T(desc.Width)*bytes;out.resize(row*desc.Height*depth);
+        for(UINT z=0;z<depth;++z)for(UINT y=0;y<desc.Height;++y)
+            std::memcpy(out.data()+(SIZE_T(z)*desc.Height+y)*row,static_cast<BYTE*>(data)+footprint.Offset+(SIZE_T(z)*desc.Height+y)*footprint.Footprint.RowPitch,row);
+        const D3D12_RANGE no_write{0,0};readback->Unmap(0,&no_write);return S_OK;
+    }
+};
 SIZE_T hook_size = 0;
 ULONGLONG hook_attributes = 0;
 void* hook_pointer = nullptr;
@@ -86,7 +182,217 @@ std::vector<std::uint8_t> read(const char* path) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if(argc==2 && std::string(argv[1])=="--graphics-stream") {
+        using xboxone::era::GraphicsCallStream;
+        std::vector<int> order;
+        std::weak_ptr<int> retained;
+        std::future<void> drained;
+        const auto producer=std::this_thread::get_id();
+        {
+            GraphicsCallStream stream;
+            std::promise<void> release;
+            auto gate=release.get_future().share();
+            auto lifetime=std::make_shared<int>(17);retained=lifetime;
+            auto first=stream.submit([gate,lifetime,&order] {gate.wait();order.push_back(*lifetime);});
+            lifetime.reset();
+            std::vector<std::future<int>> calls;
+            for(int i=0;i<64;++i)calls.push_back(stream.submit([i,&order,producer] {
+                if(std::this_thread::get_id()==producer)throw std::runtime_error("producer executed graphics work");
+                order.push_back(i);return i;
+            }));
+            check(!retained.expired(),"queued graphics commands retain their resources");
+            release.set_value();first.get();
+            for(int i=0;i<64;++i)check(calls[i].get()==i,"graphics stream returns each command result");
+            bool ordered=order.size()==65 && order.front()==17;
+            for(int i=0;i<64 && ordered;++i)ordered=order[i+1]==i;
+            check(ordered,"graphics commands execute in committed stream order on the worker");
+            check(stream.invoke([&] {return stream.invoke([] {return 42;});})==42,
+                "worker replay can call graphics helpers without deadlocking or changing threads");
+            check(stream.invoke([] {return E_INVALIDARG;})==E_INVALIDARG,"graphics worker preserves native failure codes");
+            bool failed=false;
+            try {stream.invoke([]() -> int {throw std::runtime_error("graphics test failure");});}
+            catch(const std::runtime_error& e){failed=std::string(e.what())=="graphics test failure";}
+            check(failed && stream.invoke([] {return 9;})==9,"failed graphics calls propagate and leave the consumer usable");
+            std::atomic<int> active{0},completed{0};std::atomic<bool> serialized{true};
+            std::vector<std::thread> producers;
+            for(int i=0;i<4;++i)producers.emplace_back([&] {
+                for(int n=0;n<32;++n)stream.invoke([&] {
+                    if(active.fetch_add(1)!=0)serialized=false;
+                    ++completed;--active;
+                });
+            });
+            for(auto& thread:producers)thread.join();
+            check(serialized && completed==128,"concurrent producers share one ordered graphics consumer");
+            drained=stream.submit([&order] {order.push_back(99);});
+        }
+        check(drained.wait_for(std::chrono::seconds(0))==std::future_status::ready && order.back()==99,
+            "graphics stream shutdown drains submitted commands before releasing storage");
+        drained.get();
+        check(retained.expired(),"retired graphics commands release retained resources");
+        return failures ? 1:0;
+    }
+
+    if (argc == 4 && std::string(argv[1]) == "--tls-modules") {
+        using namespace xboxone::era;
+        const auto module_file = read(argv[2]);
+        const auto title_file = read(argv[3]);
+        using Value = DWORD(*)(DWORD);
+        using Event = DWORD(*)(DWORD);
+        using Receipt = void(*)(DWORD*, BOOL);
+        Value existing_value = nullptr;
+        HANDLE probe = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE probed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE finish = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!probe || !probed || !finish) return 1;
+        std::thread existing([&] {
+            SetEvent(probed);
+            if (WaitForSingleObject(probe, 5000) == WAIT_OBJECT_0 && existing_value)
+                check(existing_value(505) == 0x51a7b007, "thread predating LoadLibrary receives the module template without a spurious thread attach");
+            else check(false, "preexisting TLS worker received its bounded probe");
+            SetEvent(probed);
+            WaitForSingleObject(finish, 5000);
+        });
+        check(WaitForSingleObject(probed, 5000) == WAIT_OBJECT_0, "worker exists before module loading");
+        Image title;
+        LoadResult result;
+        check(title.load(title_file, resolve_kernelx, result), "title TLS maps alongside library slots");
+        for (const auto& error : result.errors) std::cerr << "  title TLS: " << error << '\n';
+        auto first = std::make_unique<Image>();
+        Image second, overflow;
+        check(first->load(module_file, {}, result, ImageKind::module), "first DLL TLS maps without a title-specific binding");
+        for (const auto& error : result.errors) std::cerr << "  module TLS: " << error << '\n';
+        check(second.load(module_file, {}, result, ImageKind::module), "second DLL owns a separate TLS slot");
+        check(!overflow.load(module_file, {}, result, ImageKind::module) && !overflow.base(), "exhausted module TLS pool fails explicitly");
+        const auto a = reinterpret_cast<Value>(first->find_export("era_tls_module_value"));
+        const auto b = reinterpret_cast<Value>(second.find_export("era_tls_module_value"));
+        const auto event = reinterpret_cast<Event>(first->find_export("era_tls_module_event"));
+        const auto receipt = reinterpret_cast<Receipt>(first->find_export("era_tls_module_receipt"));
+        check(a && b && event && receipt, "TLS fixture exports were validated");
+        if (!a || !b || !event || !receipt) {
+            SetEvent(probe); SetEvent(finish); existing.join();
+            CloseHandle(probe); CloseHandle(probed); CloseHandle(finish);
+            return 1;
+        }
+        check(event(0) == 0, "mapping a DLL runs neither TLS callbacks nor DllMain");
+        std::thread checked([&] { check(a(9) == 0x51a7b007 && b(10) == 0x51a7b007,
+            "check-only thread receives independent raw templates without guest callbacks"); });
+        checked.join();
+        check(event(0) == 0, "check-only thread detach executes no guest code");
+        check(first->attach_module() && first->attach_module() && second.attach_module(), "explicit TLS DLL attach is idempotent");
+        check(event(0) == 0x11 && event(1) == 0x21 && event(2) == 0,
+            "TLS process attach precedes DllMain exactly once");
+        check(a(101) == 37 && b(202) == 37, "each module initialized its own calling-thread template");
+        existing_value = a;
+        SetEvent(probe);
+        check(WaitForSingleObject(probed, 5000) == WAIT_OBJECT_0, "preexisting worker completed its TLS access");
+        std::thread worker([&] { check(a(303) == 37 && b(404) == 37,
+            "new worker receives both module templates and callbacks"); });
+        worker.join();
+        check(a(101) == 101 && b(202) == 202, "worker writes do not change either owner TLS block");
+        check(event(2) == 0x12 && event(3) == 0x22 && event(4) == 0x13 && event(5) == 0x23,
+            "thread notifications preserve TLS callback/DllMain order");
+        DWORD detached = 0;
+        receipt(&detached, FALSE);
+        first.reset();
+        check(detached == 0x1020, "process TLS detach precedes DllMain before releasing the mapping");
+        SetEvent(finish); existing.join();
+        CloseHandle(probe); CloseHandle(probed); CloseHandle(finish);
+        check(overflow.load(module_file, {}, result, ImageKind::module), "quiescent module slot is reusable");
+        const auto rejected_receipt = reinterpret_cast<Receipt>(overflow.find_export("era_tls_module_receipt"));
+        DWORD rejected = 0;
+        if (rejected_receipt) rejected_receipt(&rejected, TRUE);
+        check(rejected_receipt && !overflow.attach_module() && rejected == 0x11211020,
+            "failed DllMain preserves attach failure and balances TLS detach");
+        check(!overflow.attach_module() && rejected == 0x11211020,
+            "a failed DLL initialization cannot silently reenter partially initialized callbacks");
+        auto malformed = module_file;
+        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(malformed.data());
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(malformed.data() + dos->e_lfanew);
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {nt->OptionalHeader.SizeOfImage - 8, 40};
+        check(!overflow.load(malformed, {}, result, ImageKind::module) && !overflow.base(),
+            "malformed TLS does not consume a reusable slot");
+        if (title.entry()) {
+            title.process_attach();
+            check(reinterpret_cast<unsigned long long(*)()>(title.entry())() == 0,
+                "title TLS remains independent of loaded libraries and their worker callbacks");
+        }
+        std::cout << (failures ? "module TLS: FAILED\n" : "module TLS: all checks passed\n");
+        return failures ? 1 : 0;
+    }
     using namespace xboxone::era;
+    if(argc==5 && std::string(argv[1])=="--xg-uav-srd") {
+        const std::filesystem::path original_path=argv[4];std::string hash,error;
+        if(!xboxone::inventory::fingerprint(original_path,hash,error) || hash!="bca2d2d3dff9bd88926e5a2603bacbbcc203e67af77ce092db654ad7daa772f1")return 1;
+        const HMODULE original=LoadLibraryExW(original_path.c_str(),nullptr,DONT_RESOLVE_DLL_REFERENCES);
+        const HMODULE crt=LoadLibraryExW(L"ucrtbase.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if(!original || !crt)return 1;
+        // Only this private mapping's CRT data-copy imports are bound; no original initializers run.
+        for(const auto& entry:std::array<std::pair<UINT,const char*>,3>{{{0xd61f0,"memset"},{0xd6248,"memcpy"},{0xd62a8,"memmove"}}}) {
+            auto* slot=reinterpret_cast<void**>(reinterpret_cast<BYTE*>(original)+entry.first);DWORD protection=0,ignored=0;
+            const auto address=GetProcAddress(crt,entry.second);
+            if(!address || !VirtualProtect(slot,sizeof *slot,PAGE_READWRITE,&protection))return 1;
+            *slot=reinterpret_cast<void*>(address);VirtualProtect(slot,sizeof *slot,protection,&ignored);
+        }
+        HRESULT hr=bind_d3d11x_abi(std::filesystem::path(argv[2]).wstring());
+        if(SUCCEEDED(hr))hr=bind_xg_module(std::filesystem::path(argv[3]).wstring());
+        if(SUCCEEDED(hr))hr=initialize_xg_module();if(FAILED(hr))return 1;
+        struct Parameters {UINT version,flags;void* tess;void* factors;UINT affinity,de_ring,ce_ring,de_segment,ce_segment;} parameters{};
+        parameters.version=0x1000b;parameters.flags=0x4000000;
+        using Create=HRESULT(WINAPI*)(const Parameters*,void**,void**);
+        const auto create=reinterpret_cast<Create>(resolve_d3d11x({"d3d11_x.dll","D3D11XCreateDeviceX",0}));
+        void* device=nullptr;void* context=nullptr;
+        if(!create || FAILED(create(&parameters,&device,&context)))return 1;
+        const auto vt=[](void* object){return *static_cast<void***>(object);};
+        using Count=ULONG(STDMETHODCALLTYPE*)(void*);
+        using Original=void*(*)(UINT32*,const UINT32*,UINT,UINT,const UINT*,UINT,UINT,UINT,void*);
+        const auto descriptor=reinterpret_cast<Original>(reinterpret_cast<BYTE*>(original)+0x9b2f0);
+        UINT comparisons=0;
+        for(const UINT width:{32u,64u,256u,384u})for(const bool volume:{false,true})for(const UINT arrays:{1u,4u,6u})
+            for(const auto format:{DXGI_FORMAT_R8_UINT,DXGI_FORMAT_R10G10B10A2_UNORM,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R16_UNORM,DXGI_FORMAT_R16G16B16A16_FLOAT,
+                DXGI_FORMAT_R8_SNORM,DXGI_FORMAT_R8G8_SNORM,DXGI_FORMAT_R8G8B8A8_SNORM,DXGI_FORMAT_R16_SNORM,DXGI_FORMAT_R16G16_SNORM,DXGI_FORMAT_R16G16B16A16_SNORM}) {
+                if(volume && arrays!=1)continue;
+                struct Desc2 {D3D11_TEXTURE2D_DESC standard{};UINT extension[2]{};} desc2;
+                struct Desc3 {D3D11_TEXTURE3D_DESC standard{};UINT extension[2]{};} desc3;
+                const UINT binds=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
+                desc2.standard={width,width,4,arrays,format,{1,0},D3D11_USAGE_DEFAULT,binds,0,arrays==6 ? UINT(D3D11_RESOURCE_MISC_TEXTURECUBE):0};
+                desc3.standard={width,width,16,4,format,D3D11_USAGE_DEFAULT,binds,0,0};
+                void* resource=nullptr;
+                hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const void*,const D3D11_SUBRESOURCE_DATA*,void**)>(vt(device)[volume ? 6:5])(device,volume ? static_cast<void*>(&desc3):static_cast<void*>(&desc2),nullptr,&resource);
+                check(hr==S_OK && resource,"original UAV descriptor control creates the shared native texture");if(!resource)return 1;
+                TitleTextureLayout layout;
+                hr=volume ? create_xg_texture3d_layout(width,width,16,4,format,binds,layout):create_xg_texture_layout(width,width,4,arrays,format,UINT_MAX,layout,binds);
+                if(FAILED(hr))return 1;
+                for(UINT mip=0;mip<4;++mip)for(UINT range=0;range<(volume ? 3u:1u);++range) {
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC selected{};selected.Format=format;
+                    selected.ViewDimension=volume ? D3D11_UAV_DIMENSION_TEXTURE3D:arrays==1 ? D3D11_UAV_DIMENSION_TEXTURE2D:D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+                    selected.Texture2D.MipSlice=mip;
+                    const UINT depth=(std::max)(1u,16u>>mip),first=volume ? (range ? 1:0):arrays>1 ? 1:0;
+                    const UINT count=volume ? range==1 ? (std::max)(1u,depth-2):depth-first:arrays-first;
+                    if(volume){selected.Texture3D.FirstWSlice=first;selected.Texture3D.WSize=range==2 ? UINT_MAX:count;}
+                    else if(arrays>1){selected.Texture2DArray.FirstArraySlice=first;selected.Texture2DArray.ArraySize=count;}
+                    void* view=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8])(device,resource,&selected,&view)==S_OK && view,"original UAV descriptor control creates the requested range");if(!view)return 1;
+                    auto source=layout.guest_descriptor;void* base=nullptr;std::memcpy(&base,static_cast<BYTE*>(view)+80,sizeof base);
+                    source[0]=UINT32(reinterpret_cast<std::uintptr_t>(base)>>8);
+                    std::array<UINT32,8> expected{},actual{};std::array<UINT,4> selectors{};
+                    for(UINT c=0;c<4;++c)selectors[c]=(source[3]>>(c*3))&7;
+                    descriptor(expected.data(),source.data(),(source[1]>>20)&63,(source[1]>>26)&15,selectors.data(),mip,first,first+count-1,nullptr);
+                    std::memcpy(actual.data(),static_cast<BYTE*>(view)+48,sizeof actual);
+                    if(actual!=expected) {
+                        std::cerr<<"UAV SRD mismatch width="<<width<<" volume="<<volume<<" arrays="<<arrays<<" format="<<format<<" mip="<<mip<<" range="<<range;
+                        for(UINT word=0;word<8;++word)if(actual[word]!=expected[word])std::cerr<<" word"<<word<<"="<<std::hex<<actual[word]<<"/"<<expected[word]<<std::dec;
+                        std::cerr<<'\n';
+                    }
+                    check(actual==expected,"UAV descriptor matches the original 11295 helper including mip rebasing and volume ranges");
+                    ++comparisons;
+                    reinterpret_cast<Count>(vt(view)[2])(view);
+                }
+                reinterpret_cast<Count>(vt(resource)[2])(resource);
+            }
+        reinterpret_cast<Count>(vt(context)[2])(context);reinterpret_cast<Count>(vt(device)[2])(device);
+        FreeLibrary(original);FreeLibrary(crt);
+        std::cout<<"Original UAV SRDs: "<<comparisons<<" comparisons, "<<failures<<" failures\n";return failures ? 1:0;
+    }
     if(argc==4 && std::string(argv[1])=="--package-metadata") {
         const std::filesystem::path root=argv[2];std::string hash,error;
         if(!xboxone::inventory::fingerprint(root/argv[3],hash,error))return 1;
@@ -357,7 +663,7 @@ int main(int argc, char** argv) {
                             reinterpret_cast<Range>(embedded[9])(context,0,1,&objects[5]);reinterpret_cast<Range>(embedded[18])(context,0,1,&objects[6]);
                             reinterpret_cast<Range>(embedded[12])(context,0,1,&objects[9]);
                             using Resources=void(STDMETHODCALLTYPE*)(void*,void* const*,UINT,UINT);
-                            reinterpret_cast<Resources>(embedded[10])(context,&objects[8],0,0x76b40);
+                            reinterpret_cast<Resources>(embedded[10])(context,&objects[8],UINT_MAX,0x76b40);
                             using Targets=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
                             reinterpret_cast<Targets>(embedded[34])(context,1,&rtv,nullptr);
                             const D3D11_VIEWPORT viewport{0,0,32,16,0,1};set_viewports(context,1,&viewport);
@@ -471,6 +777,7 @@ int main(int argc, char** argv) {
         }
         TitleTextureLayout layout;
         if (std::string(argv[1]) == "--xg-msaa") {
+            set_graphics_diagnostics(true,argc==5);
             if (SUCCEEDED(hr)) hr = create_xg_texture_layout(32, 16, 1, 1, DXGI_FORMAT_R11G11B10_FLOAT, UINT_MAX, layout,
                 D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 4);
             std::cout << "original XG MSAA4 layout hr=0x" << std::hex << hr << std::dec << " bytes=" << layout.bytes << " alignment=" << layout.alignment << '\n';
@@ -531,6 +838,31 @@ int main(int argc, char** argv) {
                 const auto tiled_before=physical;
                 check(layout.copy(layout.context.get(),true,samples.data(),physical.data()+16,0,1,16384,nullptr)==E_INVALIDARG && physical==tiled_before,
                     "invalid depth/stencil pitch preserves every physical plane");
+            }
+            for(const auto dimensions:{std::array<UINT,2>{17,9},std::array<UINT,2>{3,5}}) {
+                TitleTextureLayout partial;
+                const UINT width=dimensions[0],height=dimensions[1],pitch=width*4*8+16;
+                hr=create_xg_texture_layout(width,height,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,1,partial,
+                    D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
+                check(SUCCEEDED(hr),"depth microtile fixture accepts partial tiles and a small non-tiled table");
+                if(FAILED(hr))continue;
+                std::vector<BYTE> physical(partial.bytes+32,0x5a),samples(SIZE_T(pitch)*height,0x3c),restored(samples);
+                for(UINT repeat=0;repeat<3;++repeat) {
+                    for(UINT y=0;y<height;++y)for(UINT x=0;x<width*4;++x) {
+                        auto* pixel=samples.data()+SIZE_T(y)*pitch+x*8;
+                        const UINT32 depth=0x3e000000u+(y*width*4+x)*17+repeat;
+                        std::memcpy(pixel,&depth,4);pixel[4]=BYTE(x+y+repeat);std::memset(pixel+5,0,3);
+                    }
+                    hr=partial.copy(partial.context.get(),true,samples.data(),physical.data()+16,0,pitch,pitch*height,nullptr);
+                    if(SUCCEEDED(hr))hr=partial.copy(partial.context.get(),false,restored.data(),physical.data()+16,0,pitch,pitch*height,nullptr);
+                    check(SUCCEEDED(hr) && restored==samples,"depth/stencil microtiles preserve partial rows, all samples and row padding");
+                    TitleTextureLayout oracle;
+                    hr=create_xg_texture_layout(width,height,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,1,oracle,
+                        D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,4);
+                    std::vector<BYTE> expected(physical.size(),0x5a);
+                    if(SUCCEEDED(hr))hr=oracle.copy(oracle.context.get(),true,samples.data(),expected.data()+16,0,pitch,pitch*height,nullptr);
+                    check(SUCCEEDED(hr) && physical==expected,"microtile output and guards match every uncached original XG address");
+                }
             }
             hr = create_xg_texture_layout(1920, 1080, 1, 1, DXGI_FORMAT_R32G8X24_TYPELESS, 1, layout,
                 D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 4);
@@ -830,8 +1162,15 @@ int main(int argc, char** argv) {
                 D3D11_SHADER_RESOURCE_VIEW_DESC partial{};
                 partial.Format = desc.standard.Format; partial.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
                 partial.Texture2D = {1, 6};
-                check(create_srv(device, texture, &partial, &view) == DXGI_ERROR_UNSUPPORTED && !view,
-                      "untranslated partial texture views remain explicit");
+                check(create_srv(device, texture, &partial, &view) == S_OK && view,
+                      "partial texture views translate the selected mip range");
+                if(view) {
+                    std::array<UINT32,8> range{};std::memcpy(range.data(),static_cast<char*>(view)+48,sizeof range);
+                    check(((range[3]>>12)&15)==1 && ((range[3]>>16)&15)==6,"partial SRD preserves the first and last selected mip");
+                    reinterpret_cast<Count>(vt(view)[2])(view);view=nullptr;
+                }
+                partial.Texture2D={7,1};
+                check(create_srv(device,texture,&partial,&view)==E_INVALIDARG && !view,"partial texture view rejects an out-of-bounds base mip");
                 check(create_srv(device, texture, nullptr, nullptr) == S_FALSE, "default texture view validates without ownership changes");
                 check(create_srv(device, texture, nullptr, &view) == S_OK && view, "default texture SRV owns a native descriptor");
                 if (view) {
@@ -854,6 +1193,36 @@ int main(int argc, char** argv) {
             VirtualQuery(root, &memory, sizeof memory);
             check(memory.State == MEM_COMMIT, "placed texture release preserves borrowed canonical storage");
             free_memory(root, attributes);
+            {
+                std::array<BYTE,64> blocks{},guards;guards.fill(0x5a);for(UINT i=0;i<64;++i)blocks[i]=BYTE(i*17+11);
+                Desc compressed{};compressed.standard={8,8,1,1,DXGI_FORMAT_BC7_UNORM_SRGB,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,0};
+                using Create=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                void* objects[2]{};void* view=nullptr;
+                for(UINT i=0;i<2;++i) {
+                    if(i)compressed.standard.Format=DXGI_FORMAT_BC7_UNORM;
+                    const D3D11_SUBRESOURCE_DATA data{i ? guards.data():blocks.data(),32,64};
+                    check(reinterpret_cast<Create>(vt(device)[5])(device,&compressed,&data,&objects[i])==S_OK && objects[i],"compressed region copy creates two textures with independent BC7 block contents");
+                }
+                if(!objects[0] || !objects[1])return 1;
+                using Srv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                check(reinterpret_cast<Srv>(vt(device)[7])(device,objects[1],nullptr,&view)==S_OK && view,"compressed region destination retains its canonical storage");
+                if(!view)return 1;
+                void* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);
+                TitleTextureLayout pixels;check(create_xg_texture_layout(8,8,1,1,DXGI_FORMAT_BC7_UNORM,UINT_MAX,pixels,D3D11_BIND_SHADER_RESOURCE)==S_OK,"compressed region oracle uses the original block layout");
+                using Region=void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*);
+                const auto copy=reinterpret_cast<Region>(vt(context)[46]);D3D11_BOX box{0,4,0,4,8,1};
+                copy(context,objects[1],0,4,0,0,objects[0],0,&box);auto expected=guards;std::memcpy(expected.data()+16,blocks.data()+32,16);
+                std::array<BYTE,64> actual{};
+                check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,0,32,64,nullptr)==S_OK && actual==expected,"BC7 region copy preserves raw blocks across sRGB/UNORM siblings without decompressing or changing untouched blocks");
+                static UINT refused=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                for(UINT invalid=0;invalid<3;++invalid) {
+                    box={0,4,0,4,8,1};UINT x=4;if(invalid==0)box.left=1;if(invalid==1)x=1;if(invalid==2)box.bottom=7;
+                    refused=0;copy(context,objects[1],0,x,0,0,objects[0],0,&box);
+                    check(refused==46 && pixels.copy(pixels.context.get(),false,actual.data(),canonical,0,32,64,nullptr)==S_OK && actual==expected,"misaligned BC7 source edges and destination offsets are rejected without changing block contents");
+                }
+                set_d3d11x_trap_handler(nullptr);
+                reinterpret_cast<Count>(vt(view)[2])(view);for(auto* object:objects)reinterpret_cast<Count>(vt(object)[2])(object);
+            }
             Desc placed_depth{};
             placed_depth.standard={32,16,1,1,DXGI_FORMAT_R32G8X24_TYPELESS,{4,0},D3D11_USAGE_DEFAULT,
                 D3D11_BIND_DEPTH_STENCIL|D3D11_BIND_SHADER_RESOURCE,0,0x40000};
@@ -951,6 +1320,48 @@ int main(int argc, char** argv) {
                 clear(context,clear_dsv,3,.5f,0x6d);verify(0x3f000000,0x6d);
                 clear(context,clear_dsv,1,.25f,0);verify(0x3e800000,0x6d);
                 clear(context,clear_dsv,2,std::numeric_limits<FLOAT>::quiet_NaN(),0x27);verify(0x3e800000,0x27);
+                void* same_storage=nullptr;
+                check(place_texture(device,&placed_depth,1,0,clear_base,&same_storage)==S_OK && same_storage,"MSAA alias fixture creates a distinct native texture over the same canonical depth/stencil storage");
+                if(same_storage) {
+                    clear(context,clear_dsv,3,.25f,0x27);
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,void*)>(vt(context)[47])(context,same_storage,clear_texture);
+                    verify(0x3e800000,0x27);
+                    clear(context,clear_dsv,3,.5f,0x6d);
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*)>(vt(context)[46])(context,same_storage,0,0,0,0,clear_texture,0,nullptr);
+                    verify(0x3f000000,0x6d);
+                    reinterpret_cast<Count>(vt(same_storage)[2])(same_storage);
+                    clear(context,clear_dsv,3,.25f,0x27);
+                }
+                auto* copy_storage=static_cast<BYTE*>(allocate(98304+8192+32,attributes));
+                if(!copy_storage)return 1;
+                std::memset(copy_storage,0x5a,98304+8192+32);
+                auto* copy_base=reinterpret_cast<BYTE*>((reinterpret_cast<std::uintptr_t>(copy_storage)+16+8191)&~std::uintptr_t(8191));
+                void* copied_texture=nullptr;
+                check(place_texture(device,&placed_depth,1,0,copy_base,&copied_texture)==S_OK && copied_texture,"CopyResource creates a guarded multisample depth/stencil destination");
+                if(copied_texture) {
+                    for(UINT pass=0;pass<2;++pass) {
+                        clear(context,clear_dsv,3,.25f,0x27);
+                        std::memset(copy_base,0,98304);
+                        if(pass)reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*)>(vt(context)[46])(context,copied_texture,0,0,0,0,clear_texture,0,nullptr);
+                        else reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,void*)>(vt(context)[47])(context,copied_texture,clear_texture);
+                        bool exact=planes.copy(planes.context.get(),false,linear.data(),copy_base,0,1024,16384,nullptr)==S_OK;
+                        for(SIZE_T at=0;exact && at<linear.size();at+=8) {UINT bits=0;std::memcpy(&bits,linear.data()+at,4);exact=bits==0x3e800000 && linear[at+4]==0x27;}
+                        check(exact,"native CopyResource preserves GPU-cleared depth bits and stencil in all four samples after CPU invalidation");
+                        const D3D11_BOX boxed{0,0,0,32,16,1};static UINT refused=0;refused=0;
+                        set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*)>(vt(context)[46])(context,copied_texture,0,0,0,0,clear_texture,0,&boxed);
+                        set_d3d11x_trap_handler(nullptr);
+                        check(refused==46 && planes.copy(planes.context.get(),false,linear.data(),copy_base,0,1024,16384,nullptr)==S_OK,
+                            "reference depth/stencil region copy rejects even a full non-null box and requires whole-subresource arguments");
+                        bool unchanged=true;for(SIZE_T at=0;at<linear.size();at+=8){UINT bits=0;std::memcpy(&bits,linear.data()+at,4);unchanged=unchanged && bits==0x3e800000 && linear[at+4]==0x27;}
+                        check(unchanged,"rejected depth/stencil region preserves every sample");
+                        verify(0x3e800000,0x27);
+                    }
+                    reinterpret_cast<Count>(vt(copied_texture)[2])(copied_texture);
+                }
+                check(std::all_of(copy_storage,copy_base,[](BYTE value){return value==0x5a;}) &&
+                    std::all_of(copy_base+98304,copy_storage+98304+8192+32,[](BYTE value){return value==0x5a;}),"multisample resource copy preserves physical allocation guards");
+                free_memory(copy_storage,attributes);
                 using Deferred=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
                 using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
                 using Execute=void(STDMETHODCALLTYPE*)(void*,void*,BOOL);
@@ -1032,6 +1443,44 @@ int main(int argc, char** argv) {
                             "remapping back observes the original shared physical bytes");
                         reinterpret_cast<Count>(vt(view)[2])(view);
                     }
+                    {
+                        const std::vector<BYTE> original(esram_mirror,esram_mirror+65536);
+                        void* alias=nullptr;void* alias_view=nullptr;
+                        check(create_owned(device,&esram_desc,nullptr,&alias)==S_OK && alias,"texture alias copy creates a second native representation of the same ESRAM pages");
+                        if(alias) {
+                            check(reinterpret_cast<CreateSrv>(vt(device)[7])(device,alias,&srv_desc,&alias_view)==S_OK && alias_view,"physical texture alias keeps an independent canonical view");
+                            if(alias_view) {
+                                void* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(alias_view)+80,sizeof canonical);
+                                TitleTextureLayout pixels;check(create_xg_texture_layout(32,16,1,1,format,UINT_MAX,pixels,esram_desc.standard.BindFlags)==S_OK,"texture alias oracle retains the original tiled layout");
+                                std::vector<UINT> input(512),actual(512);
+                                if(depth) {
+                                    D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};dsv.Format=DXGI_FORMAT_D32_FLOAT;dsv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;void* target=nullptr;
+                                    using MakeDsv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_DEPTH_STENCIL_VIEW_DESC*,void**);
+                                    check(reinterpret_cast<MakeDsv>(vt(device)[10])(device,texture,&dsv,&target)==S_OK && target,"depth alias source owns a real typed DSV");
+                                    if(target) {
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,FLOAT,UINT8)>(vt(context)[53])(context,target,1,.375f,0);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,void*)>(vt(context)[47])(context,alias,texture);
+                                        check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,0,128,2048,nullptr)==S_OK &&
+                                            std::all_of(actual.begin(),actual.end(),[](UINT bits){return bits==0x3ec00000;}),"overlapping depth representations preserve GPU-written bits through the alias snapshot");
+                                        reinterpret_cast<Count>(vt(target)[2])(target);
+                                    }
+                                }else {
+                                    using Region=void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*);
+                                    const D3D11_BOX box{0,0,0,16,8,1};
+                                    for(UINT pass=0;pass<2;++pass) {
+                                        for(UINT i=0;i<512;++i)input[i]=0x20000000u+i*1024+pass*7;
+                                        check(pixels.copy(pixels.context.get(),true,input.data(),canonical,0,128,2048,nullptr)==S_OK,"physical texture alias imports changed source pixels");
+                                        auto expected=input;for(UINT y=0;y<8;++y)std::memcpy(expected.data()+(y+4)*32+8,input.data()+y*32,64);
+                                        reinterpret_cast<Region>(vt(context)[46])(context,alias,0,8,4,0,texture,0,&box);
+                                        check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,0,128,2048,nullptr)==S_OK && actual==expected,"overlapping color aliases preserve the source rectangle and all outside pixels across repeated copies");
+                                    }
+                                }
+                                reinterpret_cast<Count>(vt(alias_view)[2])(alias_view);
+                            }
+                            reinterpret_cast<Count>(vt(alias)[2])(alias);
+                        }
+                        std::memcpy(esram_mirror,original.data(),original.size());
+                    }
                     if (depth) {
                         using CreateDsv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_DEPTH_STENCIL_VIEW_DESC*,void**);
                         D3D11_DEPTH_STENCIL_VIEW_DESC description{};
@@ -1043,9 +1492,10 @@ int main(int argc, char** argv) {
                     }
                     reinterpret_cast<Count>(vt(texture)[2])(texture);
                 }
+                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[153])(context,0);
                 MEMORY_BASIC_INFORMATION retired_alias{};
                 check(!owned_alias || (VirtualQuery(owned_alias,&retired_alias,sizeof retired_alias) && retired_alias.State==MEM_FREE),
-                    "ESRAM texture retirement releases only its owned virtual view");
+                    "fenced ESRAM texture retirement releases only its owned virtual view");
                 check(esram_mirror[mirror_offset]==0x62,
                     "texture retirement preserves the physical pool and the title's mapping");
             }
@@ -1086,6 +1536,41 @@ int main(int argc, char** argv) {
                     --buffer_page;
                     check(map_title_esram(1,esram_mirror,1,&buffer_page)==S_OK && esram_mirror[256]==0x62,
                           "ESRAM physical bytes survive a temporary title remap");
+                    std::array<BYTE,144> original;std::memcpy(original.data(),esram_mirror+256,original.size());
+                    auto alias_desc=esram_buffer;alias_desc.extension=UINT64(buffer_page*65536+272)|(UINT64(128)<<32);void* alias=nullptr;
+                    check(create_esram_buffer(device,&alias_desc,nullptr,&alias)==S_OK && alias,"alias copy creates two owned buffers with overlapping physical ESRAM and independent virtual addresses");
+                    if(alias) {
+                        BYTE* alias_bytes=nullptr;std::memcpy(&alias_bytes,static_cast<BYTE*>(alias)+48,sizeof alias_bytes);
+                        check(alias_bytes && alias_bytes!=buffer_alias+16,"alias copy uses a distinct virtual mapping of the shared physical source");
+                        using Copy=void(STDMETHODCALLTYPE*)(void*,void*,void*);
+                        using Region=void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*);
+                        for(UINT reverse=0;reverse<2;++reverse) {
+                            for(UINT i=0;i<144;++i)esram_mirror[256+i]=BYTE(i*17+reverse+3);
+                            std::array<BYTE,144> expected;std::memcpy(expected.data(),esram_mirror+256,expected.size());
+                            std::memmove(expected.data()+(reverse ? 16:0),expected.data()+(reverse ? 0:16),128);
+                            reinterpret_cast<Copy>(vt(context)[47])(context,reverse ? alias:buffer,reverse ? buffer:alias);
+                            check(!std::memcmp(esram_mirror+256,expected.data(),expected.size()),"full GPU copy preserves source bytes for both directions of physical ESRAM overlap");
+                        }
+                        using Defer=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                        void* producer=nullptr;void* list=nullptr;
+                        if(reinterpret_cast<Defer>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                            const D3D11_BOX box{4,0,0,60,1,1};reinterpret_cast<Region>(vt(producer)[46])(producer,buffer,0,8,0,0,alias,0,&box);
+                            check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list,"deferred alias copy retains the original physical mappings");
+                            reinterpret_cast<Count>(vt(producer)[2])(producer);
+                        }else check(false,"alias copy creates a deferred producer");
+                        reinterpret_cast<Count>(vt(alias)[2])(alias);
+                        if(list) {
+                            for(UINT pass=0;pass<2;++pass) {
+                                for(UINT i=0;i<144;++i)esram_mirror[256+i]=BYTE(i*13+pass+9);
+                                std::array<BYTE,144> expected;std::memcpy(expected.data(),esram_mirror+256,expected.size());
+                                std::memmove(expected.data()+8,expected.data()+20,56);
+                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);
+                                check(!std::memcmp(esram_mirror+256,expected.data(),expected.size()),"deferred physical-alias region copy reads later data after caller release and preserves every outside byte on replay");
+                            }
+                            reinterpret_cast<Count>(vt(list)[2])(list);
+                        }
+                    }
+                    std::memcpy(esram_mirror+256,original.data(),original.size());
                 }
                 using CreateRawSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
                 const auto create_raw_srv=reinterpret_cast<CreateRawSrv>(vt(device)[7]);
@@ -1119,15 +1604,15 @@ int main(int argc, char** argv) {
                     fast(context,invalid.data(),invalid.data()+invalid.size());
                     invalid=packet; invalid[1]=1;invalid[2]=0;
                     fast(context,invalid.data(),invalid.data()+invalid.size());
-                    std::array<UINT32,10> partial{0x80040001,0,0,0,0,0x80000001,0,0,0,0};
+                    std::array<UINT32,10> partial{0x80040001,0,0,0,0,0x80060001,0,0,0,0};
                     fast(context,partial.data(),partial.data()+partial.size());
+                    invalid=packet;invalid[0]=0x80040000;
+                    fast(context,invalid.data(),invalid.data()+1);
                     set_d3d11x_trap_handler(nullptr);
-                    check(rejections==5 && reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,
-                          "truncated, metadata, range, pointer and unsupported-tail failures preserve prior fast bindings transactionally");
+                    check(rejections==6 && reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==3,
+                          "truncated, metadata, range, pointer, unsupported-tail and zero-count packets preserve prior fast bindings transactionally");
                     reinterpret_cast<Count>(vt(raw_view)[2])(raw_view);
                     fast(context,packet.data(),packet.data());
-                    packet[0]=0x80000000;
-                    fast(context,packet.data(),packet.data()+1);
                     packet[0]=0x80040001;packet[1]=packet[2]=0;
                     fast(context,packet.data(),packet.data()+packet.size());
                     check(reinterpret_cast<Count>(vt(raw_view)[1])(raw_view)==2,"fast null SRD unbind and empty packets preserve exact ownership");
@@ -1185,6 +1670,124 @@ int main(int argc, char** argv) {
                   "buffer cannot extend beyond the physical ESRAM pool");
             check(release_virtual(esram_mirror,0,MEM_RELEASE),"ESRAM fixture releases its own title mapping");
             {
+                struct Format {DXGI_FORMAT value;UINT bytes;UINT64 one,half;};
+                const Format formats[]{
+                    {DXGI_FORMAT_R8G8B8A8_UNORM,4,0xfefefefe,0x7f7f7f7f},
+                    {DXGI_FORMAT_R10G10B10A2_UNORM,4,1022u|(1022u<<10)|(1022u<<20)|(2u<<30),511u|(511u<<10)|(511u<<20)|(1u<<30)},
+                    {DXGI_FORMAT_R11G11B10_FLOAT,4,(15u<<6)|((15u<<6)<<11)|((15u<<5)<<22),(14u<<6)|((14u<<6)<<11)|((14u<<5)<<22)},
+                    {DXGI_FORMAT_R16G16B16A16_FLOAT,8,0x3c003c003c003c00ull,0x3800380038003800ull}};
+                using Create=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                using Srv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                using Resolve=void(STDMETHODCALLTYPE*)(void*,void*,UINT,void*,UINT,DXGI_FORMAT);
+                using Defer=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                for(const auto& f:formats)for(const UINT samples:{1u,2u,4u,8u}) {
+                    Desc source_desc{};source_desc.standard={32,32,1,1,f.value,{samples,0},D3D11_USAGE_DEFAULT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,0,samples>1 ? 0x40000u:0u};
+                    Desc target_desc{};target_desc.standard={64,64,3,6,f.value,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,D3D11_RESOURCE_MISC_TEXTURECUBE};
+                    void* objects[2]{};void* views[2]{};void* canonical[2]{};
+                    const auto create=reinterpret_cast<Create>(vt(device)[5]);const auto srv=reinterpret_cast<Srv>(vt(device)[7]);
+                    const Desc* descriptions[]{&source_desc,&target_desc};
+                    for(UINT i=0;i<2;++i) {
+                        const auto created=create(device,descriptions[i],nullptr,&objects[i]);
+                        if(FAILED(created))std::fprintf(stderr,"resolve fixture format=%u samples=%u operand=%u hr=0x%08lX\n",f.value,samples,i,created);
+                        check(created==S_OK && objects[i],"resolve fixture creates real source/destination textures");if(!objects[i])return 1;
+                        check(srv(device,objects[i],nullptr,&views[i])==S_OK && views[i],"resolve fixture retains canonical source/destination views");if(!views[i])return 1;
+                        std::memcpy(&canonical[i],static_cast<BYTE*>(views[i])+80,sizeof canonical[i]);
+                    }
+                    TitleTextureLayout source_layout,target_layout;
+                    check(create_xg_texture_layout(32,32,1,1,f.value,UINT_MAX,source_layout,source_desc.standard.BindFlags,samples)==S_OK &&
+                        create_xg_texture_layout(64,64,3,6,f.value,UINT_MAX,target_layout,target_desc.standard.BindFlags)==S_OK,"resolve pixel oracles use the original sample and cube layouts");
+                    const UINT pitch=32*samples*f.bytes;std::vector<BYTE> input(pitch*32);
+                    const auto fill_source=[&](UINT phase) {
+                        for(UINT y=0;y<32;++y)for(UINT x=0;x<32;++x)for(UINT sample=0;sample<samples;++sample) {
+                            const UINT kind=(x+2*y+phase)%3;const UINT64 value=kind==1 || (kind==2 && sample>=samples/2) ? f.one:0;
+                            std::memcpy(input.data()+((y*32+x)*samples+sample)*f.bytes,&value,f.bytes);
+                        }
+                        check(source_layout.copy(source_layout.context.get(),true,input.data(),canonical[0],0,pitch,UINT(input.size()),nullptr)==S_OK,"resolve source keeps distinct sample values and changed pixel patterns");
+                    };
+                    const auto fill_target=[&]() {
+                        for(UINT sub=0;sub<18;++sub) {
+                            const UINT width=64>>(sub%3);std::vector<BYTE> guards(width*width*f.bytes,0x19);
+                            check(target_layout.copy(target_layout.context.get(),true,guards.data(),canonical[1],sub,width*f.bytes,UINT(guards.size()),nullptr)==S_OK,"resolve destination initializes every face/mip guard");
+                        }
+                    };
+                    const auto verify=[&](UINT phase,bool resolved) {
+                        for(UINT sub=0;sub<18;++sub) {
+                            const UINT width=64>>(sub%3);std::vector<BYTE> expected(width*width*f.bytes,0x19),actual(expected.size());
+                            if(resolved && sub==16)for(UINT y=0;y<32;++y)for(UINT x=0;x<32;++x) {
+                                const UINT kind=(x+2*y+phase)%3;const UINT64 value=kind==0 ? 0:kind==1 || samples==1 ? f.one:f.half;
+                                std::memcpy(expected.data()+(y*32+x)*f.bytes,&value,f.bytes);
+                            }
+                            const auto copied=target_layout.copy(target_layout.context.get(),false,actual.data(),canonical[1],sub,width*f.bytes,UINT(actual.size()),nullptr);
+                            if(copied==S_OK && actual!=expected) {
+                                const auto at=SIZE_T(std::mismatch(actual.begin(),actual.end(),expected.begin()).first-actual.begin())/f.bytes*f.bytes;
+                                UINT64 observed=0,wanted=0;std::memcpy(&observed,actual.data()+at,f.bytes);std::memcpy(&wanted,expected.data()+at,f.bytes);
+                                std::fprintf(stderr,"resolve pixels format=%u samples=%u phase=%u sub=%u byte=%zu actual=0x%llX expected=0x%llX\n",f.value,samples,phase,sub,at,observed,wanted);
+                            }
+                            check(copied==S_OK && actual==expected,"resolve preserves exact sample averages/copy pixels in the selected cube face/mip and every outside guard");
+                        }
+                    };
+                    const auto resolve=reinterpret_cast<Resolve>(vt(context)[57]);const auto request=samples==1 ? DXGI_FORMAT(UINT_MAX):f.value;
+                    fill_source(0);fill_target();
+                    static UINT refused=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                    refused=0;resolve(context,objects[1],UINT_MAX,objects[0],0,request);check(refused==57,"resolve rejects invalid destination subresources");
+                    refused=0;resolve(context,objects[1],16,reinterpret_cast<void*>(1),0,request);check(refused==57,"resolve rejects unreadable source resources");
+                    if(samples>1) {
+                        refused=0;resolve(context,objects[1],16,objects[0],0,DXGI_FORMAT_R32_UINT);check(refused==57,"MSAA resolve rejects an incompatible format before GPU submission");
+                        if(f.value==DXGI_FORMAT_R8G8B8A8_UNORM) {
+                            refused=0;resolve(context,objects[1],16,objects[0],0,DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+                            check(refused==57,"typed MSAA resources require their own resolve format rather than a sibling interpretation");
+                        }
+                        refused=0;resolve(context,objects[0],0,objects[0],0,f.value);check(refused==57,"resolve requires a single-sample destination");
+                    }else if(f.value==DXGI_FORMAT_R8G8B8A8_UNORM) {
+                        auto mismatch=source_desc;mismatch.standard.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;void* sibling=nullptr;
+                        check(create(device,&mismatch,nullptr,&sibling)==S_OK && sibling,"single-sample resolve negative control creates a valid sibling-format source");
+                        if(sibling) {
+                            refused=0;resolve(context,objects[1],16,sibling,0,f.value);
+                            check(refused==57,"reference single-sample resolve rejects different source/destination formats even when native bit copies would allow them");
+                            reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                        }
+                    }
+                    set_d3d11x_trap_handler(nullptr);verify(0,false);
+                    resolve(context,objects[1],16,objects[0],0,request);verify(0,true);
+                    if(samples==4) {
+                        Desc flat{};flat.standard={32,32,1,1,f.value,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,0};
+                        TitleTextureLayout pixels;check(create_xg_texture_layout(32,32,1,1,f.value,UINT_MAX,pixels,flat.standard.BindFlags)==S_OK,"aliased resolve uses the original single-sample layout");
+                        void* alias=nullptr;void* view=nullptr;
+                        using Place=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,UINT,UINT,void*,void**);
+                        check(reinterpret_cast<Place>(vt(device)[64])(device,&flat,pixels.tile_mode,0,canonical[0],&alias)==S_OK && alias,"resolve creates a single-sample destination over the source's shared storage");
+                        if(alias) {
+                            check(srv(device,alias,nullptr,&view)==S_OK && view,"aliased resolve destination retains its canonical image");
+                            resolve(context,alias,0,objects[0],0,f.value);
+                            std::vector<BYTE> actual(32*32*f.bytes);void* data=nullptr;if(view)std::memcpy(&data,static_cast<BYTE*>(view)+80,sizeof data);
+                            bool exact=view && pixels.copy(pixels.context.get(),false,actual.data(),data,0,32*f.bytes,UINT(actual.size()),nullptr)==S_OK;
+                            for(UINT y=0;y<32;++y)for(UINT x=0;x<32;++x) {
+                                const UINT kind=(x+2*y)%3;const UINT64 expected=kind==0 ? 0:kind==1 ? f.one:f.half;
+                                exact=exact && !std::memcmp(actual.data()+(y*32+x)*f.bytes,&expected,f.bytes);
+                            }
+                            check(exact,"aliased MSAA resolve snapshots source samples on GPU before overwriting their canonical storage");
+                            if(view)reinterpret_cast<Count>(vt(view)[2])(view);reinterpret_cast<Count>(vt(alias)[2])(alias);
+                            fill_source(0);
+                        }
+                    }
+                    fill_target();verify(0,false);
+                    void* producer=nullptr;void* list=nullptr;
+                    if(reinterpret_cast<Defer>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                        reinterpret_cast<Resolve>(vt(producer)[57])(producer,objects[1],16,objects[0],0,request);
+                        check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list,"deferred resolve retains both resources and the requested format/subresources");
+                        verify(0,false);
+                        reinterpret_cast<Count>(vt(producer)[2])(producer);
+                    }else check(false,"resolve creates a deferred producer");
+                    for(UINT i=0;i<2;++i){reinterpret_cast<Count>(vt(views[i])[2])(views[i]);reinterpret_cast<Count>(vt(objects[i])[2])(objects[i]);}
+                    if(list) {
+                        for(UINT phase=1;phase<3;++phase) {
+                            fill_source(phase);fill_target();verify(phase,false);
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);verify(phase,true);
+                        }
+                        reinterpret_cast<Count>(vt(list)[2])(list);
+                    }
+                }
+            }
+            {
                 using PlaceBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const EsramBufferDesc*,void*,void**);
                 const auto place_buffer=reinterpret_cast<PlaceBuffer>(vt(device)[62]);
                 auto* storage=static_cast<unsigned char*>(allocate(1024,attributes));
@@ -1204,6 +1807,35 @@ int main(int argc, char** argv) {
                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,EsramBufferDesc*)>(vt(buffer)[12])(buffer,&queried.desc);
                     check(!std::memcmp(&queried.desc,&placed,sizeof placed) && queried.guard==0x1122334455667788ull,
                           "placement buffer GetDesc preserves caller semantics and exact ABI extent");
+                    void* sibling=nullptr;
+                    check(place_buffer(device,&placed,storage+384,&sibling)==S_OK && sibling,"offset constants reuse an existing matching placement buffer");
+                    if(sibling) {
+                        using FastResources=void(STDMETHODCALLTYPE*)(void*,const void*,const void*);
+                        const auto fast=reinterpret_cast<FastResources>(vt(context)[209]);
+                        std::array<UINT32,5> packet{0x91040d01};UINT64 offset=128;
+                        std::memcpy(packet.data()+1,&buffer,sizeof buffer);std::memcpy(packet.data()+3,&offset,sizeof offset);
+                        fast(context,packet.data(),packet.data()+packet.size());
+                        check(reinterpret_cast<Count>(vt(sibling)[1])(sibling)==4,"offset constants retain the existing object through parent and pixel binding");
+                        reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                        fast(context,packet.data(),packet.data()+packet.size());
+                        check(reinterpret_cast<Count>(vt(sibling)[1])(sibling)==4,"repeated offset packets reuse identity without accumulating references");
+                        reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                        static UINT offset_rejections=0;offset_rejections=0;
+                        set_d3d11x_trap_handler([](const char* name,UINT slot)->std::uintptr_t {
+                            if(!std::strcmp(name,"ID3D11DeviceContextX") && slot==209)++offset_rejections;return 0;
+                        });
+                        offset=UINT64_MAX;std::memcpy(packet.data()+3,&offset,sizeof offset);
+                        fast(context,packet.data(),packet.data()+packet.size());
+                        set_d3d11x_trap_handler(nullptr);
+                        check(offset_rejections==1 && reinterpret_cast<Count>(vt(sibling)[1])(sibling)==4,
+                              "overflowing offset preserves the prior constants binding and existing references");
+                        reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                        packet[1]=packet[2]=0;
+                        fast(context,packet.data(),packet.data()+packet.size());
+                        check(reinterpret_cast<Count>(vt(sibling)[1])(sibling)==3,"null placement constants ignore metadata and unbind without discarding the parent cache");
+                        reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                        reinterpret_cast<Count>(vt(sibling)[2])(sibling);
+                    }
                     reinterpret_cast<Count>(vt(buffer)[2])(buffer);
                 }
                 MEMORY_BASIC_INFORMATION info{};
@@ -1225,6 +1857,8 @@ int main(int argc, char** argv) {
                       "placement buffer keeps unsupported binding semantics explicit");
             }
             for (const auto storage_format:{DXGI_FORMAT_R8_TYPELESS,DXGI_FORMAT_R10G10B10A2_TYPELESS,DXGI_FORMAT_R16G16_FLOAT}) {
+                NativeUavClear native_texture;
+                check(SUCCEEDED(native_texture.initialize(argc==5)),"independent native texture-clear control initializes on the same backend");if(!native_texture.gpu)return 1;
                 Desc color{};
                 color.standard={32,16,1,1,storage_format,{1,0},D3D11_USAGE_DEFAULT,
                     D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS,0,0};
@@ -1262,51 +1896,58 @@ int main(int argc, char** argv) {
                         check(descriptor[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) &&
                             ((descriptor[1]>>26)&15)==(integer ? 4u : format==DXGI_FORMAT_R16G16_FLOAT ? 7u : 0u),"typed SRV/UAV SRDs keep physical identity and native numeric interpretation");
                     }
-                    if(kind==2 && (storage_format==DXGI_FORMAT_R8_TYPELESS || storage_format==DXGI_FORMAT_R10G10B10A2_TYPELESS) && format!=DXGI_FORMAT_R32_UINT) {
+                    if(kind==2) {
                         using ClearUav=void(STDMETHODCALLTYPE*)(void*,void*,const void*);
                         using DeferredUav=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);
                         using FinishUav=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
                         using ExecuteUav=void(STDMETHODCALLTYPE*)(void*,void*,BOOL);
-                        const bool integer=format==formats[1];
-                        const UINT slot=integer ? 51 : 52;
-                        auto clear=reinterpret_cast<ClearUav>(vt(context)[slot]);
-                        UINT words[4]{0x12345037,0x12,0x34,0x56};FLOAT floats[4]{.5f,.25f,1,0};
-                        clear(context,view,integer ? static_cast<const void*>(words) : floats);
+                        const bool integer=format==DXGI_FORMAT_R8_UINT || format==DXGI_FORMAT_R10G10B10A2_UINT || format==DXGI_FORMAT_R32_UINT;
+                        const UINT slot=integer ? 51:52,element=storage_format==DXGI_FORMAT_R8_TYPELESS ? 1:4;
+                        const auto clear=reinterpret_cast<ClearUav>(vt(context)[slot]);
                         void* canonical=nullptr;std::memcpy(&canonical,static_cast<char*>(view)+80,sizeof canonical);
-                        const UINT element=storage_format==DXGI_FORMAT_R8_TYPELESS ? 1 : 4;
-                        TitleTextureLayout pixels;std::vector<unsigned char> pixel_result(512*element);
-                        const auto exact_pixels=[&](UINT expected) {
-                            if(pixels.copy(pixels.context.get(),false,pixel_result.data(),canonical,0,32*element,512*element,nullptr)!=S_OK) return false;
-                            for(SIZE_T at=0;at<pixel_result.size();at+=element) {
-                                UINT actual=0;std::memcpy(&actual,pixel_result.data()+at,element);
-                                if(actual!=expected) {std::fprintf(stderr,"UAV pixel format=%u expected=%08X actual=%08X at=%zu\n",format,expected,actual,at);return false;}
-                            }
-                            return true;
+                        TitleTextureLayout pixels;
+                        check(create_xg_texture_layout(32,16,1,1,storage_format,UINT_MAX,pixels,color.standard.BindFlags)==S_OK,"texture clear obtains the original canonical layout");
+                        if(!pixels.copy)return 1;
+                        std::vector<BYTE> pixel_result(512*element),expected_pixels;
+                        const auto verify=[&] {
+                            const HRESULT copied=pixels.copy(pixels.context.get(),false,pixel_result.data(),canonical,0,32*element,512*element,nullptr);
+                            const bool exact=SUCCEEDED(copied) && pixel_result==expected_pixels;
+                            if(!exact)std::fprintf(stderr,"reference texture clear mismatch resource=%u view=%u\n",storage_format,format);
+                            check(exact,"texture Uint/Float clear preserves the exact reference native pixels");
                         };
-                        check(create_xg_texture_layout(32,16,1,1,storage_format,UINT_MAX,pixels,color.standard.BindFlags)==S_OK &&
-                            exact_pixels(element==1 ? (integer ? 0x37u : 128u) : (integer ? 0x83404837u : 0x3ff40200u)),
-                            "UAV clear executes original integer/float values through a real shader-visible descriptor and fence");
-                        const std::vector<unsigned char> before(static_cast<unsigned char*>(canonical),static_cast<unsigned char*>(canonical)+pixels.bytes);
-                        void* producer=nullptr;void* retained=nullptr;void* list=nullptr;
-                        check(reinterpret_cast<DeferredUav>(vt(device)[27])(device,0,&producer)==S_OK && producer &&
-                            factory(device,texture,input,&retained)==S_OK && retained,"UAV clear creates a deferred producer and owned view");
-                        if(producer && retained) {
-                            UINT value[4]{integer ? 0x61u : 0x3f400000u,0,0,0};
-                            auto record=reinterpret_cast<ClearUav>(vt(producer)[slot]);
-                            record(producer,nullptr,reinterpret_cast<const void*>(1)); // Original null view is a no-op.
-                            record(producer,retained,value);std::memset(value,0,sizeof value);
+                        const std::array<UINT,4> inputs[]{{0x12345037,0x12,0x34,0x56},{0x3f000000,0x3e800000,0x3f800000,0}};
+                        for(const auto& values:inputs)for(const UINT operation:{51u,52u}) {
+                            if(FAILED(native_texture.texture(pixels.resource_desc,format,element,values,operation==52,expected_pixels)))return 1;
+                            reinterpret_cast<ClearUav>(vt(context)[operation])(context,view,values.data());verify();
+                        }
+                        for(const UINT operation:{51u,52u}) {
+                            std::array<UINT,4> values=operation==51 ? std::array<UINT,4>{0x61,0x12,0x34,0x56}:std::array<UINT,4>{0x40900061,0x3e800000,0x3f000000,0x3f800000};
+                            if(FAILED(native_texture.texture(pixels.resource_desc,format,element,values,operation==52,expected_pixels)))return 1;
+                            std::array<UINT,4> reset_values{};
+                            if(std::none_of(expected_pixels.begin(),expected_pixels.end(),[](BYTE value){return value!=0;}))reset_values[0]=integer ? 0x61u:0x3f400000u;
+                            std::vector<BYTE> reset_pixels;
+                            if(FAILED(native_texture.texture(pixels.resource_desc,format,element,reset_values,!integer,reset_pixels)))return 1;
+                            check(reset_pixels!=expected_pixels,"reference texture replay control starts from a different pixel image");
+                            clear(context,view,reset_values.data());
+                            const std::vector<BYTE> before(static_cast<BYTE*>(canonical),static_cast<BYTE*>(canonical)+pixels.bytes);
+                            void* producer=nullptr;void* retained=nullptr;void* list=nullptr;
+                            check(reinterpret_cast<DeferredUav>(vt(device)[27])(device,0,&producer)==S_OK && producer &&
+                                factory(device,texture,input,&retained)==S_OK && retained,"texture clear creates a deferred producer and retained native view");
+                            if(!producer || !retained)return 1;
+                            const auto record=reinterpret_cast<ClearUav>(vt(producer)[operation]);
+                            record(producer,nullptr,reinterpret_cast<const void*>(1));
+                            record(producer,retained,values.data());
+                            for(const UINT empty:{51u,52u})reinterpret_cast<ClearUav>(vt(producer)[empty])(producer,retained,nullptr);
+                            values.fill(0);
                             check(reinterpret_cast<FinishUav>(vt(producer)[114])(producer,TRUE,&list)==S_OK && list &&
-                                !std::memcmp(before.data(),canonical,before.size()),"UAV recording and Finish preserve canonical bytes and capture the source words");
+                                !std::memcmp(before.data(),canonical,before.size()),"texture clear recording captures values and operation without executing");
+                            reinterpret_cast<Count>(vt(retained)[2])(retained);reinterpret_cast<Count>(vt(producer)[2])(producer);
+                            if(!list)return 1;
+                            for(UINT pass=0;pass<2;++pass) {
+                                clear(context,view,reset_values.data());reinterpret_cast<ExecuteUav>(vt(context)[58])(context,list,pass!=0);verify();
+                            }
+                            reinterpret_cast<Count>(vt(list)[2])(list);
                         }
-                        if(retained) reinterpret_cast<Count>(vt(retained)[2])(retained);
-                        if(producer) reinterpret_cast<Count>(vt(producer)[2])(producer);
-                        for(UINT pass=0;pass<2 && list;++pass) {
-                            clear(context,view,nullptr);
-                            reinterpret_cast<ExecuteUav>(vt(context)[58])(context,list,pass!=0);
-                            check(exact_pixels(integer ? 0x61u : element==1 ? 191u : 767u),
-                                "UAV list retains its view and source values after producer release and restores exact pixels on reuse");
-                        }
-                        if(list) reinterpret_cast<Count>(vt(list)[2])(list);
                     }
                     if (kind==1 && format==formats[0]) {
                         using SetTargets=void(STDMETHODCALLTYPE*)(void*,UINT,void* const*,void*);
@@ -1369,7 +2010,7 @@ int main(int argc, char** argv) {
                                 if(updater) {
                                     const FLOAT black[]{0,0,0,0};
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(updater)[50])(updater,view,black);
-                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(updater)[153])(updater);
+                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(updater)[153])(updater,0);
                                     std::fill(upload.begin(),upload.end(),0xb3);
                                     reinterpret_cast<Update>(vt(updater)[48])(updater,texture,0,nullptr,upload.data(),40,640);
                                     check(reinterpret_cast<FinishUpdate>(vt(updater)[114])(updater,FALSE,&update_list)==S_OK && update_list,
@@ -1381,7 +2022,7 @@ int main(int argc, char** argv) {
                                     reinterpret_cast<Count>(vt(updater)[2])(updater);
                                     for(UINT pass=0;pass<2 && update_list;++pass) {
                                         reinterpret_cast<ExecuteUpdate>(vt(context)[58])(context,update_list,FALSE);
-                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[153])(context);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[153])(context,0);
                                         check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto value){return value==0xb3;}),
                                             "clear then update executes in order and reuses the owned upload after producer release");
@@ -1513,10 +2154,225 @@ int main(int argc, char** argv) {
                                     "float4 main(float2 p:POSITION,uint id:SV_VertexID):SV_Position{return float4(float2(id&1,id>>1)*float2(2,-2)+float2(-1,1)+p,0,1);}"};
                                 void* shaders[5]{};void* empty_layout=nullptr;void* vertex_layout=nullptr;void* vertex_buffer=nullptr;bool ready=compile!=nullptr;
                                 using CreateShader=HRESULT(STDMETHODCALLTYPE*)(void*,const void*,SIZE_T,void*,void**);
+                                if(compile && storage_format==DXGI_FORMAT_R8_TYPELESS) {
+                                    NativeUavClear native_clear;
+                                    check(SUCCEEDED(native_clear.initialize(argc==5)),"independent native typed-clear control initializes on the same backend");
+                                    if(!native_clear.gpu)return 1;
+                                    struct TypedFormat {DXGI_FORMAT format;UINT bytes,channels,kind,bits;}; // uint, sint, float, UNORM, raw, SNORM.
+                                    const TypedFormat formats[]{
+                                        {DXGI_FORMAT_R32_UINT,4,1,0,32},{DXGI_FORMAT_R16_UINT,2,1,0,16},{DXGI_FORMAT_R8_UINT,1,1,0,8},
+                                        {DXGI_FORMAT_R32_SINT,4,1,1,32},{DXGI_FORMAT_R16_SINT,2,1,1,16},{DXGI_FORMAT_R8_SINT,1,1,1,8},
+                                        {DXGI_FORMAT_R32G32B32A32_UINT,16,4,0,32},{DXGI_FORMAT_R16G16B16A16_UINT,8,4,0,16},{DXGI_FORMAT_R10G10B10A2_UINT,4,4,0,10},
+                                        {DXGI_FORMAT_R32_FLOAT,4,1,2,32},{DXGI_FORMAT_R16_FLOAT,2,1,2,16},{DXGI_FORMAT_R16G16B16A16_FLOAT,8,4,2,16},
+                                        {DXGI_FORMAT_R32G32B32A32_FLOAT,16,4,2,32},{DXGI_FORMAT_R8_UNORM,1,1,3,8},{DXGI_FORMAT_R8G8_UNORM,2,2,3,8},
+                                        {DXGI_FORMAT_R8G8B8A8_UNORM,4,4,3,8},{DXGI_FORMAT_R16_UNORM,2,1,3,16},{DXGI_FORMAT_R16G16_UNORM,4,2,3,16},
+                                        {DXGI_FORMAT_R16G16B16A16_UNORM,8,4,3,16},{DXGI_FORMAT_R10G10B10A2_UNORM,4,4,3,10},
+                                        {DXGI_FORMAT_R32_TYPELESS,4,1,4,32},
+                                        {DXGI_FORMAT_R8_SNORM,1,1,5,8},{DXGI_FORMAT_R8G8_SNORM,2,2,5,8},{DXGI_FORMAT_R8G8B8A8_SNORM,4,4,5,8},
+                                        {DXGI_FORMAT_R16_SNORM,2,1,5,16},{DXGI_FORMAT_R16G16_SNORM,4,2,5,16},{DXGI_FORMAT_R16G16B16A16_SNORM,8,4,5,16}};
+                                    using Uav=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                                    using Srv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                                    using Clear=void(STDMETHODCALLTYPE*)(void*,void*,const UINT*);
+                                    using Dispatch=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT);
+                                    using Defer=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                    struct TypedBufferDesc {D3D11_BUFFER_DESC standard;UINT64 extension;};
+                                    using Buffer=HRESULT(STDMETHODCALLTYPE*)(void*,const TypedBufferDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                                    for(const auto& f:formats) {
+                                        const bool raw=f.kind==4;const UINT first=raw ? 4:2;void* objects[3]{};
+                                        const UINT misc=raw || f.format==DXGI_FORMAT_R16_UINT ? D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS:0;
+                                        const TypedBufferDesc desc{{f.bytes*10+3,D3D11_USAGE_DEFAULT,D3D11_BIND_UNORDERED_ACCESS|D3D11_BIND_SHADER_RESOURCE,0,misc,0},0};
+                                        std::vector<BYTE> guards(desc.standard.ByteWidth,0xa5);const D3D11_SUBRESOURCE_DATA initial{guards.data(),0,0};
+                                        const auto buffer=reinterpret_cast<Buffer>(vt(device)[3]);const auto uav=reinterpret_cast<Uav>(vt(device)[8]);
+                                        check(buffer(device,&desc,&initial,&objects[0])==S_OK && objects[0],"typed UAV fixture creates a real unstructured buffer with trailing byte guards");if(!objects[0])return 1;
+                                        D3D11_UNORDERED_ACCESS_VIEW_DESC view{};view.Format=f.format;view.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;
+                                        view.Buffer={first,4,raw ? UINT(D3D11_BUFFER_UAV_FLAG_RAW):0};
+                                        const auto created=uav(device,objects[0],&view,&objects[1]);
+                                        if(FAILED(created))std::fprintf(stderr,"typed UAV format=%u creation=0x%08lX\n",f.format,created);
+                                        check(created==S_OK && objects[1],"typed/raw UAV creates a native sliced buffer descriptor");if(!objects[1])return 1;
+                                        check(uav(device,objects[0],&view,nullptr)==S_FALSE,"typed UAV validation does not publish ownership");
+                                        for(UINT invalid=0;invalid<4;++invalid) {
+                                            auto bad=view;if(invalid==0)bad.Buffer.FirstElement=UINT_MAX;if(invalid==1)bad.Buffer.NumElements=0;
+                                            if(invalid==2)bad.Buffer.Flags|=D3D11_BUFFER_UAV_FLAG_COUNTER;if(invalid==3)bad.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
+                                            void* refused=reinterpret_cast<void*>(1);const auto rejected=uav(device,objects[0],&bad,&refused);
+                                            check(FAILED(rejected) && !refused,"typed UAV rejects range overflow, zero elements, counters and wrong dimensions without publishing a view");
+                                        }
+                                        void* absent=reinterpret_cast<void*>(1);check(uav(device,objects[0],nullptr,&absent)==E_INVALIDARG && !absent,"unstructured UAV requires the reference's explicit description");
+                                        D3D11_UNORDERED_ACCESS_VIEW_DESC observed{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*)>(vt(objects[1])[9])(objects[1],&observed);
+                                        check(!std::memcmp(&observed,&view,sizeof view),"typed UAV GetDesc preserves first element, count, format and flags");
+                                        D3D11_SHADER_RESOURCE_VIEW_DESC read{};read.Format=f.format;read.ViewDimension=raw ? D3D11_SRV_DIMENSION_BUFFEREX:D3D11_SRV_DIMENSION_BUFFER;
+                                        read.BufferEx={first,4,raw ? UINT(D3D11_BUFFEREX_SRV_FLAG_RAW):0};void* srv=nullptr;
+                                        check(reinterpret_cast<Srv>(vt(device)[7])(device,objects[0],&read,&srv)==S_OK && srv,"typed UAV has a matching original-format SRV descriptor");
+                                        if(srv) {
+                                            std::array<UINT,4> a{},b{};std::memcpy(a.data(),static_cast<BYTE*>(objects[1])+48,sizeof a);std::memcpy(b.data(),static_cast<BYTE*>(srv)+48,sizeof b);
+                                            check(a==b,"typed buffer UAV and SRV SRDs share the native address, stride, range, numeric encoding and selectors");
+                                            reinterpret_cast<Count>(vt(srv)[2])(srv);
+                                        }
+                                        const bool floating=f.kind==2 || f.kind==3 || f.kind==5;
+                                        std::string type=f.kind==1 ? "int":"uint";if(floating)type="float";if(f.channels>1)type+=std::to_string(f.channels);
+                                        std::string body;
+                                        if(raw)body="uint value=u.Load(id.x*4);u.Store(id.x*4,value+id.x+1);";
+                                        else if(floating)body="u[id.x]+=.125;";
+                                        else if(f.kind==1)body="u[id.x]-=int(id.x)+1;";
+                                        else if(f.channels==4)body=f.bits==10 ? "u[id.x]+=uint4(1,2,3,0)+id.x;":"u[id.x]+=uint4(1,2,3,4)+id.x;";
+                                        else body="u[id.x]+=id.x+1;";
+                                        const std::string source=(raw ? "RWByteAddressBuffer":"RWBuffer<"+type+">")+std::string(" u:register(u0);[numthreads(1,1,1)]void main(uint3 id:SV_DispatchThreadID){")+body+"}";
+                                        Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                        check(SUCCEEDED(compile(source.data(),source.size(),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,nullptr)) &&
+                                            reinterpret_cast<CreateShader>(vt(device)[18])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&objects[2])==S_OK && objects[2],"typed UAV shader creates a real native typed-load/store compute pipeline");if(!objects[2])return 1;
+                                        BYTE* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(objects[0])+48,sizeof canonical);
+                                        for(const UINT slot:{51u,52u})reinterpret_cast<Clear>(vt(context)[slot])(context,objects[1],nullptr);
+                                        check(!std::memcmp(canonical,guards.data(),guards.size()),"reference null clear values preserve every buffer byte");
+                                        FLOAT color[]{.25f,.5f,.75f,1};
+                                        std::vector<BYTE> clear_image;
+                                        if(f.kind==5) {
+                                            color[0]=-.5f;color[1]=.5f;color[2]=-2;color[3]=2;
+                                        }
+                                        std::array<UINT,4> clear{0x12345678,7,8,9};if(f.kind==0 && f.bits<32)clear[0]=55;
+                                        if(f.bits==10)clear[3]=0; // Keep the compute step's alpha in its original 0..3 domain.
+                                        if(f.kind==1)clear={UINT(-2),7,8,9};if(floating)std::memcpy(clear.data(),color,sizeof color);
+                                        if(FAILED(native_clear.clear(f.format,f.bytes,clear,floating,clear_image,raw)))return 1;
+                                        const auto verify=[&](bool computed) {
+                                            auto expected=guards;
+                                            std::memcpy(expected.data()+first*f.bytes,clear_image.data(),clear_image.size());
+                                            for(UINT i=0;computed && i<4;++i) {
+                                                UINT packed=0;
+                                                for(UINT c=0;c<f.channels;++c) {
+                                                    const auto* at=clear_image.data()+i*f.bytes+c*(f.bytes/f.channels);
+                                                    UINT value=0;
+                                                    if(f.bits==10){std::memcpy(&value,clear_image.data()+i*f.bytes,4);value=(value>>(c==3 ? 30:c*10))&(c==3 ? 3:1023);}
+                                                    else std::memcpy(&value,at,f.bytes/f.channels);
+                                                    if(f.kind==0 || raw)value+=(f.bits==10 && c==3 ? 0:c+1)+i;
+                                                    else if(f.kind==1) {
+                                                        INT q=0;if(f.bits==8){std::int8_t v=0;std::memcpy(&v,at,1);q=v;}else if(f.bits==16){std::int16_t v=0;std::memcpy(&v,at,2);q=v;}else std::memcpy(&q,at,4);
+                                                        value=UINT(q)-i-1;
+                                                    }
+                                                    else if(f.kind==2) {
+                                                        if(f.bits==32){const FLOAT v=color[c]+(computed ? .125f:0);std::memcpy(&value,&v,4);}
+                                                        else {const UINT before[]{0x3400,0x3800,0x3a00,0x3c00},after[]{0x3600,0x3900,0x3b00,0x3c80};value=computed ? after[c]:before[c];}
+                                                    }else if(f.kind==5) {
+                                                        INT q=0;
+                                                        if(f.bits==8){std::int8_t v=0;std::memcpy(&v,at,1);q=v;}else{std::int16_t v=0;std::memcpy(&v,at,2);q=v;}
+                                                        const INT max=(1<<(f.bits-1))-1;
+                                                        if(computed)q=std::clamp(q+(1<<(f.bits-4)),-max,max);
+                                                        value=UINT(q);
+                                                    }
+                                                    else {
+                                                        const UINT bits=f.bits==10 && c==3 ? 2:f.bits,max=(1u<<bits)-1;
+                                                        value=(std::min)(max,value+UINT(.125f*FLOAT(max)+.5f));
+                                                    }
+                                                    if(f.bits==10)packed|=value<<(c==3 ? 30:c*10);
+                                                    else std::memcpy(expected.data()+(first+i)*f.bytes+c*(f.bytes/f.channels),&value,f.bytes/f.channels);
+                                                }
+                                                if(f.bits==10)std::memcpy(expected.data()+(first+i)*f.bytes,&packed,4);
+                                            }
+                                            const bool exact=!std::memcmp(canonical,expected.data(),expected.size());
+                                            if(!exact){const auto at=SIZE_T(std::mismatch(expected.begin(),expected.end(),canonical).first-expected.begin());std::fprintf(stderr,"typed UAV format=%u compute=%u byte=%zu actual=%u expected=%u\n",f.format,UINT(computed),at,canonical[at],expected[at]);}
+                                            check(exact,"typed/raw UAV clear and compute preserve exact selected elements, all components and every surrounding byte");
+                                        };
+                                        const UINT clear_slot=floating ? 52:51;
+                                        {
+                                            const auto saved_image=clear_image;
+                                            const std::array<UINT,4> probes[]{{0x12345678,7,8,9},{0x3e800000,0x3f000000,0x3f400000,0x3f800000}};
+                                            for(const auto& values:probes)for(const UINT slot:{51u,52u}) {
+                                                if(FAILED(native_clear.clear(f.format,f.bytes,values,slot==52,clear_image,raw)))return 1;
+                                                reinterpret_cast<Clear>(vt(context)[slot])(context,objects[1],values.data());verify(false);
+                                            }
+                                            clear_image=saved_image;
+                                        }
+                                        if(f.kind==5) {
+                                            const FLOAT inf=std::numeric_limits<FLOAT>::infinity(),nan=std::numeric_limits<FLOAT>::quiet_NaN();
+                                            const FLOAT cases[]{-inf,-2,-1,-.5f,-.25f,-0.f,0,.25f,.5f,1,2,inf,nan};
+                                            const auto saved_clear=clear;const auto saved_image=clear_image;
+                                            for(const FLOAT probe:cases) {
+                                                UINT bits=0;std::memcpy(&bits,&probe,4);clear.fill(bits);
+                                                for(const UINT slot:{51u,52u}) {
+                                                    if(FAILED(native_clear.clear(f.format,f.bytes,clear,slot==52,clear_image)))return 1;
+                                                    reinterpret_cast<Clear>(vt(context)[slot])(context,objects[1],clear.data());verify(false);
+                                                }
+                                            }
+                                            clear=saved_clear;clear_image=saved_image;
+                                            const std::array<UINT,4> integer_values{0x12345678,7,8,9};
+                                            for(const auto values:{integer_values,std::array<UINT,4>{UINT(-2),0x8001,0x7fff,UINT_MAX}}) {
+                                                if(FAILED(native_clear.clear(f.format,f.bytes,values,false,clear_image)))return 1;
+                                                reinterpret_cast<Clear>(vt(context)[51])(context,objects[1],values.data());verify(false);
+                                            }
+                                            if(FAILED(native_clear.clear(f.format,f.bytes,integer_values,false,clear_image)))return 1;
+                                            void* integer_producer=nullptr;void* integer_list=nullptr;
+                                            const auto before_record=std::vector<BYTE>(canonical,canonical+guards.size());
+                                            check(reinterpret_cast<Defer>(vt(device)[27])(device,0x60000,&integer_producer)==S_OK && integer_producer,"SNORM Uint clear creates a deferred producer");
+                                            if(!integer_producer)return 1;
+                                            reinterpret_cast<Clear>(vt(integer_producer)[51])(integer_producer,objects[1],integer_values.data());
+                                            check(reinterpret_cast<Finish>(vt(integer_producer)[114])(integer_producer,FALSE,&integer_list)==S_OK && integer_list &&
+                                                !std::memcmp(canonical,before_record.data(),before_record.size()),"SNORM Uint recording preserves the distinct operation and leaves bytes unchanged");
+                                            reinterpret_cast<Count>(vt(integer_producer)[2])(integer_producer);
+                                            if(!integer_list)return 1;
+                                            for(UINT pass=0;pass<2;++pass) {
+                                                std::memcpy(canonical,guards.data(),guards.size());
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,integer_list,TRUE);verify(false);
+                                            }
+                                            reinterpret_cast<Count>(vt(integer_list)[2])(integer_list);clear_image=saved_image;
+                                        }
+                                        reinterpret_cast<Clear>(vt(context)[clear_slot])(context,objects[1],clear.data());verify(false);
+                                        if(!raw) {
+                                            std::vector<BYTE> reference_bytes;
+                                            if(FAILED(native_clear.clear(f.format,f.bytes,clear,floating,reference_bytes)))return 1;
+                                            const bool same=!std::memcmp(canonical+first*f.bytes,reference_bytes.data(),reference_bytes.size());
+                                            if(!same)std::fprintf(stderr,"reference clear mismatch format=%u\n",f.format);
+                                            check(same,"typed buffer clear matches the supplied reference native operation");
+                                        }
+                                        const auto bind=[&](void* target) {
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(target)[69])(target,objects[2]);
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*)>(vt(target)[68])(target,0,1,&objects[1]);
+                                        };
+                                        bind(context);reinterpret_cast<Dispatch>(vt(context)[41])(context,4,1,1);verify(true);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);std::memcpy(canonical,guards.data(),guards.size());
+                                        void* producer=nullptr;void* list=nullptr;
+                                        if(reinterpret_cast<Defer>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                                            reinterpret_cast<Clear>(vt(producer)[clear_slot])(producer,objects[1],clear.data());
+                                            for(const UINT slot:{51u,52u})reinterpret_cast<Clear>(vt(producer)[slot])(producer,objects[1],nullptr);
+                                            bind(producer);
+                                            reinterpret_cast<Dispatch>(vt(producer)[41])(producer,4,1,1);
+                                            check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list && !std::memcmp(canonical,guards.data(),guards.size()),"typed UAV recording retains resources without clearing or dispatching");
+                                            reinterpret_cast<Count>(vt(producer)[2])(producer);
+                                        }else check(false,"typed UAV creates a deferred producer");
+                                        for(auto* object:objects)reinterpret_cast<Count>(vt(object)[2])(object);
+                                        if(list) {
+                                            for(UINT pass=0;pass<2;++pass) {std::memcpy(canonical,guards.data(),guards.size());reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);verify(true);}
+                                            reinterpret_cast<Count>(vt(list)[2])(list);
+                                        }
+                                    }
+                                    for(const UINT stride:{4u,12u,16u})for(const UINT slot:{51u,52u}) {
+                                        const TypedBufferDesc desc{{10*stride,D3D11_USAGE_DEFAULT,D3D11_BIND_UNORDERED_ACCESS,0,D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,stride},0};
+                                        const std::vector<BYTE> guards(desc.standard.ByteWidth,0xa5);const D3D11_SUBRESOURCE_DATA initial{guards.data(),0,0};
+                                        void* resource=nullptr;void* target=nullptr;
+                                        check(reinterpret_cast<Buffer>(vt(device)[3])(device,&desc,&initial,&resource)==S_OK && resource,"structured clear creates shared storage with a verified DWORD stride");
+                                        if(!resource)return 1;
+                                        D3D11_UNORDERED_ACCESS_VIEW_DESC view{};view.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;view.Buffer={2,4,0};
+                                        check(reinterpret_cast<Uav>(vt(device)[8])(device,resource,&view,&target)==S_OK && target,"structured clear creates its sliced unknown-format view");
+                                        if(!target)return 1;
+                                        BYTE* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(resource)+48,sizeof canonical);
+                                        const std::array<UINT,4> values=slot==51 ? std::array<UINT,4>{0x12345678,7,8,9}:std::array<UINT,4>{0x3e800000,0x3f000000,0x3f400000,0x3f800000};
+                                        std::vector<BYTE> native;
+                                        if(FAILED(native_clear.clear(DXGI_FORMAT_R32_UINT,4,values,slot==52,native,false,stride)))return 1;
+                                        auto expected=guards;std::memcpy(expected.data()+2*stride,native.data(),native.size());
+                                        const auto verify=[&]{check(!std::memcmp(canonical,expected.data(),expected.size()),"structured Uint/Float clear matches the reference DWORD alias and preserves both guards");};
+                                        reinterpret_cast<Clear>(vt(context)[slot])(context,target,values.data());verify();
+                                        std::memcpy(canonical,guards.data(),guards.size());
+                                        void* producer=nullptr;void* list=nullptr;
+                                        check(reinterpret_cast<Defer>(vt(device)[27])(device,0x60000,&producer)==S_OK && producer,"structured clear creates a deferred producer");
+                                        if(!producer)return 1;
+                                        reinterpret_cast<Clear>(vt(producer)[slot])(producer,target,values.data());
+                                        check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list && !std::memcmp(canonical,guards.data(),guards.size()),"structured clear records without executing");
+                                        reinterpret_cast<Count>(vt(producer)[2])(producer);reinterpret_cast<Count>(vt(target)[2])(target);reinterpret_cast<Count>(vt(resource)[2])(resource);
+                                        if(!list)return 1;
+                                        for(UINT pass=0;pass<2;++pass){std::memcpy(canonical,guards.data(),guards.size());reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);verify();}
+                                        reinterpret_cast<Count>(vt(list)[2])(list);
+                                    }
+                                }
                                 for(UINT i=0;i<5 && ready;++i) {
                                     Microsoft::WRL::ComPtr<ID3DBlob> code;
                                     const bool vertex=i==0 || i==3 || i==4;
-                                    ready=SUCCEEDED(compile(sources[i],std::strlen(sources[i]),nullptr,nullptr,nullptr,"main",vertex ? "vs_5_0" : "ps_5_0",0,0,&code,nullptr));
+                                    ready=SUCCEEDED(compile(sources[i],std::strlen(sources[i]),nullptr,nullptr,nullptr,"main",vertex ? "vs_4_0" : "ps_4_0",0,0,&code,nullptr));
                                     if(ready) ready=reinterpret_cast<CreateShader>(vt(device)[vertex ? 12 : 15])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shaders[i])==S_OK;
                                     if(ready && vertex && i != 4) {
                                         using CreateLayout=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_INPUT_ELEMENT_DESC*,UINT,const void*,SIZE_T,void**);
@@ -1527,12 +2383,18 @@ int main(int argc, char** argv) {
                                 }
                                 const FLOAT vertices[]{99,99,0,0,-1,1,0,0,3,1,0,0,-1,-3,0,0};
                                 if(ready) {
-                                    struct VertexDesc { D3D11_BUFFER_DESC standard;UINT64 extension; } vertex_desc{{sizeof vertices,D3D11_USAGE_DEFAULT,D3D11_BIND_VERTEX_BUFFER,0,0,0},0};
+                                    struct VertexDesc { D3D11_BUFFER_DESC standard;UINT64 extension; } vertex_desc{{sizeof vertices,D3D11_USAGE_IMMUTABLE,D3D11_BIND_VERTEX_BUFFER,0,0,40},0};
                                     const D3D11_SUBRESOURCE_DATA initial{vertices,0,0};
                                     using CreateBuffer=HRESULT(STDMETHODCALLTYPE*)(void*,const VertexDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
                                     ready=reinterpret_cast<CreateBuffer>(vt(device)[3])(device,&vertex_desc,&initial,&vertex_buffer)==S_OK;
+                                    if(ready) {
+                                        VertexDesc observed{};
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,VertexDesc*)>(vt(vertex_buffer)[12])(vertex_buffer,&observed);
+                                        check(observed.standard.StructureByteStride==40 && observed.standard.Usage==D3D11_USAGE_IMMUTABLE,
+                                            "nonstructured vertex buffer retains its stride hint while native IA uses the bound stride");
+                                    }
                                 }
-                                check(ready,"legacy procedural draw creates real VS/PS shader objects");
+                                check(ready,"legacy procedural draw creates real Shader Model 4.0 VS/PS objects");
                                 if(ready) {
                                     bind_targets(context,1,targets,nullptr);
                                     using Draw=void(STDMETHODCALLTYPE*)(void*,UINT,UINT);
@@ -1541,8 +2403,37 @@ int main(int argc, char** argv) {
                                     reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(context)[44])(context,1,&viewport);
                                     const UINT64 topology=0x000009ffc0009e00ull;
                                     std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);
+                                    static_cast<BYTE*>(context)[0x390]=1; // Exercise the legacy inline fallback independently of the reference dispatch mode.
                                     std::memcpy(static_cast<char*>(context)+0x180,&shaders[0],sizeof(void*));
                                     std::memcpy(static_cast<char*>(context)+0x178,&empty_layout,sizeof empty_layout);
+                                    {
+                                        auto* queued_base=static_cast<BYTE*>(reserve(nullptr,65536,0x30002000,PAGE_READWRITE));
+                                        if(!queued_base || pixels.bytes>65536 || reserve(queued_base,65536,0x30001000,0x10004)!=queued_base)return 1;
+                                        std::memset(queued_base,0x5a,65536);
+                                        void* queued_texture=nullptr;void* queued_view=nullptr;
+                                        using PlaceTracked=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,UINT,UINT,void*,void**);
+                                        check(reinterpret_cast<PlaceTracked>(vt(device)[64])(device,&color,pixels.tile_mode,0,queued_base,&queued_texture)==S_OK && queued_texture &&
+                                            factory(device,queued_texture,&rtv,&queued_view)==S_OK && queued_view,
+                                            "queued draw creates a tracked graphics texture with an original-XG layout");
+                                        if(!queued_texture || !queued_view)return 1;
+                                        bind_targets(context,1,&queued_view,nullptr);
+                                        for(UINT pass=0;pass<2;++pass) {
+                                            std::memcpy(static_cast<char*>(context)+0x188,&shaders[1+pass],sizeof(void*));
+                                            draw(context,3,0);
+                                            const auto copied=pixels.copy(pixels.context.get(),false,linear.data(),queued_base,0,32,512,nullptr);
+                                            check(SUCCEEDED(copied) && std::all_of(linear.begin(),linear.end(),[&](auto value){return value==(pass ? 191:64);}),
+                                                "CPU access retires a queued draw before original-XG pixel conversion");
+                                        }
+                                        draw(context,3,0);
+                                        bind_targets(context,1,targets,nullptr);
+                                        reinterpret_cast<Count>(vt(queued_view)[2])(queued_view);
+                                        reinterpret_cast<Count>(vt(queued_texture)[2])(queued_texture);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[153])(context,0);
+                                        check(pixels.copy(pixels.context.get(),false,linear.data(),queued_base,0,32,512,nullptr)==S_OK &&
+                                            std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
+                                            "queued native resources survive all public view and texture releases until GPU idle");
+                                        check(release_virtual(queued_base,0,MEM_RELEASE),"GPU idle retires retained storage before graphics reservation release");
+                                    }
                                     for(UINT pass=0;pass<2;++pass) {
                                         std::memcpy(static_cast<char*>(context)+0x188,&shaders[1+pass],sizeof(void*));
                                         draw(context,3,0);
@@ -1552,6 +2443,429 @@ int main(int argc, char** argv) {
                                     }
                                     check(reinterpret_cast<Count>(vt(shaders[1])[1])(shaders[1])==2,"inline PS replacement releases the prior shader binding");
                                     reinterpret_cast<Count>(vt(shaders[1])[2])(shaders[1]);
+                                    for(UINT epoch=0;epoch<3;++epoch) {
+                                        const char* source="struct V{float4 p:SV_Position;nointerpolation float r:COLOR;}; V vs(float r:COLOR,float2 p:POSITION){V o;o.p=float4(p,0,1);o.r=r;return o;} float4 ps(V v):SV_Target{return float4(v.r*GAIN,0,0,1);}";
+                                        const D3D_SHADER_MACRO defines[]{{"GAIN",epoch==2 ? "0.5":"1"},{nullptr,nullptr}};
+                                        const BYTE multiple=epoch==2 ? 32:64,single=epoch==2 ? 96:191;
+                                        void* objects[6]{};bool made=true;
+                                        for(UINT stage=0;stage<2 && made;++stage) {
+                                            Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                            made=SUCCEEDED(compile(source,std::strlen(source),nullptr,defines,nullptr,stage ? "ps":"vs",stage ? "ps_4_0":"vs_4_0",0,0,&code,nullptr)) &&
+                                                reinterpret_cast<CreateShader>(vt(device)[stage ? 15:12])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&objects[stage])==S_OK;
+                                            if(made && !stage) {
+                                                const D3D12_INPUT_ELEMENT_DESC instance[]{{"COLOR",0,DXGI_FORMAT_R32_FLOAT,0,0,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1},{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,1,0,D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,0}};
+                                                using Layout=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D12_INPUT_ELEMENT_DESC*,UINT,const void*,SIZE_T,void**);
+                                                made=reinterpret_cast<Layout>(vt(device)[11])(device,instance,2,code->GetBufferPointer(),code->GetBufferSize(),&objects[2])==S_OK;
+                                            }
+                                        }
+                                        const FLOAT colors[]{1,1,1,.125f,.25f,.5f,.75f,1};const UINT16 indices[]{99,6,7,8,99};
+                                        const FLOAT positions[]{99,99,99,99,99,99,99,99,99,99,-1,1,3,1,-1,-3};
+                                        struct BufferDesc {D3D11_BUFFER_DESC standard;UINT64 extension;};
+                                        using BufferFactory=HRESULT(STDMETHODCALLTYPE*)(void*,const BufferDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                                        for(UINT i=0;i<3 && made;++i) {
+                                            BufferDesc desc{{i==2 ? UINT(sizeof positions):i==1 ? UINT(sizeof indices):UINT(sizeof colors),D3D11_USAGE_IMMUTABLE,i==1 ? UINT(D3D11_BIND_INDEX_BUFFER):UINT(D3D11_BIND_VERTEX_BUFFER),0,0,0},0};
+                                            const D3D11_SUBRESOURCE_DATA initial{i==2 ? static_cast<const void*>(positions):i==1 ? static_cast<const void*>(indices):static_cast<const void*>(colors),0,0};
+                                            made=reinterpret_cast<BufferFactory>(vt(device)[3])(device,&desc,&initial,&objects[3+i])==S_OK;
+                                        }
+                                        check(made,"reference instanced draw fixture creates per-instance input, indexed vertices and original-ABI shaders");
+                                        if(made) {
+                                            using Vertices=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*,const UINT*,const UINT*);
+                                            using Indices=void(STDMETHODCALLTYPE*)(void*,UINT,void*,UINT);
+                                            using Instanced=void(STDMETHODCALLTYPE*)(void*,UINT,UINT64,UINT);
+                                            using IndexedInstanced=void(STDMETHODCALLTYPE*)(void*,UINT64,UINT64,UINT);
+                                            const auto bind=[&](void* target) {
+                                                bind_targets(target,1,targets,nullptr);
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(target)[44])(target,1,&viewport);
+                                                std::memcpy(static_cast<char*>(target)+0x170,&topology,sizeof topology);static_cast<BYTE*>(target)[0x390]=1;
+                                                std::memcpy(static_cast<char*>(target)+0x180,&objects[0],sizeof(void*));std::memcpy(static_cast<char*>(target)+0x188,&objects[1],sizeof(void*));
+                                                std::memcpy(static_cast<char*>(target)+0x178,&objects[2],sizeof(void*));
+                                                const UINT strides[]{4,8},offsets[]{0,0};void* vertices[]{objects[3],objects[5]};
+                                                reinterpret_cast<Vertices>(vt(target)[19])(target,0,2,vertices,strides,offsets);
+                                                reinterpret_cast<Indices>(vt(target)[20])(target,0,objects[4],0);
+                                            };
+                                            const FLOAT black[]{0,0,0,0};
+                                            const auto exact=[&](BYTE value) {
+                                                const auto copied=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr);
+                                                const bool matches=copied==S_OK && std::all_of(linear.begin(),linear.end(),[&](BYTE pixel){return pixel==value;});
+                                                if(!matches){const auto bounds=std::minmax_element(linear.begin(),linear.end());std::fprintf(stderr,"instanced pixels expected=%u first=%u min=%u max=%u copy=0x%08lX\n",value,linear[0],*bounds.first,*bounds.second,copied);}
+                                                return matches;
+                                            };
+                                            bind(context);
+                                            for(UINT indexed=0;indexed<2;++indexed) {
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                if(indexed)reinterpret_cast<IndexedInstanced>(vt(context)[21])(context,(UINT64(3)<<32)|1,(UINT64(3)<<32)|UINT(-1),2);
+                                                else reinterpret_cast<Instanced>(vt(context)[22])(context,3,(UINT64(3)<<32)|5,2);
+                                                check(exact(multiple),"instanced draws preserve packed starts and input addressing across shader recreation and changed shader contents");
+                                            }
+                                            {
+                                                using Indirect=void(STDMETHODCALLTYPE*)(void*,void*,UINT);
+                                                using ComputeBind=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                                                using Dispatch=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT);
+                                                std::array<UINT,32> words{};words[0]=words[1]=words[2]=words[3]=words[8]=words[9]=words[15]=0x6d6d6d6d;
+                                                words[4]=3;words[5]=2;words[6]=5;words[7]=3;
+                                                words[10]=3;words[11]=2;words[12]=1;words[13]=UINT(-1);words[14]=3;
+                                                words[20]=4;words[21]=2;words[22]=1;
+                                                void* indirect_objects[5]{}; // Argument buffer/UAV, argument writer, fill shader, target UAV.
+                                                BufferDesc args_desc{{sizeof words,D3D11_USAGE_DEFAULT,D3D11_BIND_UNORDERED_ACCESS,0,D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS|D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS,0},0};
+                                                const D3D11_SUBRESOURCE_DATA args_data{words.data(),0,0};
+                                                bool indirect_ready=reinterpret_cast<BufferFactory>(vt(device)[3])(device,&args_desc,&args_data,&indirect_objects[0])==S_OK;
+                                                using Uav=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                                                D3D11_UNORDERED_ACCESS_VIEW_DESC raw{};raw.Format=DXGI_FORMAT_R32_TYPELESS;raw.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;raw.Buffer.NumElements=32;raw.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_RAW;
+                                                if(indirect_ready)indirect_ready=reinterpret_cast<Uav>(vt(device)[8])(device,indirect_objects[0],&raw,&indirect_objects[1])==S_OK;
+                                                const char* compute[]{
+                                                    "RWByteAddressBuffer args:register(u0);[numthreads(1,1,1)] void main(){args.Store4(16,uint4(3,1,5,6));args.Store4(40,uint4(3,1,1,0xffffffff));args.Store(56,6);args.Store3(80,uint3(0,2,1));}",
+                                                    "RWTexture2D<float> output:register(u0);[numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID){output[id.xy]=.125;}"};
+                                                for(UINT i=0;i<2 && indirect_ready;++i) {
+                                                    Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                                    indirect_ready=SUCCEEDED(compile(compute[i],std::strlen(compute[i]),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,nullptr)) &&
+                                                        reinterpret_cast<CreateShader>(vt(device)[18])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&indirect_objects[2+i])==S_OK;
+                                                }
+                                                D3D11_UNORDERED_ACCESS_VIEW_DESC output{};output.Format=DXGI_FORMAT_R8_UNORM;output.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
+                                                if(indirect_ready)indirect_ready=reinterpret_cast<Uav>(vt(device)[8])(device,texture,&output,&indirect_objects[4])==S_OK;
+                                                check(indirect_ready,"reference indirect fixture creates GPU-written argument data and native draw/dispatch targets");
+                                                if(indirect_ready) {
+                                                    D3D11_UNORDERED_ACCESS_VIEW_DESC observed{};
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*)>(vt(indirect_objects[1])[9])(indirect_objects[1],&observed);
+                                                    check(std::memcmp(&observed,&raw,sizeof raw)==0,"raw UAV preserves the guest description");
+                                                    for(UINT invalid=0;invalid<4;++invalid) {
+                                                        auto bad=raw;
+                                                        if(invalid==0)bad.Buffer.Flags|=D3D11_BUFFER_UAV_FLAG_COUNTER;
+                                                        if(invalid==1)bad.Format=DXGI_FORMAT_R32_UINT;
+                                                        if(invalid==2)bad.Buffer.NumElements=33;
+                                                        if(invalid==3)bad.Buffer.FirstElement=UINT_MAX;
+                                                        void* rejected=reinterpret_cast<void*>(1);
+                                                        const auto result=reinterpret_cast<Uav>(vt(device)[8])(device,indirect_objects[0],&bad,&rejected);
+                                                        check(result==E_INVALIDARG && !rejected,"raw UAV rejects mixed counter flags, typed formats and out-of-buffer ranges");
+                                                    }
+                                                    const auto draw_indirect=reinterpret_cast<Indirect>(vt(context)[40]);const auto indexed_indirect=reinterpret_cast<Indirect>(vt(context)[39]);
+                                                    const auto dispatch_indirect=reinterpret_cast<Indirect>(vt(context)[42]);
+                                                    const auto set_compute=[&](UINT shader,UINT uav) {
+                                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(context)[69])(context,indirect_objects[shader]);
+                                                        reinterpret_cast<ComputeBind>(vt(context)[68])(context,0,1,&indirect_objects[uav]);
+                                                    };
+                                                    set_compute(3,4);
+                                                    static UINT refused=0;
+                                                    set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                                                    const auto reject=[&](UINT slot,void* buffer,UINT offset) {
+                                                        refused=0;reinterpret_cast<Indirect>(vt(context)[slot])(context,buffer,offset);
+                                                        check(refused==slot,"indirect command rejects null/unreadable/wrong-type arguments, bad alignment and logical range overflow");
+                                                    };
+                                                    reject(40,nullptr,16);reject(39,reinterpret_cast<void*>(1),40);reject(42,texture,80);
+                                                    reject(40,indirect_objects[0],2);reject(39,indirect_objects[0],112);reject(42,indirect_objects[0],120);
+                                                    reject(40,indirect_objects[0],UINT_MAX-3);
+                                                    set_d3d11x_trap_handler(nullptr);
+                                                    check(exact(multiple),"invalid indirect commands leave the rendered image unchanged");
+                                                    void* arguments=nullptr;std::memcpy(&arguments,static_cast<BYTE*>(indirect_objects[0])+48,sizeof arguments);
+                                                    using Placement=HRESULT(STDMETHODCALLTYPE*)(void*,const BufferDesc*,void*,void**);
+                                                    BufferDesc placed=args_desc;placed.standard.BindFlags=D3D11_BIND_SHADER_RESOURCE;placed.standard.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;void* borrowed=nullptr;
+                                                    const auto placed_hr=reinterpret_cast<Placement>(vt(device)[62])(device,&placed,arguments,&borrowed);
+                                                    check(placed_hr==S_OK && borrowed,"placement argument rejection uses a real borrowed view of valid argument bytes");
+                                                    if(borrowed) {
+                                                        refused=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                                                        draw_indirect(context,borrowed,16);set_d3d11x_trap_handler(nullptr);
+                                                        check(refused==40 && exact(multiple),"reference placement indirect arguments remain explicitly unsupported without CPU fallback");
+                                                        reinterpret_cast<Count>(vt(borrowed)[2])(borrowed);
+                                                    }
+                                                    for(UINT indexed=0;indexed<2;++indexed) {
+                                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                        (indexed ? indexed_indirect:draw_indirect)(context,indirect_objects[0],indexed ? 40:16);
+                                                        check(exact(multiple),"native indirect draw consumes all GPU argument fields at a nonzero byte offset");
+                                                    }
+                                                    dispatch_indirect(context,indirect_objects[0],80);
+                                                    check(exact(32),"native indirect dispatch consumes current GPU group dimensions and writes every pixel");
+                                                    void* indirect_producer=nullptr;void* argument_list=nullptr;void* dispatch_list=nullptr;
+                                                    if(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&indirect_producer)==S_OK && indirect_producer) {
+                                                        bind(indirect_producer);reinterpret_cast<Indirect>(vt(indirect_producer)[39])(indirect_producer,indirect_objects[0],40);
+                                                        using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                                        check(reinterpret_cast<Finish>(vt(indirect_producer)[114])(indirect_producer,FALSE,&argument_list)==S_OK && argument_list && exact(32),
+                                                            "indirect recording retains the buffer without executing or capturing its current argument values");
+                                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(indirect_producer)[69])(indirect_producer,indirect_objects[3]);
+                                                        reinterpret_cast<ComputeBind>(vt(indirect_producer)[68])(indirect_producer,0,1,&indirect_objects[4]);
+                                                        reinterpret_cast<Indirect>(vt(indirect_producer)[42])(indirect_producer,indirect_objects[0],80);
+                                                        check(reinterpret_cast<Finish>(vt(indirect_producer)[114])(indirect_producer,FALSE,&dispatch_list)==S_OK && dispatch_list && exact(32),
+                                                            "indirect dispatch recording retains bindings without executing its nonzero groups");
+                                                        reinterpret_cast<Count>(vt(indirect_producer)[2])(indirect_producer);
+                                                    }else check(false,"indirect recording creates a deferred context");
+                                                    set_compute(2,1);reinterpret_cast<Dispatch>(vt(context)[41])(context,1,1,1);
+                                                    const auto* actual=static_cast<const UINT*>(arguments);
+                                                    check(actual[0]==0x6d6d6d6d && actual[3]==actual[0] && actual[8]==actual[0] && actual[9]==actual[0] && actual[15]==actual[0] && actual[31]==0,
+                                                        "GPU argument updates preserve prefix, gaps and final buffer guards");
+                                                    for(UINT indexed=0;indexed<2;++indexed) {
+                                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                        (indexed ? indexed_indirect:draw_indirect)(context,indirect_objects[0],indexed ? 40:16);
+                                                        check(exact(single),"indirect draws observe arguments changed by the real compute shader");
+                                                    }
+                                                    set_compute(3,4);dispatch_indirect(context,indirect_objects[0],80);
+                                                    check(exact(single),"indirect dispatch observes GPU-written zero groups without modifying pixels");
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                                    for(auto*& object:indirect_objects)if(object){reinterpret_cast<Count>(vt(object)[2])(object);object=nullptr;}
+                                                    if(argument_list) {
+                                                        for(UINT pass=0;pass<2;++pass) {
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,argument_list,TRUE);
+                                                            check(exact(single),"indirect list retains arguments and bindings after all callers release them and reads the later GPU values on reuse");
+                                                        }
+                                                        reinterpret_cast<Count>(vt(argument_list)[2])(argument_list);
+                                                    }
+                                                    if(dispatch_list) {
+                                                        for(UINT pass=0;pass<2;++pass) {
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,dispatch_list,TRUE);
+                                                            check(exact(0),"retained indirect dispatch reads later GPU-written zero groups after producer and resource release");
+                                                        }
+                                                        reinterpret_cast<Count>(vt(dispatch_list)[2])(dispatch_list);
+                                                    }
+                                                    bind(context);
+                                                }
+                                                for(auto* object:indirect_objects)if(object)reinterpret_cast<Count>(vt(object)[2])(object);
+                                            }
+                                            {
+                                                BufferDesc desc{{128,D3D11_USAGE_DYNAMIC,0,D3D11_CPU_ACCESS_WRITE,0,0},0};void* arguments=nullptr;void* producer=nullptr;void* lists[2]{};
+                                                const auto created=reinterpret_cast<BufferFactory>(vt(device)[3])(device,&desc,nullptr,&arguments);
+                                                check(created==S_OK && arguments,"indirect arguments accept owned dynamic buffers without an artificial misc-flag requirement");
+                                                if(created!=S_OK || !arguments)return 1;
+                                                if(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&producer)!=S_OK || !producer)return 1;
+                                                for(UINT version=0;version<2;++version) {
+                                                    bind(producer);D3D11_MAPPED_SUBRESOURCE mapped{};
+                                                    using Map=HRESULT(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,D3D11_MAPPED_SUBRESOURCE*);
+                                                    const auto mapped_hr=reinterpret_cast<Map>(vt(producer)[15])(producer,arguments,0,D3D11_MAP_WRITE_DISCARD,0,&mapped);
+                                                    check(mapped_hr==S_OK && mapped.pData,"deferred indirect argument rename maps its private version");if(mapped_hr!=S_OK || !mapped.pData)return 1;
+                                                    std::memset(mapped.pData,0,128);const UINT data[]{3,version ? 1u:2u,1,UINT(-1),version ? 6u:3u};std::memcpy(static_cast<BYTE*>(mapped.pData)+40,data,sizeof data);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(producer)[16])(producer,arguments);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT)>(vt(producer)[39])(producer,arguments,40);
+                                                    using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                                    check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&lists[version])==S_OK && lists[version],"indirect list captures the renamed argument allocation");
+                                                }
+                                                reinterpret_cast<Count>(vt(producer)[2])(producer);reinterpret_cast<Count>(vt(arguments)[2])(arguments);
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                                for(UINT version:{0u,1u,0u})if(lists[version]) {
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,lists[version],TRUE);
+                                                    check(exact(version ? single:multiple),"indirect replay keeps each WRITE_DISCARD argument version distinct after producer and original buffer release");
+                                                }
+                                                for(auto* list:lists)if(list)reinterpret_cast<Count>(vt(list)[2])(list);bind(context);
+                                            }
+                                            {
+                                                void* counter_objects[4]{}; // Structured buffer, counter UAV, destination, compute shader.
+                                                BufferDesc structured{{64,D3D11_USAGE_DEFAULT,D3D11_BIND_UNORDERED_ACCESS,0,D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,4},0};
+                                                bool counter_ready=reinterpret_cast<BufferFactory>(vt(device)[3])(device,&structured,nullptr,&counter_objects[0])==S_OK;
+                                                D3D11_UNORDERED_ACCESS_VIEW_DESC counter_desc{};counter_desc.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;
+                                                counter_desc.Buffer.NumElements=16;counter_desc.Buffer.Flags=D3D11_BUFFER_UAV_FLAG_COUNTER;
+                                                using Uav=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**);
+                                                if(counter_ready)counter_ready=reinterpret_cast<Uav>(vt(device)[8])(device,counter_objects[0],&counter_desc,&counter_objects[1])==S_OK;
+                                                std::array<BYTE,16> guards;guards.fill(0xa5);
+                                                BufferDesc target_desc{{16,D3D11_USAGE_DEFAULT,0,0,0,0},0};const D3D11_SUBRESOURCE_DATA initial{guards.data(),0,0};
+                                                if(counter_ready)counter_ready=reinterpret_cast<BufferFactory>(vt(device)[3])(device,&target_desc,&initial,&counter_objects[2])==S_OK;
+                                                const char* writer="RWStructuredBuffer<uint> output:register(u0);[numthreads(1,1,1)]void main(){uint i=output.IncrementCounter();output[i]=i+7;}";
+                                                Microsoft::WRL::ComPtr<ID3DBlob> code;
+                                                if(counter_ready)counter_ready=SUCCEEDED(compile(writer,std::strlen(writer),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,nullptr)) &&
+                                                    reinterpret_cast<CreateShader>(vt(device)[18])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&counter_objects[3])==S_OK;
+                                                check(counter_ready,"structure count fixture creates a real GPU counter, destination and shader");
+                                                if(counter_ready) {
+                                                    using CopyCount=void(STDMETHODCALLTYPE*)(void*,void*,UINT,void*);
+                                                    const auto copy_count=reinterpret_cast<CopyCount>(vt(context)[49]);
+                                                    BYTE* target=nullptr;std::memcpy(&target,static_cast<BYTE*>(counter_objects[2])+48,sizeof target);
+                                                    const auto matches=[&](UINT offset,UINT value) {
+                                                        auto expected=guards;std::memcpy(expected.data()+offset,&value,4);
+                                                        return std::memcmp(target,expected.data(),expected.size())==0;
+                                                    };
+                                                    copy_count(context,counter_objects[2],0,counter_objects[1]);
+                                                    check(matches(0,0),"new reference UAV counter starts at zero without synthetic shader initialization");
+                                                    std::memcpy(target,guards.data(),guards.size());
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(context)[69])(context,counter_objects[3]);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*)>(vt(context)[68])(context,0,1,&counter_objects[1]);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT)>(vt(context)[41])(context,3,1,1);
+                                                    copy_count(context,counter_objects[2],5,counter_objects[1]);
+                                                    check(matches(5,3),"structure count copies four GPU-written bytes at an unaligned offset and preserves every surrounding byte");
+                                                    {
+                                                        std::array<BYTE,24> fill;fill.fill(0x3c);auto copied_desc=target_desc;copied_desc.standard.ByteWidth=24;
+                                                        const D3D11_SUBRESOURCE_DATA copied_initial{fill.data(),0,0};void* copied=nullptr;
+                                                        check(reinterpret_cast<BufferFactory>(vt(device)[3])(device,&copied_desc,&copied_initial,&copied)==S_OK && copied,
+                                                            "resource copy creates a larger buffer with guarded tail bytes");
+                                                        if(copied) {
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,void*)>(vt(context)[47])(context,copied,counter_objects[2]);
+                                                            BYTE* bytes=nullptr;std::memcpy(&bytes,static_cast<BYTE*>(copied)+48,sizeof bytes);
+                                                            std::memcpy(fill.data(),guards.data(),16);const UINT count=3;std::memcpy(fill.data()+5,&count,4);
+                                                            check(!std::memcmp(bytes,fill.data(),fill.size()),"CopyResource consumes GPU-written buffer data and copies the smaller logical size without touching the destination tail");
+                                                            reinterpret_cast<Count>(vt(copied)[2])(copied);
+                                                        }
+                                                    }
+                                                    copy_count(context,counter_objects[2],13,counter_objects[1]);copy_count(context,counter_objects[2],UINT_MAX,counter_objects[1]);
+                                                    check(matches(5,3),"reference out-of-range structure count copies leave the buffer unchanged");
+                                                    static UINT refused_count=0;
+                                                    set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused_count=slot;return 0;});
+                                                    for(UINT invalid=0;invalid<3;++invalid) {
+                                                        refused_count=0;copy_count(context,invalid==2 ? counter_objects[1]:counter_objects[2],0,
+                                                            invalid==0 ? nullptr:invalid==1 ? counter_objects[0]:counter_objects[1]);
+                                                        check(refused_count==49 && matches(5,3),"structure count rejects invalid destination and source objects without modifying pixels or bytes");
+                                                    }
+                                                    set_d3d11x_trap_handler(nullptr);
+                                                    void* no_counter=nullptr;auto plain_desc=counter_desc;plain_desc.Buffer.Flags=0;
+                                                    check(reinterpret_cast<Uav>(vt(device)[8])(device,counter_objects[0],&plain_desc,&no_counter)==S_OK && no_counter,
+                                                        "counterless negative control creates a valid structured UAV");
+                                                    if(no_counter) {
+                                                        refused_count=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused_count=slot;return 0;});
+                                                        copy_count(context,counter_objects[2],0,no_counter);set_d3d11x_trap_handler(nullptr);
+                                                        check(refused_count==49 && matches(5,3),"structure count rejects a valid UAV without a counter");
+                                                        reinterpret_cast<Count>(vt(no_counter)[2])(no_counter);
+                                                    }
+                                                    auto placed_desc=target_desc;placed_desc.standard.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                                                    using Placement=HRESULT(STDMETHODCALLTYPE*)(void*,const BufferDesc*,void*,void**);void* borrowed=nullptr;
+                                                    check(reinterpret_cast<Placement>(vt(device)[62])(device,&placed_desc,target,&borrowed)==S_OK && borrowed,
+                                                        "structure count placement rejection uses a valid borrowed buffer");
+                                                    if(borrowed) {
+                                                        refused_count=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused_count=slot;return 0;});
+                                                        copy_count(context,borrowed,0,counter_objects[1]);set_d3d11x_trap_handler(nullptr);
+                                                        check(refused_count==49 && matches(5,3),"reference structure count rejects placement destinations without a CPU fallback");
+                                                        reinterpret_cast<Count>(vt(borrowed)[2])(borrowed);
+                                                    }
+                                                    void* producer=nullptr;void* list=nullptr;
+                                                    if(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                                                        reinterpret_cast<CopyCount>(vt(producer)[49])(producer,counter_objects[2],9,counter_objects[1]);
+                                                        using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                                        check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list && matches(5,3),
+                                                            "structure count recording retains objects without capturing the current counter value or executing");
+                                                        reinterpret_cast<Count>(vt(producer)[2])(producer);
+                                                    }else check(false,"structure count creates a deferred producer");
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT)>(vt(context)[41])(context,2,1,1);
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                                    for(auto*& object:counter_objects)if(object){reinterpret_cast<Count>(vt(object)[2])(object);object=nullptr;}
+                                                    if(list) {
+                                                        for(UINT pass=0;pass<2;++pass) {
+                                                            std::memcpy(target,guards.data(),guards.size());
+                                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);
+                                                            check(matches(9,5),"structure count replay observes the later GPU value after caller release and CPU invalidation");
+                                                        }
+                                                        reinterpret_cast<Count>(vt(list)[2])(list);
+                                                    }
+                                                    bind(context);
+                                                }
+                                                for(auto* object:counter_objects)if(object)reinterpret_cast<Count>(vt(object)[2])(object);
+                                            }
+                                            for(const bool partial:{false,true}) {
+                                                void* copied[2]{};void* producer=nullptr;void* list=nullptr;
+                                                std::array<BYTE,16> source{},guard;guard.fill(0xee);for(UINT i=0;i<16;++i)source[i]=BYTE(i*13+3);
+                                                BufferDesc desc{{16,D3D11_USAGE_DEFAULT,0,0,0,0},0};
+                                                for(UINT i=0;i<2;++i) {
+                                                    const D3D11_SUBRESOURCE_DATA data{i ? guard.data():source.data(),0,0};
+                                                    check(reinterpret_cast<BufferFactory>(vt(device)[3])(device,&desc,&data,&copied[i])==S_OK && copied[i],"deferred CopyResource creates independent source and destination buffers");
+                                                }
+                                                if(!copied[0] || !copied[1])return 1;
+                                                BYTE* input=nullptr;BYTE* output=nullptr;std::memcpy(&input,static_cast<BYTE*>(copied[0])+48,sizeof input);std::memcpy(&output,static_cast<BYTE*>(copied[1])+48,sizeof output);
+                                                using Copy=void(STDMETHODCALLTYPE*)(void*,void*,void*);
+                                                reinterpret_cast<Copy>(vt(context)[47])(context,copied[0],copied[0]);
+                                                check(!std::memcmp(input,source.data(),16),"CopyResource into the same buffer is an unchanged identity copy");
+                                                static UINT refused_copy=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused_copy=slot;return 0;});
+                                                for(UINT invalid=0;invalid<3;++invalid) {
+                                                    refused_copy=0;reinterpret_cast<Copy>(vt(context)[47])(context,copied[1],invalid==0 ? nullptr:invalid==1 ? reinterpret_cast<void*>(1):texture);
+                                                    check(refused_copy==47 && !std::memcmp(output,guard.data(),16),"CopyResource rejects unreadable sources and buffer/texture mismatches without changing the destination");
+                                                }
+                                                set_d3d11x_trap_handler(nullptr);
+                                                using Region=void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*);
+                                                if(!partial) {
+                                                    auto placement=desc;placement.standard.ByteWidth=8;placement.standard.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+                                                    using Place=HRESULT(STDMETHODCALLTYPE*)(void*,const BufferDesc*,void*,void**);void* alias=nullptr;
+                                                    check(reinterpret_cast<Place>(vt(device)[62])(device,&placement,output+4,&alias)==S_OK && alias,"DDR alias copy creates a borrowed source over the owned destination");
+                                                    if(alias) {
+                                                        for(UINT mode=0;mode<2;++mode) {
+                                                            for(UINT i=0;i<16;++i)output[i]=BYTE(i*11+mode+1);std::array<BYTE,16> expected;std::memcpy(expected.data(),output,16);
+                                                            if(mode) {
+                                                                const D3D11_BOX box{1,0,0,7,1,1};std::memmove(expected.data()+8,expected.data()+5,6);
+                                                                reinterpret_cast<Region>(vt(context)[46])(context,copied[1],0,8,0,0,alias,0,&box);
+                                                            }else {std::memmove(expected.data(),expected.data()+4,8);reinterpret_cast<Copy>(vt(context)[47])(context,copied[1],alias);}
+                                                            check(!std::memcmp(output,expected.data(),16),"DDR copies snapshot an overlapping borrowed source on GPU before the owned destination is changed");
+                                                        }
+                                                        reinterpret_cast<Count>(vt(alias)[2])(alias);
+                                                        std::memcpy(output,guard.data(),16);
+                                                    }
+                                                    placement.standard.ByteWidth=16;alias=nullptr;
+                                                    check(reinterpret_cast<Place>(vt(device)[62])(device,&placement,output,&alias)==S_OK && alias,"same-window buffer alias retains a separate resource handle");
+                                                    if(alias) {
+                                                        reinterpret_cast<Copy>(vt(context)[47])(context,copied[1],alias);
+                                                        check(!std::memcmp(output,guard.data(),16),"copy between two handles of the same native buffer preserves the full owned contents");
+                                                        reinterpret_cast<Count>(vt(alias)[2])(alias);
+                                                    }
+                                                }
+                                                if(partial) {
+                                                    const auto copy=reinterpret_cast<Region>(vt(context)[46]);
+                                                    for(const UINT destination:{4u,0u,9u}) {
+                                                        std::memcpy(input,source.data(),16);auto expected=source;
+                                                        const UINT left=destination==0 ? 4:0,count=destination==9 ? 6:10;
+                                                        D3D11_BOX box{left,UINT_MAX,UINT_MAX,left+count,0,0};
+                                                        std::memmove(expected.data()+destination,expected.data()+left,count);
+                                                        copy(context,copied[0],UINT_MAX,destination,UINT_MAX,UINT_MAX,copied[0],UINT_MAX,&box);
+                                                        check(!std::memcmp(input,expected.data(),16),"reference buffer region copy uses GPU scratch for both overlapping directions and ignores texture-only coordinates");
+                                                    }
+                                                    std::memcpy(input,source.data(),16);
+                                                    static UINT refused_region=0;set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused_region=slot;return 0;});
+                                                    for(UINT invalid=0;invalid<4;++invalid) {
+                                                        D3D11_BOX box{3,0,0,11,1,1};UINT x=0;
+                                                        if(invalid==0)box.right=17;if(invalid==1)box.right=box.left;if(invalid==2)x=UINT_MAX;if(invalid==3){box.left=12;box.right=4;}
+                                                        refused_region=0;copy(context,copied[1],0,x,0,0,copied[0],0,&box);
+                                                        check(!refused_region && !std::memcmp(output,guard.data(),16),"empty, reversed, overflowing and out-of-buffer regions are reference no-ops");
+                                                    }
+                                                    refused_region=0;copy(context,copied[1],0,0,0,0,copied[0],0,reinterpret_cast<const D3D11_BOX*>(1));
+                                                    check(refused_region==46 && !std::memcmp(output,guard.data(),16),"region copy rejects an unreadable source-box pointer before changing destination bytes");
+                                                    refused_region=0;copy(context,copied[1],0,1,0,0,copied[0],0,nullptr);
+                                                    check(!refused_region && !std::memcmp(output,guard.data(),16),"null-box buffer region copies the entire source or leaves the destination unchanged when it cannot fit");
+                                                    set_d3d11x_trap_handler(nullptr);
+                                                }
+                                                if(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                                                    D3D11_BOX box{3,0,0,11,1,1};
+                                                    if(partial)reinterpret_cast<Region>(vt(producer)[46])(producer,copied[1],0,2,0,0,copied[0],0,&box);
+                                                    else reinterpret_cast<Copy>(vt(producer)[47])(producer,copied[1],copied[0]);
+                                                    box={};
+                                                    using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                                    check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list && !std::memcmp(output,guard.data(),16),"CopyResource recording preserves destination bytes and retains both resources");
+                                                    reinterpret_cast<Count>(vt(producer)[2])(producer);
+                                                }else check(false,"CopyResource creates a deferred producer");
+                                                for(auto* object:copied)reinterpret_cast<Count>(vt(object)[2])(object);
+                                                if(list) {
+                                                    for(UINT pass=0;pass<2;++pass) {
+                                                        for(UINT i=0;i<16;++i)input[i]=BYTE(source[i]+pass+1);
+                                                        std::memcpy(output,guard.data(),16);
+                                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);
+                                                        auto expected=guard;
+                                                        if(partial)for(UINT i=0;i<8;++i)expected[i+2]=BYTE(source[i+3]+pass+1);
+                                                        else for(UINT i=0;i<16;++i)expected[i]=BYTE(source[i]+pass+1);
+                                                        check(!std::memcmp(output,expected.data(),16),"full/partial copy replay retains the box and resources, reads later source bytes and preserves uncopied destination bytes");
+                                                    }
+                                                    reinterpret_cast<Count>(vt(list)[2])(list);
+                                                }
+                                                bind(context);
+                                            }
+                                            reinterpret_cast<Instanced>(vt(context)[22])(context,3,(UINT64(6)<<32)|5,1);
+                                            check(exact(single),"one instance uses its nonzero first-instance input location");
+                                            reinterpret_cast<Instanced>(vt(context)[22])(context,3,(UINT64(3)<<32)|5,0);
+                                            check(exact(single),"zero instances preserve every destination pixel");
+                                            void* producer=nullptr;void* list=nullptr;
+                                            if(reinterpret_cast<Deferred>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                                                bind(producer);
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(producer)[50])(producer,view,black);
+                                                reinterpret_cast<IndexedInstanced>(vt(producer)[21])(producer,(UINT64(3)<<32)|1,(UINT64(3)<<32)|UINT(-1),2);
+                                                using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                                const bool unchanged=exact(single);const auto finished=reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list);
+                                                check(unchanged && finished==S_OK && list,
+                                                    "deferred instanced draw records without publishing and retains all packed draw fields");
+                                                reinterpret_cast<Count>(vt(producer)[2])(producer);
+                                            }else check(false,"instanced recording creates a deferred producer");
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                            for(auto*& object:objects)if(object){reinterpret_cast<Count>(vt(object)[2])(object);object=nullptr;}
+                                            if(list) {
+                                                for(UINT pass=0;pass<2;++pass) {
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);
+                                                    check(exact(multiple),"deferred instanced draw survives object release and replays exact pixels across pipeline reuse and shader replacement");
+                                                }
+                                                reinterpret_cast<Count>(vt(list)[2])(list);
+                                            }
+                                        }
+                                        for(auto* object:objects)if(object)reinterpret_cast<Count>(vt(object)[2])(object);
+                                        bind_targets(context,1,targets,nullptr);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(context)[44])(context,1,&viewport);
+                                        std::memcpy(static_cast<char*>(context)+0x170,&topology,sizeof topology);static_cast<BYTE*>(context)[0x390]=1;
+                                        std::memcpy(static_cast<char*>(context)+0x180,&shaders[0],sizeof(void*));std::memcpy(static_cast<char*>(context)+0x188,&shaders[2],sizeof(void*));
+                                        std::memcpy(static_cast<char*>(context)+0x178,&empty_layout,sizeof empty_layout);
+                                    }
                                     {
                                         const char* source="cbuffer C:register(b2){float4 shift;} struct V{float4 p:SV_Position;}; [maxvertexcount(3)] void main(triangle V input[3],inout TriangleStream<V> output){for(uint i=0;i<3;i++){V v=input[i];v.p+=shift;output.Append(v);}}";
                                         Microsoft::WRL::ComPtr<ID3DBlob> code;
@@ -1658,7 +2972,7 @@ int main(int argc, char** argv) {
                                         const auto clear=reinterpret_cast<Clear>(vt(deferred_draw)[50]);
                                         bind_targets(deferred_draw,1,targets,nullptr);
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(deferred_draw)[44])(deferred_draw,1,&viewport);
-                                        auto* data=static_cast<char*>(deferred_draw);
+                                        auto* data=static_cast<char*>(deferred_draw);data[0x390]=1;
                                         std::memcpy(data+0x170,&topology,sizeof topology);
                                         std::memcpy(data+0x178,&empty_layout,sizeof empty_layout);
                                         std::memcpy(data+0x180,&shaders[0],sizeof(void*));
@@ -1672,7 +2986,7 @@ int main(int argc, char** argv) {
                                         std::memcpy(data+0x188,&shaders[2],sizeof(void*));
                                         draw(deferred_draw,3,0);
                                         const UINT16 indices[]{99,0,1,2};
-                                        struct IndexDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} index_desc{{sizeof indices,D3D11_USAGE_DEFAULT,D3D11_BIND_INDEX_BUFFER,0,0,0},0};
+                                        struct IndexDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} index_desc{{sizeof indices,D3D11_USAGE_IMMUTABLE,D3D11_BIND_INDEX_BUFFER,0,0,2},0};
                                         const D3D11_SUBRESOURCE_DATA index_data{indices,0,0};
                                         using CreateIndex=HRESULT(STDMETHODCALLTYPE*)(void*,const IndexDesc*,const D3D11_SUBRESOURCE_DATA*,void**);
                                         void* recorded_indices=nullptr;
@@ -1741,7 +3055,7 @@ int main(int argc, char** argv) {
                                         for(UINT pass=0;pass<2;++pass) {
                                             bind_targets(mapper,1,targets,nullptr);
                                             reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(mapper)[44])(mapper,1,&viewport);
-                                            auto* data=static_cast<char*>(mapper);
+                                            auto* data=static_cast<char*>(mapper);data[0x390]=1;
                                             std::memcpy(data+0x170,&topology,sizeof topology);std::memcpy(data+0x178,&vertex_layout,sizeof vertex_layout);
                                             std::memcpy(data+0x180,&shaders[3],sizeof(void*));std::memcpy(data+0x188,&shaders[2],sizeof(void*));
                                             bind_vertices(mapper,0,1,&dynamic,&stride,&offset);
@@ -1784,10 +3098,10 @@ int main(int argc, char** argv) {
                                             "separate WRITE_DISCARD versions replay exact pixels after producer/resource release and remain reusable");
                                     }
                                     for(auto* version:versions) if(version) reinterpret_cast<Count>(vt(version)[2])(version);
-                                    const char* compute_source="Texture2D<float> src:register(t0); RWTexture2D<float> dst:register(u0); SamplerState point_sampler:register(s0); cbuffer C:register(b0){float amount;}; [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID){dst[id.xy]=src.SampleLevel(point_sampler,(float2(id.xy)+.5)/float2(32,16),0)+amount;}";
+                                    const char* compute_source="Texture2D<float> src:register(t0); Buffer<float4> halfs:register(t1); Buffer<uint> words:register(t2); Texture2D<float4> alpha:register(t3); RWTexture2D<float> dst:register(u0); SamplerState point_sampler:register(s0); cbuffer C:register(b0){float amount;}; [numthreads(8,8,1)] void main(uint3 id:SV_DispatchThreadID){float4 mask=alpha.Load(int3(127,0,0));bool valid=src.SampleLevel(point_sampler,float2(-1,-1),0)==1 && all(mask.rgb==0) && mask.a>.599 && mask.a<.601 && all(halfs.Load(1)==float4(1,.5,-2,4)) && all(halfs.Load(2)==0) && words.Load(2)==400 && words.Load(3)==65530 && words.Load(4)==0;dst[id.xy]=valid ? src.SampleLevel(point_sampler,(float2(id.xy)+.5)/float2(32,16),0)+amount:0;}";
                                     Microsoft::WRL::ComPtr<ID3DBlob> compute_code;
                                     bool compute_ready=SUCCEEDED(compile(compute_source,std::strlen(compute_source),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&compute_code,nullptr));
-                                    void* compute_objects[6]{}; // CS, source, SRV, UAV, sampler, dynamic CBV.
+                                    void* compute_objects[12]{}; // CS, texture/SRV/UAV, sampler, CBV, typed buffers/views, alpha texture/view.
                                     if(compute_ready) compute_ready=reinterpret_cast<CreateShader>(vt(device)[18])(device,compute_code->GetBufferPointer(),compute_code->GetBufferSize(),nullptr,&compute_objects[0])==S_OK;
                                     std::array<BYTE,512> source_pixels;source_pixels.fill(51);
                                     auto input_desc=color;input_desc.standard.BindFlags=D3D11_BIND_SHADER_RESOURCE;
@@ -1798,25 +3112,73 @@ int main(int argc, char** argv) {
                                     D3D11_UNORDERED_ACCESS_VIEW_DESC output_desc{};output_desc.Format=DXGI_FORMAT_R8_UNORM;output_desc.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
                                     if(compute_ready) compute_ready=reinterpret_cast<MakeComputeUav>(vt(device)[8])(device,texture,&output_desc,&compute_objects[3])==S_OK;
                                     using MakeComputeSampler=HRESULT(STDMETHODCALLTYPE*)(void*,const D3D11_SAMPLER_DESC*,void**);
-                                    D3D11_SAMPLER_DESC point{};point.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;point.AddressU=point.AddressV=point.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
+                                    D3D11_SAMPLER_DESC point{};point.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;point.AddressU=point.AddressV=point.AddressW=D3D11_TEXTURE_ADDRESS_BORDER;
                                     point.MaxAnisotropy=1;point.ComparisonFunc=D3D11_COMPARISON_NEVER;point.MaxLOD=D3D11_FLOAT32_MAX;
                                     if(compute_ready) compute_ready=reinterpret_cast<MakeComputeSampler>(vt(device)[23])(device,&point,&compute_objects[4])==S_OK;
+                                    if(compute_ready) {
+                                        std::array<UINT32,4> descriptor{};
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT32*)>(vt(compute_objects[4])[9])(compute_objects[4],descriptor.data());
+                                        reinterpret_cast<Count>(vt(compute_objects[4])[2])(compute_objects[4]);compute_objects[4]=nullptr;
+                                        descriptor[3]=(descriptor[3]&0x3fffffffu)|0x80000000u;
+                                        compute_ready=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const UINT32*,void**)>(vt(device)[67])(device,descriptor.data(),&compute_objects[4])==S_OK;
+                                    }
                                     DynamicDesc constant_desc{{16,D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0},0};
                                     const FLOAT amounts[4]{.05f,0,0,0};const D3D11_SUBRESOURCE_DATA constant_data{amounts,0,0};
                                     if(compute_ready) compute_ready=reinterpret_cast<CreateDynamic>(vt(device)[3])(device,&constant_desc,&constant_data,&compute_objects[5])==S_OK;
-                                    check(compute_ready,"compute fixture creates original-format shader, texture views, sampler and constants");
+                                    const std::array<UINT16,16> half_records{0,0,0,0,0,0,0,0,0x3c00,0x3800,0xc000,0x4400,0,0,0,0};
+                                    const std::array<UINT16,8> word_records{17,23,101,400,65530,7,9,11};
+                                    for(UINT typed=0;compute_ready && typed<2;++typed) {
+                                        const auto bytes=typed ? sizeof word_records:sizeof half_records;
+                                        DynamicDesc typed_desc{{UINT(bytes),D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,typed ? 0u:UINT(D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS),0},0};
+                                        D3D11_SUBRESOURCE_DATA typed_data{typed ? static_cast<const void*>(word_records.data()):static_cast<const void*>(half_records.data()),0,0};
+                                        const UINT buffer_slot=typed ? 8:6,view_slot=buffer_slot+1;
+                                        compute_ready=reinterpret_cast<CreateDynamic>(vt(device)[3])(device,&typed_desc,&typed_data,&compute_objects[buffer_slot])==S_OK;
+                                        D3D11_SHADER_RESOURCE_VIEW_DESC typed_view{};typed_view.Format=typed ? DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R16G16B16A16_FLOAT;
+                                        typed_view.ViewDimension=D3D11_SRV_DIMENSION_BUFFER;typed_view.Buffer={1,typed ? 4u:2u};
+                                        if(compute_ready)compute_ready=reinterpret_cast<MakeSrv>(vt(device)[7])(device,compute_objects[buffer_slot],&typed_view,&compute_objects[view_slot])==S_OK;
+                                        if(compute_ready) {
+                                            std::array<UINT,4> descriptor{};std::memcpy(descriptor.data(),static_cast<char*>(compute_objects[view_slot])+48,sizeof descriptor);
+                                            check((descriptor[1]&0x3fff0000)==((typed ? 2u:8u)<<16) && descriptor[2]==(typed ? 4u:2u) &&
+                                                descriptor[3]==(typed ? 0x14204u:0x67facu),"typed buffer SRD matches original UMD 180099860 stride, range, numeric format and swizzle");
+                                            D3D11_SHADER_RESOURCE_VIEW_DESC actual{};
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(compute_objects[view_slot])[9])(compute_objects[view_slot],&actual);
+                                            check(!std::memcmp(&actual,&typed_view,sizeof actual),"typed buffer GetDesc preserves its original sliced descriptor");
+                                            auto invalid=typed_view;invalid.Buffer.NumElements=UINT(bytes);
+                                            void* rejected=reinterpret_cast<void*>(1);
+                                            check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,compute_objects[buffer_slot],&invalid,&rejected)==E_INVALIDARG && !rejected,
+                                                  "typed buffer slice cannot address elements beyond its logical bytes");
+                                            reinterpret_cast<Count>(vt(compute_objects[buffer_slot])[2])(compute_objects[buffer_slot]);compute_objects[buffer_slot]=nullptr;
+                                        }
+                                    }
+                                    check(compute_ready,"compute fixture creates typed half and uint16 SRVs, including a raw-capable typed buffer");
+                                    auto alpha_desc=input_desc;alpha_desc.standard.Width=256;alpha_desc.standard.Height=1;
+                                    alpha_desc.standard.Format=DXGI_FORMAT_A8_UNORM;alpha_desc.standard.Usage=D3D11_USAGE_IMMUTABLE;
+                                    std::array<BYTE,256> alpha_bytes;alpha_bytes.fill(153);
+                                    const D3D11_SUBRESOURCE_DATA alpha_data{alpha_bytes.data(),256,256};
+                                    void* missing_alpha=reinterpret_cast<void*>(1);
+                                    check(reinterpret_cast<CreateOwned>(vt(device)[5])(device,&alpha_desc,nullptr,&missing_alpha)==E_INVALIDARG && !missing_alpha,
+                                          "immutable texture requires complete initial data and clears its failed output");
+                                    if(compute_ready)compute_ready=reinterpret_cast<CreateOwned>(vt(device)[5])(device,&alpha_desc,&alpha_data,&compute_objects[10])==S_OK;
+                                    if(compute_ready)compute_ready=reinterpret_cast<MakeSrv>(vt(device)[7])(device,compute_objects[10],nullptr,&compute_objects[11])==S_OK;
+                                    check(compute_ready,"immutable A8 texture and default SRV preserve original alpha-only sampling");
                                     if(compute_ready) {
                                         using BindCompute=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
                                         using Dispatch=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT);
                                         const auto bind_compute=[&](void* ctx) {
+                                            std::array<BYTE,9> cached_compute{};
+                                            std::memcpy(cached_compute.data(),static_cast<char*>(ctx)+0x1f0,cached_compute.size());
                                             reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(ctx)[69])(ctx,compute_objects[0]);
-                                            reinterpret_cast<BindCompute>(vt(ctx)[67])(ctx,0,1,&compute_objects[2]);
+                                            if(static_cast<BYTE*>(ctx)[0x390]&2)check(!std::memcmp(cached_compute.data(),static_cast<char*>(ctx)+0x1f0,cached_compute.size()),
+                                                "reference out-of-line compute binding preserves caller cache and flags while retaining the shader");
+                                            void* resources[]{compute_objects[2],compute_objects[7],compute_objects[9],compute_objects[11]};
+                                            reinterpret_cast<BindCompute>(vt(ctx)[67])(ctx,0,4,resources);
                                             reinterpret_cast<BindCompute>(vt(ctx)[68])(ctx,0,1,&compute_objects[3]);
                                             reinterpret_cast<BindCompute>(vt(ctx)[70])(ctx,0,1,&compute_objects[4]);
                                             reinterpret_cast<BindCompute>(vt(ctx)[71])(ctx,0,1,&compute_objects[5]);
                                         };
                                         Desc sample_desc{};sample_desc.standard={32,16,1,1,DXGI_FORMAT_R11G11B10_FLOAT,{4,0},D3D11_USAGE_DEFAULT,D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE,0,0};
                                         void* sample_texture=nullptr;void* sample_view=nullptr;
+                                        void* cached_texture=nullptr;void* cached_view=nullptr;
                                         check(reinterpret_cast<CreateOwned>(vt(device)[5])(device,&sample_desc,nullptr,&sample_texture)==S_OK && sample_texture,
                                               "vertex sampling creates a real four-sample original-format texture");
                                         if(sample_texture) {
@@ -1832,60 +3194,205 @@ int main(int argc, char** argv) {
                                             check(create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R11G11B10_FLOAT,UINT_MAX,sample_layout,sample_desc.standard.BindFlags,4)==S_OK &&
                                                 sample_layout.copy(sample_layout.context.get(),true,samples.data(),sample_bytes,0,32*4*4,32*16*4*4,nullptr)==S_OK,
                                                 "MSAA fixture records four distinct canonical samples per pixel through original XG");
+                                            void* cached_bytes=nullptr;std::memcpy(&cached_bytes,static_cast<char*>(compute_objects[2])+80,sizeof cached_bytes);
+                                            TitleTextureLayout cached_layout;
+                                            check(create_xg_texture_layout(32,16,1,1,input_desc.standard.Format,UINT_MAX,cached_layout,input_desc.standard.BindFlags)==S_OK &&
+                                                place_texture(device,&input_desc,cached_layout.tile_mode,0,cached_bytes,&cached_texture)==S_OK && cached_texture &&
+                                                reinterpret_cast<MakeSrv>(vt(device)[7])(device,cached_texture,&srv,&cached_view)==S_OK && cached_view,
+                                                "a second logical texture binds the same native storage through its own SRV");
                                         }
-                                        const char* vertex_source="Texture2DMS<float3> a:register(t4); Texture2D<float> b:register(t7); Texture2D<float4> n:register(t9); Texture2D<uint4> u:register(t10); Texture2DMS<float4> m:register(t11); Buffer<float4> q:register(t12); Texture2D<int4> s:register(t13); cbuffer C:register(b2){float amount;}; float4 main(float2 p:POSITION,float2 uv:TEXCOORD0):SV_Position {bool valid=a.Load(int2(0,0),0).x==.125 && a.Load(int2(0,0),1).x==.25 && a.Load(int2(0,0),2).x==.5 && a.Load(int2(0,0),3).x==1 && abs(b.Load(int3(0,0,0))+amount-.25)<.001 && all(n.Load(int3(0,0,0))==0) && all(u.Load(int3(0,0,0))==0) && all(m.Load(int2(0,0),0)==0) && all(q.Load(0)==0) && all(s.Load(int3(0,0,0))==0);return float4((p+uv)*(valid ? 1:0),0,1);}";
+                                        const char* vertex_source="Texture2DMS<float3> a:register(t4); Texture2D<float> cached:register(t5); Texture2D<float> b:register(t7); SamplerState vertex_border:register(s3); Texture2D<float4> n:register(t9); Texture2D<uint4> u:register(t10); Texture2DMS<float4> m:register(t11); Buffer<float4> q:register(t12); Texture2D<int4> s:register(t13); Buffer<float4> halfs:register(t14); Buffer<uint> words:register(t15); cbuffer C:register(b2){float amount;}; float4 main(float2 p:POSITION,float2 uv:TEXCOORD0):SV_Position {bool valid=all(halfs.Load(1)==float4(1,.5,-2,4)) && all(halfs.Load(2)==0) && words.Load(2)==400 && words.Load(3)==65530 && words.Load(4)==0 && b.SampleLevel(vertex_border,float2(-1,-1),0)==1 && a.Load(int2(0,0),0).x==.125 && a.Load(int2(0,0),1).x==.25 && a.Load(int2(0,0),2).x==.5 && a.Load(int2(0,0),3).x==1 && cached.Load(int3(0,0,0))==b.Load(int3(0,0,0)) && abs(b.Load(int3(0,0,0))+amount-.25)<.001 && all(n.Load(int3(0,0,0))==0) && all(u.Load(int3(0,0,0))==0) && all(m.Load(int2(0,0),0)==0) && all(q.Load(0)==0) && all(s.Load(int3(0,0,0))==0);return float4((p+uv)*(valid ? 1:0),0,1);}";
                                         Microsoft::WRL::ComPtr<ID3DBlob> vertex_code;void* resource_vertex=nullptr;
                                         check(SUCCEEDED(compile(vertex_source,std::strlen(vertex_source),nullptr,nullptr,nullptr,"main","vs_5_0",0,0,&vertex_code,nullptr)) &&
                                             reinterpret_cast<CreateShader>(vt(device)[12])(device,vertex_code->GetBufferPointer(),vertex_code->GetBufferSize(),nullptr,&resource_vertex)==S_OK && resource_vertex,
                                             "vertex resource fixture creates a shader using sparse t4/t7 and b2 bindings");
-                                        if(resource_vertex) {
+                                        void* vertex_sampler=nullptr;
+                                        auto border=point;border.AddressU=border.AddressV=border.AddressW=D3D11_TEXTURE_ADDRESS_BORDER;
+                                        std::fill(std::begin(border.BorderColor),std::end(border.BorderColor),1.f);
+                                        check(reinterpret_cast<MakeComputeSampler>(vt(device)[23])(device,&border,&vertex_sampler)==S_OK && vertex_sampler,
+                                              "vertex stage has its own white-border sampler distinct from the pixel clamp sampler");
+                                        std::array<FLOAT,128> vertex_constants_bytes{};vertex_constants_bytes[0]=.5f;vertex_constants_bytes[4]=.05f;
+                                        DynamicDesc placement_constants{{sizeof vertex_constants_bytes,D3D11_USAGE_DEFAULT,D3D11_BIND_CONSTANT_BUFFER,0,0,0},0};
+                                        D3D11_SUBRESOURCE_DATA placement_data{vertex_constants_bytes.data(),0,0};
+                                        void* vertex_constants=nullptr;void* vertex_constants_base=nullptr;
+                                        check(reinterpret_cast<CreateDynamic>(vt(device)[3])(device,&placement_constants,&placement_data,&vertex_constants)==S_OK && vertex_constants,
+                                              "offset constants use an owned parent containing a distinct wrong value");
+                                        if(vertex_constants)std::memcpy(&vertex_constants_base,static_cast<char*>(vertex_constants)+48,sizeof vertex_constants_base);
+                                        if(resource_vertex && vertex_sampler && vertex_constants) {
                                             const auto bind_vertex=[&](void* ctx) {
                                                 bind_targets(ctx,1,targets,nullptr);
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_VIEWPORT*)>(vt(ctx)[44])(ctx,1,&viewport);
-                                                std::memcpy(static_cast<char*>(ctx)+0x180,&resource_vertex,sizeof resource_vertex);
-                                                std::memcpy(static_cast<char*>(ctx)+0x188,&shaders[2],sizeof(void*));
-                                                std::memcpy(static_cast<char*>(ctx)+0x178,&vertex_layout,sizeof vertex_layout);
+                                                static_cast<BYTE*>(ctx)[0x390]=3;
+                                                std::memset(static_cast<char*>(ctx)+0x180,0,16);
+                                                void* cached_layout=nullptr;std::memcpy(&cached_layout,static_cast<char*>(ctx)+0x178,8);
+                                                using BindObject=void(STDMETHODCALLTYPE*)(void*,void*);
+                                                reinterpret_cast<BindObject>(vt(ctx)[12])(ctx,resource_vertex);
+                                                reinterpret_cast<BindObject>(vt(ctx)[10])(ctx,shaders[2]);
+                                                reinterpret_cast<BindObject>(vt(ctx)[18])(ctx,vertex_layout);
+                                                std::array<void*,3> inline_cache{};
+                                                std::memcpy(inline_cache.data(),static_cast<char*>(ctx)+0x178,sizeof inline_cache);
+                                                check(inline_cache[0]==cached_layout && !inline_cache[1] && !inline_cache[2],
+                                                      "reference out-of-line shaders and layout retain real state without overwriting guest inline caches");
                                                 std::memcpy(static_cast<char*>(ctx)+0x170,&topology,sizeof topology);
                                                 bind_vertices(ctx,0,1,&vertex_buffer,&stride,&offset);
-                                                reinterpret_cast<BindCompute>(vt(ctx)[25])(ctx,4,1,&sample_view);
+                                                void* sampled_aliases[]{sample_view,cached_view};
+                                                reinterpret_cast<BindCompute>(vt(ctx)[25])(ctx,4,2,sampled_aliases);
                                                 reinterpret_cast<BindCompute>(vt(ctx)[25])(ctx,7,1,&compute_objects[2]);
-                                                reinterpret_cast<BindCompute>(vt(ctx)[8])(ctx,2,1,&compute_objects[5]);
+                                                reinterpret_cast<BindCompute>(vt(ctx)[25])(ctx,14,1,&compute_objects[7]);
+                                                reinterpret_cast<BindCompute>(vt(ctx)[25])(ctx,15,1,&compute_objects[9]);
+                                                if(ctx==context)reinterpret_cast<BindCompute>(vt(ctx)[8])(ctx,2,1,&vertex_constants);
+                                                reinterpret_cast<BindCompute>(vt(ctx)[26])(ctx,3,1,&compute_objects[4]);
+                                                reinterpret_cast<BindCompute>(vt(ctx)[11])(ctx,3,1,&compute_objects[4]);
+                                                const UINT zero_stride=0;
+                                                bind_vertices(ctx,0,1,&vertex_buffer,&zero_stride,&offset);
+                                                std::array<BYTE,80> packets{};SIZE_T packet_offset=0;
+                                                const auto packet=[&](UINT header,void* object,UINT64 metadata=0) {
+                                                    std::memcpy(packets.data()+packet_offset,&header,4);
+                                                    std::memcpy(packets.data()+packet_offset+4,&object,8);
+                                                    std::memcpy(packets.data()+packet_offset+12,&metadata,8);packet_offset+=20;
+                                                };
+                                                packet(0xa0000301,vertex_sampler);
+                                                packet(0x91060001,vertex_buffer,(UINT64(stride)<<48)|offset);
+                                                packet(0x80000701,compute_objects[2]);
+                                                packet(0x91000201,vertex_constants,16);
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,const void*,const void*)>(vt(ctx)[209])(
+                                                    ctx,packets.data(),packets.data()+packet_offset);
                                             };
                                             reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                             bind_vertex(context);draw(context,3,1);
                                             check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                                 std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
                                                 "vertex shader reads four distinct MSAA samples, sparse t7 and b2 through real non-pixel resource barriers");
+                                            using SetScissors=void(STDMETHODCALLTYPE*)(void*,UINT,const D3D11_RECT*);
+                                            using GetScissors=void(STDMETHODCALLTYPE*)(void*,UINT*,D3D11_RECT*);
+                                            using SetRaster=void(STDMETHODCALLTYPE*)(void*,void*);
+                                            D3D11_RASTERIZER_DESC clipped_desc{};
+                                            clipped_desc.FillMode=D3D11_FILL_SOLID;clipped_desc.CullMode=D3D11_CULL_NONE;
+                                            clipped_desc.DepthClipEnable=TRUE;clipped_desc.ScissorEnable=TRUE;
+                                            void* clipped_raster=nullptr;
+                                            check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const D3D11_RASTERIZER_DESC*,void**)>(vt(device)[22])(
+                                                device,&clipped_desc,&clipped_raster)==S_OK && clipped_raster,"reference scissor draw creates its native raster state");
+                                            const D3D11_RECT left_half{0,0,16,16},right_half{16,0,32,16};
+                                            const bool clipped=clipped_raster!=nullptr;
+                                            const auto clipped_pixels=[&] {
+                                                for(SIZE_T i=0;i<linear.size();++i)if(linear[i]!=(i%32<16 ? 191:0))return false;
+                                                return true;
+                                            };
+                                            if(clipped) {
+                                                reinterpret_cast<SetRaster>(vt(context)[43])(context,clipped_raster);
+                                                reinterpret_cast<SetScissors>(vt(context)[45])(context,1,&left_half);
+                                                std::array<D3D11_RECT,17> query{};query.back()={1,2,3,4};UINT requested=17;
+                                                reinterpret_cast<GetScissors>(vt(context)[96])(context,&requested,query.data());
+                                                check(requested==1 && !std::memcmp(query.data(),&left_half,sizeof left_half) &&
+                                                    query[1].right==0 && query[15].bottom==0 && query[16].left==1,
+                                                    "reference scissor getter returns actual count, zero fills and caps writes at sixteen");
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                draw(context,3,1);
+                                                check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK && clipped_pixels(),
+                                                      "native scissor retains the left half and leaves pixels outside the rectangle untouched");
+                                                reinterpret_cast<SetScissors>(vt(context)[45])(context,0,nullptr);
+                                                for(bool read_clear : {false,true}) {
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
+                                                    if(read_clear)check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
+                                                        std::all_of(linear.begin(),linear.end(),[](auto value){return value==0;}),
+                                                        "clear before an empty scissor draw publishes exact zero pixels");
+                                                    draw(context,3,1);
+                                                    const auto empty_clip_copy=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr);
+                                                    const auto empty_clip_nonzero=std::count_if(linear.begin(),linear.end(),[](auto value){return value!=0;});
+                                                    if(empty_clip_copy!=S_OK || empty_clip_nonzero)
+                                                        std::fprintf(stderr,"empty scissor readback hr=0x%08lX nonzero=%zu first=%u last=%u\n",empty_clip_copy,SIZE_T(empty_clip_nonzero),UINT(linear.front()),UINT(linear.back()));
+                                                    check(empty_clip_copy==S_OK && !empty_clip_nonzero,
+                                                        "enabled scissor with no rectangles clips every fragment without skipping the draw");
+                                                }
+                                                reinterpret_cast<SetRaster>(vt(context)[43])(context,nullptr);
+                                            }
                                             void* vertex_producer=nullptr;void* vertex_list=nullptr;
                                             check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&vertex_producer)==S_OK && vertex_producer,
                                                   "vertex resource draw uses an existing deferred producer");
                                             if(vertex_producer) {
-                                                bind_vertex(vertex_producer);draw(vertex_producer,3,1);
+                                                bind_vertex(vertex_producer);
+                                                if(clipped) {
+                                                    reinterpret_cast<SetRaster>(vt(vertex_producer)[43])(vertex_producer,clipped_raster);
+                                                    reinterpret_cast<SetScissors>(vt(vertex_producer)[45])(vertex_producer,1,&left_half);
+                                                }
+                                                draw(vertex_producer,3,1);
+                                                if(clipped)reinterpret_cast<SetScissors>(vt(vertex_producer)[45])(vertex_producer,1,&right_half);
                                                 check(reinterpret_cast<FinishDeferred>(vt(vertex_producer)[114])(vertex_producer,FALSE,&vertex_list)==S_OK && vertex_list,
                                                       "sparse vertex bindings survive FinishCommandList");
                                                 reinterpret_cast<Count>(vt(vertex_producer)[2])(vertex_producer);
                                             }
+                                            if(clipped_raster)reinterpret_cast<Count>(vt(clipped_raster)[2])(clipped_raster);
                                             reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(context)[110])(context);
+                                            reinterpret_cast<Count>(vt(vertex_constants)[2])(vertex_constants);vertex_constants=nullptr;
+                                            MEMORY_BASIC_INFORMATION constant_info{};
+                                            check(VirtualQuery(vertex_constants_base,&constant_info,sizeof constant_info) && constant_info.State==MEM_COMMIT,
+                                                  "offset alias retains the owned allocation after the parent buffer is destroyed");
+                                            UINT cleared_count=16;std::array<D3D11_RECT,16> cleared_rectangles{};
+                                            reinterpret_cast<GetScissors>(vt(context)[96])(context,&cleared_count,cleared_rectangles.data());
+                                            check(cleared_count==0 && cleared_rectangles[0].right==0,"ClearState clears the shared scissor state");
                                             reinterpret_cast<Count>(vt(resource_vertex)[2])(resource_vertex);
+                                            resource_vertex=nullptr;
+                                            reinterpret_cast<Count>(vt(vertex_sampler)[2])(vertex_sampler);vertex_sampler=nullptr;
                                             if(sample_view) {reinterpret_cast<Count>(vt(sample_view)[2])(sample_view);sample_view=nullptr;}
                                             if(sample_texture) {reinterpret_cast<Count>(vt(sample_texture)[2])(sample_texture);sample_texture=nullptr;}
+                                            if(cached_view) {reinterpret_cast<Count>(vt(cached_view)[2])(cached_view);cached_view=nullptr;}
+                                            if(cached_texture) {reinterpret_cast<Count>(vt(cached_texture)[2])(cached_texture);cached_texture=nullptr;}
                                             for(UINT pass=0;pass<2 && vertex_list;++pass) {
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,black);
                                                 reinterpret_cast<ExecuteDeferred>(vt(context)[58])(context,vertex_list,FALSE);
                                                 check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
-                                                    std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;}),
+                                                    (clipped ? clipped_pixels():std::all_of(linear.begin(),linear.end(),[](auto value){return value==191;})),
                                                     "deferred sparse vertex descriptors retain exact fenced pixels after producer and shader release on reuse");
                                             }
                                             if(vertex_list) reinterpret_cast<Count>(vt(vertex_list)[2])(vertex_list);
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[197])(context,0x407);
+                                            check(VirtualQuery(vertex_constants_base,&constant_info,sizeof constant_info) && constant_info.State==MEM_FREE,
+                                                  "last recorded offset alias retires the owned allocation after replay");
                                         }
+                                        if(vertex_constants)reinterpret_cast<Count>(vt(vertex_constants)[2])(vertex_constants);
+                                        if(resource_vertex)reinterpret_cast<Count>(vt(resource_vertex)[2])(resource_vertex);
+                                        if(vertex_sampler)reinterpret_cast<Count>(vt(vertex_sampler)[2])(vertex_sampler);
                                         if(sample_view) reinterpret_cast<Count>(vt(sample_view)[2])(sample_view);
                                         if(sample_texture) reinterpret_cast<Count>(vt(sample_texture)[2])(sample_texture);
+                                        if(cached_view) reinterpret_cast<Count>(vt(cached_view)[2])(cached_view);
+                                        if(cached_texture) reinterpret_cast<Count>(vt(cached_texture)[2])(cached_texture);
                                         bind_compute(context);reinterpret_cast<Dispatch>(vt(context)[41])(context,4,2,1);
                                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(context)[197])(context,0x407);
-                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(context)[152])(context,0x400000,nullptr,0);
+                                        for(const UINT profile:{0x400000u,0x80c00000u})
+                                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(context)[152])(context,profile,nullptr,0);
                                         check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
                                             std::all_of(linear.begin(),linear.end(),[](auto value){return value==64;}),
                                             "immediate Dispatch samples the original texture and writes every UAV pixel after a fence");
+                                        {
+                                            std::string changed=compute_source;const auto at=changed.find("+amount:0");
+                                            check(at!=std::string::npos,"compute replacement fixture locates its output expression");
+                                            if(at==std::string::npos)return 1;
+                                            // Avoid a UNORM half-step after hardware sampling (RTX/WARP can round the preceding arithmetic differently).
+                                            changed.replace(at,std::strlen("+amount:0"),"+amount+.125:0");
+                                            Microsoft::WRL::ComPtr<ID3DBlob> replacement;
+                                            const auto compiled=compile(changed.data(),changed.size(),nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&replacement,nullptr);
+                                            check(SUCCEEDED(compiled) && replacement,"compute replacement fixture compiles its different output");
+                                            if(FAILED(compiled) || !replacement)return 1;
+                                            for(UINT epoch=0;epoch<3;++epoch) {
+                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(context)[69])(context,nullptr);
+                                                check(reinterpret_cast<Count>(vt(compute_objects[0])[2])(compute_objects[0])==0,
+                                                    "native compute pipeline cache does not retain the guest shader object");compute_objects[0]=nullptr;
+                                                auto* code=epoch==1 ? replacement.Get():compute_code.Get();
+                                                const auto created=reinterpret_cast<CreateShader>(vt(device)[18])(device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&compute_objects[0]);
+                                                check(created==S_OK && compute_objects[0],"compute shader is recreated after its previous object is destroyed");
+                                                if(created!=S_OK || !compute_objects[0])return 1;
+                                                bind_compute(context);reinterpret_cast<Dispatch>(vt(context)[41])(context,4,2,1);
+                                                const auto copied=pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr);
+                                                const bool exact=copied==S_OK && std::all_of(linear.begin(),linear.end(),[&](BYTE pixel){return pixel==(epoch==1 ? 96:64);});
+                                                if(!exact){const auto bounds=std::minmax_element(linear.begin(),linear.end());std::fprintf(stderr,"compute replacement epoch=%u first=%u min=%u max=%u copy=0x%08lX\n",epoch,linear[0],*bounds.first,*bounds.second,copied);}
+                                                check(exact,
+                                                    "compute cache preserves exact pixels across identical bytecode recreation, shader replacement and restoring the earlier shader");
+                                            }
+                                            reinterpret_cast<Dispatch>(vt(context)[41])(context,0,2,1);
+                                            check(pixels.copy(pixels.context.get(),false,linear.data(),alias,0,32,512,nullptr)==S_OK &&
+                                                std::all_of(linear.begin(),linear.end(),[](BYTE pixel){return pixel==64;}),
+                                                "cached compute pipeline uses the current dispatch dimensions and preserves pixels for zero groups");
+                                        }
                                         void* producer=nullptr;void* compute_list=nullptr;
                                         check(reinterpret_cast<Deferred>(vt(device)[27])(device,0x60000,&producer)==S_OK && producer,"compute recording creates a deferred producer");
                                         if(producer) {
@@ -1898,7 +3405,8 @@ int main(int argc, char** argv) {
                                                 reinterpret_cast<Dispatch>(vt(producer)[41])(producer,4,2,1);
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(producer)[197])(producer,0x407);
                                                 reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(producer)[197])(producer,0x80000001u);
-                                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(producer)[152])(producer,0x400000,nullptr,0);
+                                                for(const UINT profile:{0x400000u,0x80c00000u})
+                                                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(producer)[152])(producer,profile,nullptr,0);
                                             }
                                             check(reinterpret_cast<FinishDeferred>(vt(producer)[114])(producer,FALSE,&compute_list)==S_OK && compute_list,
                                                   "deferred Dispatch finishes without executing");
@@ -1952,6 +3460,106 @@ int main(int argc, char** argv) {
                 check(create_uav(device,texture,&invalid,&view)==DXGI_ERROR_UNSUPPORTED && !view,"texture UAV refuses an incompatible format without replacing its parent");
                 reinterpret_cast<Count>(vt(texture)[2])(texture);
             }
+            if(graphics) {
+                NativeUavClear native;
+                if(FAILED(native.initialize(argc==5)))return 1;
+                for(const UINT levels:{0u,1u}) {
+                    Desc cube{};cube.standard={32,32,levels,6,DXGI_FORMAT_R32G32B32A32_FLOAT,{1,0},D3D11_USAGE_DEFAULT,
+                        D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS,0,
+                        D3D11_RESOURCE_MISC_TEXTURECUBE|D3D11_RESOURCE_MISC_GENERATE_MIPS};
+                    void* resource=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**)>(vt(device)[5])(device,&cube,nullptr,&resource)==S_OK && resource,
+                        "reference RGBA32 float cubemap supports SRV RTV UAV and automatic or explicit mip counts");
+                    if(!resource)return 1;
+                    Desc queried{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,Desc*)>(vt(resource)[12])(resource,&queried);
+                    check(queried.standard.Format==DXGI_FORMAT_R32G32B32A32_FLOAT && queried.standard.ArraySize==6 && queried.standard.MipLevels==(levels ? 1:6),
+                        "RGBA32 float cubemap preserves format and faces and resolves a zero mip count");
+                    void* view=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**)>(vt(device)[7])(device,resource,nullptr,&view)==S_OK && view,
+                        "RGBA32 float cubemap exposes its original cube SRV");
+                    BYTE* canonical=nullptr;
+                    if(view){std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);reinterpret_cast<Count>(vt(view)[2])(view);}
+                    if(!canonical)return 1;
+                    D3D11_RENDER_TARGET_VIEW_DESC selected{};selected.Format=cube.standard.Format;selected.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    selected.Texture2DArray={0,1,1};view=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_RENDER_TARGET_VIEW_DESC*,void**)>(vt(device)[9])(device,resource,&selected,&view)==S_OK && view,
+                        "RGBA32 float cube face exposes a native RTV");if(!view)return 1;
+                    TitleTextureLayout pixels;
+                    if(FAILED(create_xg_texture_layout(32,32,queried.standard.MipLevels,6,cube.standard.Format,UINT_MAX,pixels,cube.standard.BindFlags)))return 1;
+                    std::memset(canonical,0x5a,pixels.bytes);
+                    const std::array<UINT,4> color{0xbfa00000,0x3e000000,0x40600000,0x3f800000};
+                    FLOAT clear[4];std::memcpy(clear,color.data(),sizeof clear);
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,view,clear);
+                    auto control=pixels.resource_desc;control.DepthOrArraySize=control.MipLevels=1;
+                    std::vector<BYTE> expected,actual(32*32*16),untouched(actual.size());
+                    if(FAILED(native.texture(control,cube.standard.Format,16,color,true,expected,true)))return 1;
+                    check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,queried.standard.MipLevels,512,16384,nullptr)==S_OK && actual==expected &&
+                        pixels.copy(pixels.context.get(),false,untouched.data(),canonical,0,512,16384,nullptr)==S_OK &&
+                        std::all_of(untouched.begin(),untouched.end(),[](BYTE value){return value==0x5a;}),
+                        "RGBA32 float RTV clear matches every native component and preserves an unselected cube face");
+                    reinterpret_cast<Count>(vt(view)[2])(view);reinterpret_cast<Count>(vt(resource)[2])(resource);
+                }
+                for(const auto format:{DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_R32G32B32A32_FLOAT})for(const UINT faces:{1u,4u,6u})for(const UINT operation:{51u,52u})for(const bool remaining:{false,true}) {
+                    const UINT element=format==DXGI_FORMAT_R32G32B32A32_FLOAT ? 16:4;
+                    Desc desc{};desc.standard={32,32,3,faces,format,{1,0},D3D11_USAGE_DEFAULT,
+                        D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS,0,faces==6 ? UINT(D3D11_RESOURCE_MISC_TEXTURECUBE):0};
+                    void* resource=nullptr;void* view=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**)>(vt(device)[5])(device,&desc,nullptr,&resource)==S_OK && resource,
+                        "mipped UAV fixture owns a single texture or array");if(!resource)return 1;
+                    const auto create=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8]);
+                    check(create(device,resource,nullptr,&view)==S_OK && view,"reference default UAV accepts mips and arrays");if(!view)return 1;
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC queried{};
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*)>(vt(view)[9])(view,&queried);
+                    check(queried.ViewDimension==(faces==1 ? D3D11_UAV_DIMENSION_TEXTURE2D:D3D11_UAV_DIMENSION_TEXTURE2DARRAY) &&
+                        queried.Texture2D.MipSlice==0 && (faces==1 || queried.Texture2DArray.ArraySize==faces),"reference default UAV selects mip zero and every array slice");
+                    reinterpret_cast<Count>(vt(view)[2])(view);view=nullptr;
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC selected{};selected.Format=desc.standard.Format;
+                    selected.ViewDimension=faces==1 ? D3D11_UAV_DIMENSION_TEXTURE2D:D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+                    selected.Texture2D.MipSlice=1;
+                    const UINT first=faces==1 ? 0:1,count=faces==1 ? 1:remaining ? faces-first:2;
+                    if(faces>1){selected.Texture2DArray.FirstArraySlice=first;selected.Texture2DArray.ArraySize=remaining ? UINT_MAX:count;}
+                    check(create(device,resource,&selected,&view)==S_OK && view,"reference UAV selects one mip and a bounded slice range");if(!view)return 1;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*)>(vt(view)[9])(view,&queried);
+                    check(!std::memcmp(&selected,&queried,sizeof selected),"UAV GetDesc retains the requested remaining-slice sentinel");
+                    std::array<UINT32,8> srd{};std::memcpy(srd.data(),static_cast<BYTE*>(view)+48,sizeof srd);
+                    check((srd[3]&0xff000u)==0 && (srd[5]&0x3ffffffu)==(first|((first+count-1)<<13)) &&
+                        (faces==1 || (srd[3]>>28)==13),"UAV SRD rebases the mip and retains the array range without turning cube faces into a cube sampler");
+                    auto invalid=selected;invalid.Texture2D.MipSlice=3;void* rejected=nullptr;
+                    check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"mipped UAV rejects an out-of-resource mip");
+                    if(faces>1) {
+                        invalid=selected;invalid.Texture2DArray.FirstArraySlice=faces;
+                        check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"array UAV rejects an out-of-resource first slice");
+                        invalid=selected;invalid.Texture2DArray.ArraySize=faces;
+                        check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"array UAV rejects a range beyond storage");
+                    }
+                    TitleTextureLayout pixels,control;
+                    if(FAILED(create_xg_texture_layout(32,32,3,faces,desc.standard.Format,UINT_MAX,pixels,desc.standard.BindFlags)) ||
+                        FAILED(create_xg_texture_layout(16,16,1,1,desc.standard.Format,UINT_MAX,control,desc.standard.BindFlags)))return 1;
+                    BYTE* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);
+                    std::array<UINT,4> values=operation==51 ? std::array<UINT,4>{0x61,0x12,0x34,0x56}:std::array<UINT,4>{0x3e800000,0x3f000000,0x3f400000,0x3f800000};
+                    std::vector<BYTE> expected;
+                    if(FAILED(native.texture(control.resource_desc,desc.standard.Format,element,values,operation==52,expected)))return 1;
+                    const auto verify=[&] {
+                        for(UINT face=0;face<faces;++face)for(UINT mip=0;mip<3;++mip) {
+                            const UINT width=32>>mip;std::vector<BYTE> actual(width*width*element);
+                            const bool targeted=mip==1 && face>=first && face<first+count;
+                            check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,face*3+mip,width*element,width*width*element,nullptr)==S_OK &&
+                                (targeted ? actual==expected:std::all_of(actual.begin(),actual.end(),[](BYTE value){return value==0x5a;})),
+                                "Uint/Float UAV clear preserves selected mip pixels and all untouched mips and slices");
+                        }
+                    };
+                    std::memset(canonical,0x5a,pixels.bytes);
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(context)[operation])(context,view,values.data());verify();
+                    std::memset(canonical,0x5a,pixels.bytes);void* producer=nullptr;void* list=nullptr;
+                    if(FAILED(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**)>(vt(device)[27])(device,0,&producer)) || !producer)return 1;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(producer)[operation])(producer,view,values.data());values.fill(0);
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**)>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list &&
+                        std::all_of(canonical,canonical+pixels.bytes,[](BYTE value){return value==0x5a;}),"mipped array clear records without executing");if(!list)return 1;
+                    reinterpret_cast<Count>(vt(producer)[2])(producer);reinterpret_cast<Count>(vt(view)[2])(view);reinterpret_cast<Count>(vt(resource)[2])(resource);
+                    for(UINT pass=0;pass<2;++pass){std::memset(canonical,0x5a,pixels.bytes);reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,FALSE);verify();}
+                    reinterpret_cast<Count>(vt(list)[2])(list);
+                }
+            }
             for (const UINT faces:{1u,6u}) {
                 Desc initialized{};
                 initialized.standard={8,8,3,faces,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE,0,faces==6 ? UINT(D3D11_RESOURCE_MISC_TEXTURECUBE) : 0};
@@ -1998,6 +3606,87 @@ int main(int argc, char** argv) {
                             for (UINT y=0;y<width;++y) exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
                             check(exact,"upload preserves every source pixel without copying row padding");
                         }
+                        void* destination=nullptr;void* destination_view=nullptr;
+                        auto copy_desc=initialized;copy_desc.standard.Format=DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+                        check(create_initialized(device,&copy_desc,nullptr,&destination)==S_OK && destination,"CopyResource creates a matching sRGB sibling texture with every face and mip");
+                        if(destination) {
+                            check(reinterpret_cast<MakeSrv>(vt(device)[7])(device,destination,nullptr,&destination_view)==S_OK && destination_view,"copied texture exposes the original XG layout");
+                            if(destination_view) {
+                                void* copied=nullptr;std::memcpy(&copied,static_cast<BYTE*>(destination_view)+80,sizeof copied);
+                                using Copy=void(STDMETHODCALLTYPE*)(void*,void*,void*);
+                                for(UINT pass=0;pass<2;++pass) {
+                                    std::memset(copied,0x9d,pixels.bytes);
+                                    if(!pass)for(UINT invalid=0;invalid<2;++invalid) {
+                                        auto bad=initialized;if(invalid)bad.standard.Format=DXGI_FORMAT_R32_FLOAT;else {bad.standard.Width=4;bad.standard.Height=4;}
+                                        void* wrong=nullptr;check(create_initialized(device,&bad,nullptr,&wrong)==S_OK && wrong,"texture copy negative control creates a valid incompatible source");
+                                        if(wrong) {
+                                            static UINT refused=0;refused=0;
+                                            set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{refused=slot;return 0;});
+                                            reinterpret_cast<Copy>(vt(context)[47])(context,destination,wrong);set_d3d11x_trap_handler(nullptr);
+                                            check(refused==47 && std::all_of(static_cast<BYTE*>(copied),static_cast<BYTE*>(copied)+pixels.bytes,[](BYTE value){return value==0x9d;}),
+                                                "CopyResource rejects mismatched extents and unrelated format families before touching destination storage");
+                                            reinterpret_cast<Count>(vt(wrong)[2])(wrong);
+                                        }
+                                    }
+                                    reinterpret_cast<Copy>(vt(context)[47])(context,destination,texture);
+                                    reinterpret_cast<Copy>(vt(context)[47])(context,destination,destination);
+                                    for(UINT mip=0;mip<faces*3;++mip) {
+                                        const UINT width=8>>(mip%3),pitch=width*4;std::vector<BYTE> linear(pitch*width);
+                                        bool exact=pixels.copy(pixels.context.get(),false,linear.data(),copied,mip,pitch,pitch*width,nullptr)==S_OK;
+                                        for(UINT y=0;y<width;++y)exact=exact && !std::memcmp(linear.data()+y*pitch,sources[mip].data()+y*initial[mip].SysMemPitch,pitch);
+                                        check(exact,"native CopyResource preserves every face/mip and replaces CPU-invalidated destination data on reuse");
+                                    }
+                                }
+                                std::vector<std::vector<BYTE>> expected(faces*3);
+                                for(UINT mip=0;mip<faces*3;++mip) {
+                                    const UINT width=8>>(mip%3);expected[mip].resize(width*width*4);
+                                    for(UINT y=0;y<width;++y)std::memcpy(expected[mip].data()+y*width*4,sources[mip].data()+y*initial[mip].SysMemPitch,width*4);
+                                }
+                                const auto verify_regions=[&]() {
+                                    for(UINT mip=0;mip<faces*3;++mip) {
+                                        const UINT width=8>>(mip%3);std::vector<BYTE> actual(width*width*4);
+                                        check(pixels.copy(pixels.context.get(),false,actual.data(),copied,mip,width*4,UINT(actual.size()),nullptr)==S_OK && actual==expected[mip],
+                                            "texture region copy preserves exact pixels in selected rectangles and every untouched mip/face");
+                                    }
+                                };
+                                using Region=void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*);
+                                const auto copy_region=reinterpret_cast<Region>(vt(context)[46]);const UINT selected=(faces-1)*3+1;
+                                D3D11_BOX box{1,2,0,3,4,1};
+                                copy_region(context,destination,selected,1,1,0,texture,0,&box);
+                                for(UINT y=0;y<2;++y)std::memcpy(expected[selected].data()+((y+1)*4+1)*4,sources[0].data()+(y+2)*initial[0].SysMemPitch+4,8);
+                                verify_regions();
+                                box={1,1,0,3,3,1};
+                                copy_region(context,destination,2,0,0,0,destination,selected,&box);
+                                for(UINT y=0;y<2;++y)std::memcpy(expected[2].data()+y*8,expected[selected].data()+((y+1)*4+1)*4,8);
+                                verify_regions();
+                                const D3D11_BOX empty{1,1,0,1,2,1},outside{0,0,0,9,1,1};
+                                copy_region(context,destination,selected,0,0,0,texture,0,&empty);
+                                copy_region(context,destination,selected,0,0,0,texture,0,&outside);
+                                copy_region(context,destination,UINT_MAX,0,0,0,texture,0,nullptr);
+                                verify_regions();
+                                using Defer=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                                void* producer=nullptr;void* list=nullptr;
+                                if(reinterpret_cast<Defer>(vt(device)[27])(device,0,&producer)==S_OK && producer) {
+                                    box={1,2,0,3,4,1};reinterpret_cast<Region>(vt(producer)[46])(producer,destination,selected,1,1,0,texture,0,&box);box={};
+                                    check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list,"deferred texture copy snapshots the box without copying source pixel data");
+                                    verify_regions();reinterpret_cast<Count>(vt(producer)[2])(producer);
+                                }else check(false,"texture region copy creates a deferred producer");
+                                if(list) {
+                                    reinterpret_cast<Count>(vt(destination_view)[2])(destination_view);destination_view=nullptr;
+                                    reinterpret_cast<Count>(vt(destination)[2])(destination);destination=nullptr;
+                                    for(UINT pass=0;pass<2;++pass) {
+                                        std::array<BYTE,256> changed;changed.fill(BYTE(0x6b+pass));
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,const D3D11_BOX*,const void*,UINT,UINT)>(vt(context)[48])(context,texture,0,nullptr,changed.data(),32,256);
+                                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,TRUE);
+                                        for(UINT y=0;y<2;++y)std::fill_n(expected[selected].data()+((y+1)*4+1)*4,8,BYTE(0x6b+pass));
+                                        verify_regions();
+                                    }
+                                    reinterpret_cast<Count>(vt(list)[2])(list);
+                                }
+                                if(destination_view)reinterpret_cast<Count>(vt(destination_view)[2])(destination_view);
+                            }
+                            if(destination)reinterpret_cast<Count>(vt(destination)[2])(destination);
+                        }
                         reinterpret_cast<Count>(vt(view)[2])(view);
                     }
                     reinterpret_cast<Count>(vt(texture)[2])(texture);
@@ -2018,6 +3707,94 @@ int main(int argc, char** argv) {
                           "cube texture rejects an incomplete face set");
                 }
             }
+            // Reference 1401ca160 / 1405869a0: full-chain creation, per-face mip filtering and retained deferred work.
+            for(const UINT faces:{1u,6u})for(const bool restricted:{false,true}) {
+                Desc generated{};generated.standard={8,8,0,faces,DXGI_FORMAT_R8G8B8A8_UNORM,{1,0},D3D11_USAGE_DEFAULT,
+                    D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET,0,UINT(D3D11_RESOURCE_MISC_GENERATE_MIPS)|(faces==6 ? UINT(D3D11_RESOURCE_MISC_TEXTURECUBE):0)};
+                std::vector<std::vector<BYTE>> sources(faces*4),expected(faces*4);
+                std::vector<D3D11_SUBRESOURCE_DATA> initial(faces*4);
+                for(UINT face=0;face<faces;++face)for(UINT mip=0;mip<4;++mip) {
+                    const UINT width=8>>mip,pitch=width*4+12,index=face*4+mip;
+                    sources[index].assign(pitch*width+16,0x5a);expected[index].resize(width*width*4);
+                    for(UINT y=0;y<width;++y)for(UINT x=0;x<width;++x)for(UINT c=0;c<4;++c) {
+                        const BYTE value=BYTE(x*(17+c*9)+y*(7+c*13)+face*29+mip*41+c*19);
+                        sources[index][y*pitch+x*4+c]=value;expected[index][(y*width+x)*4+c]=value;
+                    }
+                    initial[index]={sources[index].data(),pitch,0};
+                }
+                const auto originals=sources;
+                using CreateInitialized=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);
+                void* object=nullptr;hr=reinterpret_cast<CreateInitialized>(vt(device)[5])(device,&generated,initial.data(),&object);
+                check(hr==S_OK && object,"reference autogen creation accepts a full mip chain for 2D and cube resources");if(!object)return 1;
+                Desc queried{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,Desc*)>(vt(object)[12])(object,&queried);
+                check(queried.standard.MipLevels==4 && queried.standard.ArraySize==faces && queried.standard.MiscFlags==generated.standard.MiscFlags,
+                    "MipLevels zero expands the complete chain without losing cube/autogen metadata");
+                D3D11_SHADER_RESOURCE_VIEW_DESC desc{};desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+                desc.ViewDimension=faces==6 ? D3D11_SRV_DIMENSION_TEXTURECUBE:D3D11_SRV_DIMENSION_TEXTURE2D;
+                const UINT base=restricted ? 1:0,levels=restricted ? 2:4;
+                desc.Texture2D.MostDetailedMip=base;desc.Texture2D.MipLevels=levels;
+                using MakeSrv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**);
+                void* view=nullptr;hr=reinterpret_cast<MakeSrv>(vt(device)[7])(device,object,&desc,&view);
+                check(hr==S_OK && view,"mip generation accepts the selected original view range");if(!view)return 1;
+                std::array<UINT32,8> srd{};std::memcpy(srd.data(),static_cast<BYTE*>(view)+48,sizeof srd);
+                check(((srd[3]>>12)&15)==base && ((srd[3]>>16)&15)==base+levels-1,"console SRD retains base/last mip of the selected view");
+                void* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);
+                TitleTextureLayout layout;hr=create_xg_texture_layout(8,8,4,faces,DXGI_FORMAT_R8G8B8A8_UNORM,UINT_MAX,layout,generated.standard.BindFlags);
+                if(FAILED(hr))return 1;
+                if(faces==6) {
+                    D3D11_RENDER_TARGET_VIEW_DESC rtv{};rtv.Format=desc.Format;rtv.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    rtv.Texture2DArray={99,99,UINT_MAX};void* target=nullptr;
+                    using MakeRtv=HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_RENDER_TARGET_VIEW_DESC*,void**);
+                    check(reinterpret_cast<MakeRtv>(vt(device)[9])(device,object,&rtv,&target)==S_OK && target,"cube RTV accepts source-compatible clamped mip and face ranges");
+                    if(!target)return 1;
+                    const FLOAT green[]{0,1,0,1};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,target,green);
+                    reinterpret_cast<Count>(vt(target)[2])(target);expected[faces*4-1]={0,255,0,255};
+                    for(UINT index=0;index<faces*4;++index) {
+                        const UINT width=8>>(index%4);std::vector<BYTE> actual(width*width*4);
+                        check(layout.copy(layout.context.get(),false,actual.data(),canonical,index,width*4,UINT(actual.size()),nullptr)==S_OK && actual==expected[index],
+                            "clamped array RTV clears only the last face/mip and preserves every other subresource");
+                    }
+                }
+                const std::vector<BYTE> before(static_cast<BYTE*>(canonical),static_cast<BYTE*>(canonical)+layout.bytes);
+                using Generate=void(STDMETHODCALLTYPE*)(void*,void*);
+                using Finish=HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**);
+                void* commands=nullptr;
+                if(faces==6) {
+                    using Defer=HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**);void* producer=nullptr;
+                    if(reinterpret_cast<Defer>(vt(device)[27])(device,0,&producer)!=S_OK || !producer)return 1;
+                    reinterpret_cast<Generate>(vt(producer)[54])(producer,view);
+                    check(!std::memcmp(before.data(),canonical,before.size()),"deferred GenerateMips does not alter canonical pixels while recording");
+                    check(reinterpret_cast<Finish>(vt(producer)[114])(producer,FALSE,&commands)==S_OK && commands,"deferred mip generation finishes in the existing command list");
+                    reinterpret_cast<Count>(vt(producer)[2])(producer);
+                    reinterpret_cast<Count>(vt(view)[2])(view);view=nullptr;reinterpret_cast<Count>(vt(object)[2])(object);object=nullptr;
+                    if(!commands)return 1;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,commands,FALSE);
+                } else reinterpret_cast<Generate>(vt(context)[54])(context,view);
+                for(UINT face=0;face<faces;++face)for(UINT mip=base+1;mip<base+levels;++mip) {
+                    const UINT width=8>>mip,source_width=width*2;
+                    for(UINT y=0;y<width;++y)for(UINT x=0;x<width;++x)for(UINT c=0;c<4;++c) {
+                        UINT sum=0;for(UINT dy=0;dy<2;++dy)for(UINT dx=0;dx<2;++dx)sum+=expected[face*4+mip-1][((2*y+dy)*source_width+2*x+dx)*4+c];
+                        expected[face*4+mip][(y*width+x)*4+c]=BYTE((sum+2)/4);
+                    }
+                }
+                for(UINT index=0;index<faces*4;++index) {
+                    const UINT mip=index%4,width=8>>mip;std::vector<BYTE> actual(width*width*4);
+                    hr=layout.copy(layout.context.get(),false,actual.data(),canonical,index,width*4,UINT(actual.size()),nullptr);
+                    const int tolerance=mip>base && mip<base+levels ? 2:0;bool exact=SUCCEEDED(hr);
+                    for(size_t i=0;i<actual.size();++i)exact=exact && std::abs(int(actual[i])-int(expected[index][i]))<=tolerance;
+                    check(exact,"GenerateMips linearly filters each selected face/mip, including alpha, and preserves the source and unselected levels");
+                }
+                check(sources==originals,"mip generation preserves producer pixels, row padding and guards");
+                if(commands)reinterpret_cast<Count>(vt(commands)[2])(commands);
+                if(view)reinterpret_cast<Count>(vt(view)[2])(view);if(object)reinterpret_cast<Count>(vt(object)[2])(object);
+            }
+            {
+                Desc cube{};cube.standard={32,32,0,6,DXGI_FORMAT_R11G11B10_FLOAT,{1,0},D3D11_USAGE_DEFAULT,0xA8,0,D3D11_RESOURCE_MISC_TEXTURECUBE|D3D11_RESOURCE_MISC_GENERATE_MIPS};
+                using CreateOwned=HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**);void* object=nullptr;
+                check(reinterpret_cast<CreateOwned>(vt(device)[5])(device,&cube,nullptr,&object)==S_OK && object,"FH2-demonstrated generic 32x32 float cube creation expands its full mip chain");
+                if(object){Desc actual{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,Desc*)>(vt(object)[12])(object,&actual);check(actual.standard.MipLevels==6,"32x32 cube exposes six original mip levels");reinterpret_cast<Count>(vt(object)[2])(object);}
+            }
+
             TitleTextureLayout placed_color;
             const UINT color_binds=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET|D3D11_BIND_UNORDERED_ACCESS;
             hr=create_xg_texture_layout(32,16,1,1,DXGI_FORMAT_R16G16_FLOAT,14,placed_color,color_binds);
@@ -2089,7 +3866,7 @@ int main(int argc, char** argv) {
                     const auto* view_words=reinterpret_cast<const UINT32*>(static_cast<const unsigned char*>(uav)+48);
                     void* canonical=nullptr;
                     std::memcpy(&canonical,static_cast<const unsigned char*>(uav)+80,sizeof canonical);
-                    check(view_words[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) && (view_words[3]>>28)==10,
+                    check(view_words[0]==(reinterpret_cast<std::uintptr_t>(canonical)>>8) && (view_words[3]>>28)==13 && (view_words[5]&0x3ffffffu)==(15u<<13),
                           "volume UAV preserves the physical XG base and native 3D resource type");
                     reinterpret_cast<Count>(vt(uav)[2])(uav);
                 }
@@ -2099,8 +3876,9 @@ int main(int argc, char** argv) {
                 check(create_uav(device,texture,&invalid,&uav)==E_INVALIDARG && !uav,
                       "volume UAV rejects a slice range outside the resource");
                 invalid.Texture3D.WSize=8;
-                check(create_uav(device,texture,&invalid,&uav)==DXGI_ERROR_UNSUPPORTED && !uav,
-                      "partial volume UAV remains an explicit unsupported case");
+                check(create_uav(device,texture,&invalid,&uav)==S_OK && uav,
+                      "partial volume UAV accepts the reference depth range");
+                if(uav)reinterpret_cast<Count>(vt(uav)[2])(uav);
                 using CreateSrv = HRESULT (STDMETHODCALLTYPE*)(void*, void*, const D3D11_SHADER_RESOURCE_VIEW_DESC*, void**);
                 void* view = nullptr;
                 check(reinterpret_cast<CreateSrv>(vt(device)[7])(device, texture, nullptr, &view) == S_OK && view,
@@ -2121,11 +3899,168 @@ int main(int argc, char** argv) {
                     for (UINT z=0;z<16;++z) for (UINT y=0;y<16;++y)
                         exact=exact && !std::memcmp(linear.data()+(z*16+y)*64,volume_source.data()+z*volume_slice+y*volume_pitch,64);
                     check(exact && volume_source==original_volume_source,"volume initialization preserves every depth slice and source padding");
+                    void* destination=nullptr;void* copied_view=nullptr;
+                    check(create_volume(device,&volume_desc,nullptr,&destination)==S_OK && destination,"CopyResource creates a matching volume texture");
+                    if(destination) {
+                        check(reinterpret_cast<CreateSrv>(vt(device)[7])(device,destination,nullptr,&copied_view)==S_OK && copied_view,"volume copy retains its native texture3D view");
+                        if(copied_view) {
+                            void* copied=nullptr;std::memcpy(&copied,static_cast<BYTE*>(copied_view)+80,sizeof copied);
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,void*)>(vt(context)[47])(context,destination,texture);
+                            bool matches=pixels.copy(pixels.context.get(),false,linear.data(),copied,0,64,16*64,nullptr)==S_OK;
+                            for(UINT z=0;z<16;++z)for(UINT y=0;y<16;++y)matches=matches && !std::memcmp(linear.data()+(z*16+y)*64,volume_source.data()+z*volume_slice+y*volume_pitch,64);
+                            check(matches,"native CopyResource preserves all texels and depth slices of a packed volume");
+                            const D3D11_BOX box{2,3,4,5,6,7};auto expected=linear;
+                            for(UINT z=0;z<3;++z)for(UINT y=0;y<3;++y)std::memcpy(expected.data()+((z+9)*16+y+8)*64+7*4,volume_source.data()+(z+4)*volume_slice+(y+3)*volume_pitch+2*4,12);
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,UINT,UINT,UINT,UINT,void*,UINT,const D3D11_BOX*)>(vt(context)[46])(context,destination,0,7,8,9,texture,0,&box);
+                            check(pixels.copy(pixels.context.get(),false,linear.data(),copied,0,64,16*64,nullptr)==S_OK && linear==expected,
+                                "3D region copy preserves the selected volume box, nonzero destination XYZ and all surrounding texels");
+                            reinterpret_cast<Count>(vt(copied_view)[2])(copied_view);
+                        }
+                        reinterpret_cast<Count>(vt(destination)[2])(destination);
+                    }
                     check(reinterpret_cast<Count>(vt(texture)[2])(texture) == 1, "volume view retains its storage after caller release");
                     texture = nullptr;
                     reinterpret_cast<Count>(vt(view)[2])(view);
                 }
                 if (texture) reinterpret_cast<Count>(vt(texture)[2])(texture);
+            }
+            if(graphics) {
+                NativeUavClear native;
+                if(FAILED(native.initialize(argc==5)))return 1;
+                struct ClearFormat {DXGI_FORMAT format;UINT bytes;bool snorm=false;};
+                const ClearFormat clear_formats[]{{DXGI_FORMAT_R8_UNORM,1},{DXGI_FORMAT_R8_UINT,1},{DXGI_FORMAT_R16_UNORM,2},
+                    {DXGI_FORMAT_R8G8B8A8_UNORM,4},{DXGI_FORMAT_R11G11B10_FLOAT,4},{DXGI_FORMAT_R16G16B16A16_FLOAT,8},
+                    {DXGI_FORMAT_R32_FLOAT,4},{DXGI_FORMAT_R32_UINT,4},{DXGI_FORMAT_R10G10B10A2_UNORM,4},
+                    {DXGI_FORMAT_R8_SNORM,1,true},{DXGI_FORMAT_R8G8_SNORM,2,true},{DXGI_FORMAT_R8G8B8A8_SNORM,4,true},
+                    {DXGI_FORMAT_R16_SNORM,2,true},{DXGI_FORMAT_R16G16_SNORM,4,true},{DXGI_FORMAT_R16G16B16A16_SNORM,8,true}};
+                for(const auto& item:clear_formats)for(const bool alias:{false,true})for(const UINT operation:{51u,52u}) {
+                    if(alias && item.format!=DXGI_FORMAT_R8_SNORM && item.format!=DXGI_FORMAT_R10G10B10A2_UNORM)continue;
+                    Desc desc{};desc.standard={32,16,1,1,item.format,{1,0},D3D11_USAGE_DEFAULT,D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS,0,0};
+                    if(alias)desc.standard.Format=item.format==DXGI_FORMAT_R8_SNORM ? DXGI_FORMAT_R8_TYPELESS:DXGI_FORMAT_R10G10B10A2_TYPELESS;
+                    if(item.snorm)desc.standard.BindFlags|=D3D11_BIND_RENDER_TARGET;
+                    void* resource=nullptr;void* view=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const Desc*,const D3D11_SUBRESOURCE_DATA*,void**)>(vt(device)[5])(device,&desc,nullptr,&resource)==S_OK && resource,"typed texture clear creates a UAV-capable original layout");if(!resource)return 1;
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC uav_desc{};uav_desc.Format=item.format;uav_desc.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE2D;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8])(device,resource,alias ? &uav_desc:nullptr,&view)==S_OK && view,"typed texture clear creates its matching native view");if(!view)return 1;
+                    if(item.snorm) {
+                        D3D11_SHADER_RESOURCE_VIEW_DESC read{};read.Format=item.format;read.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;read.Texture2D.MipLevels=1;
+                        void* srv=nullptr;
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**)>(vt(device)[7])(device,resource,&read,&srv)==S_OK && srv,"SNORM texture owns a native signed-normalized SRV");if(!srv)return 1;
+                        D3D11_SHADER_RESOURCE_VIEW_DESC queried{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_SHADER_RESOURCE_VIEW_DESC*)>(vt(srv)[9])(srv,&queried);
+                        check(queried.Format==item.format && queried.ViewDimension==read.ViewDimension,"SNORM SRV preserves the requested numeric format");
+                        reinterpret_cast<Count>(vt(srv)[2])(srv);
+                        if(alias) {
+                            auto invalid=uav_desc;invalid.Format=DXGI_FORMAT_R16_SNORM;void* rejected=nullptr;
+                            check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8])(device,resource,&invalid,&rejected)==DXGI_ERROR_UNSUPPORTED && !rejected,"SNORM alias refuses a different storage family");
+                        }
+                    }
+                    TitleTextureLayout pixels;
+                    if(FAILED(create_xg_texture_layout(32,16,1,1,desc.standard.Format,UINT_MAX,pixels,desc.standard.BindFlags)))return 1;
+                    BYTE* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);
+                    std::array<UINT,4> values=operation==51 ? std::array<UINT,4>{0x61,0x12,0x34,0x56}:std::array<UINT,4>{0x40900061,0x3e800000,0x3f000000,0x3f800000};
+                    std::vector<BYTE> expected,actual(32*16*item.bytes);
+                    if(FAILED(native.texture(pixels.resource_desc,item.format,item.bytes,values,operation==52,expected)))return 1;
+                    const auto verify=[&] {check(pixels.copy(pixels.context.get(),false,actual.data(),canonical,0,32*item.bytes,512*item.bytes,nullptr)==S_OK && actual==expected,"typed texture clear preserves every native reference pixel");};
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(context)[operation])(context,view,values.data());verify();
+                    if(item.snorm) {
+                        const auto saved=expected;const FLOAT inf=std::numeric_limits<FLOAT>::infinity(),nan=std::numeric_limits<FLOAT>::quiet_NaN();
+                        for(const FLOAT probe:{-inf,-2.f,-1.f,-.5f,-.25f,-0.f,0.f,.25f,.5f,1.f,2.f,inf,nan}) {
+                            UINT bits=0;std::memcpy(&bits,&probe,4);const std::array<UINT,4> words{bits,bits,bits,bits};
+                            if(FAILED(native.texture(pixels.resource_desc,item.format,item.bytes,words,operation==52,expected)))return 1;
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(context)[operation])(context,view,words.data());verify();
+                        }
+                        expected=saved;
+                    }
+                    if(item.snorm && operation==52) {
+                        const auto saved=expected;const std::array<UINT,4> words{0xbf000000,0xbe800000,0x3f000000,0x3f800000};
+                        if(FAILED(native.texture(pixels.resource_desc,item.format,item.bytes,words,true,expected,true)))return 1;
+                        D3D11_RENDER_TARGET_VIEW_DESC target{};target.Format=item.format;target.ViewDimension=D3D11_RTV_DIMENSION_TEXTURE2D;
+                        void* rtv=nullptr;
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_RENDER_TARGET_VIEW_DESC*,void**)>(vt(device)[9])(device,resource,&target,&rtv)==S_OK && rtv,"SNORM storage retains a native RTV alongside its UAV and SRV");if(!rtv)return 1;
+                        FLOAT color[4];std::memcpy(color,words.data(),sizeof color);
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const FLOAT*)>(vt(context)[50])(context,rtv,color);verify();
+                        reinterpret_cast<Count>(vt(rtv)[2])(rtv);expected=saved;
+                    }
+                    std::memset(canonical,0x5a,pixels.bytes);
+                    void* producer=nullptr;void* list=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**)>(vt(device)[27])(device,0,&producer)==S_OK && producer,"typed texture clear creates a deferred producer");if(!producer)return 1;
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,const UINT*)>(vt(producer)[operation])(producer,view,values.data());values.fill(0);
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**)>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list &&
+                        std::all_of(canonical,canonical+pixels.bytes,[](BYTE value){return value==0x5a;}),"typed texture clear captures values and operation without execution");
+                    reinterpret_cast<Count>(vt(producer)[2])(producer);reinterpret_cast<Count>(vt(view)[2])(view);reinterpret_cast<Count>(vt(resource)[2])(resource);if(!list)return 1;
+                    for(UINT pass=0;pass<2;++pass){std::memset(canonical,0x5a,pixels.bytes);reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,FALSE);verify();}
+                    reinterpret_cast<Count>(vt(list)[2])(list);
+                }
+                using ClearVolume=void(STDMETHODCALLTYPE*)(void*,void*,const UINT*);
+                for(const auto& item:clear_formats)for(const bool alias:{false,true}) {
+                if((!item.snorm && item.format!=volume_desc.standard.Format) ||
+                    (alias && item.format!=DXGI_FORMAT_R8_SNORM && item.format!=DXGI_FORMAT_R10G10B10A2_UNORM))continue;
+                for(const UINT levels:{1u,3u})for(UINT selected_mip=0;selected_mip<levels;++selected_mip)for(const UINT operation:{51u,52u})for(UINT range=0;range<4;++range) {
+                    auto desc=volume_desc;desc.standard.MipLevels=levels;
+                    desc.standard.Format=alias ? (item.format==DXGI_FORMAT_R8_SNORM ? DXGI_FORMAT_R8_TYPELESS:DXGI_FORMAT_R10G10B10A2_TYPELESS):item.format;
+                    const UINT size=16>>selected_mip;
+                    TitleTextureLayout layout,control;
+                    if(FAILED(create_xg_texture3d_layout(16,16,16,levels,desc.standard.Format,desc.standard.BindFlags,layout)) ||
+                        FAILED(create_xg_texture3d_layout(size,size,size,1,desc.standard.Format,desc.standard.BindFlags,control)))return 1;
+                    void* resource=nullptr;void* view=nullptr;
+                    check(create_volume(device,&desc,nullptr,&resource)==S_OK && resource,"volume clear creates a fresh native 3D resource");if(!resource)return 1;
+                    if(!alias) {
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8])(device,resource,nullptr,&view)==S_OK && view,"volume clear retains a full-depth UAV");if(!view)return 1;
+                        reinterpret_cast<Count>(vt(view)[2])(view);view=nullptr;
+                    }
+                    const auto create=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8]);
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC selected{};selected.Format=item.format;selected.ViewDimension=D3D11_UAV_DIMENSION_TEXTURE3D;
+                    const UINT first=range>=2 ? 1:0,count=range>=2 ? (range&1 ? size-first:size-2):size;
+                    selected.Texture3D.MipSlice=selected_mip;selected.Texture3D.FirstWSlice=first;selected.Texture3D.WSize=range&1 ? UINT_MAX:count;
+                    check(create(device,resource,&selected,&view)==S_OK && view,"3D UAV selects the requested mip and depth range");if(!view)return 1;
+                    if(alias && range==0 && operation==51) {
+                        D3D11_SHADER_RESOURCE_VIEW_DESC read{};read.Format=item.format;read.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE3D;read.Texture3D.MostDetailedMip=selected_mip;read.Texture3D.MipLevels=1;
+                        void* srv=nullptr;
+                        check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_SHADER_RESOURCE_VIEW_DESC*,void**)>(vt(device)[7])(device,resource,&read,&srv)==S_OK && srv,"typeless volume retains its requested numeric SRV alias");if(!srv)return 1;
+                        reinterpret_cast<Count>(vt(srv)[2])(srv);
+                    }
+                    D3D11_UNORDERED_ACCESS_VIEW_DESC queried{};
+                    reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_UNORDERED_ACCESS_VIEW_DESC*)>(vt(view)[9])(view,&queried);
+                    check(!std::memcmp(&selected,&queried,sizeof selected),"3D UAV preserves the requested mip and depth sentinel in GetDesc");
+                    auto invalid=selected;invalid.Texture3D.WSize=size+1;void* rejected=nullptr;
+                    check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"3D UAV validates depth against the selected mip");
+                    invalid=selected;invalid.Texture3D.FirstWSlice=size;
+                    check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"3D UAV rejects a first slice outside the selected mip");
+                    invalid=selected;invalid.Texture3D.MipSlice=levels;
+                    check(create(device,resource,&invalid,&rejected)==E_INVALIDARG && !rejected,"3D UAV rejects a nonexistent mip");
+                    BYTE* canonical=nullptr;std::memcpy(&canonical,static_cast<BYTE*>(view)+80,sizeof canonical);
+                    std::array<UINT,4> values=operation==51 ? std::array<UINT,4>{0x61,0x12,0x34,0x56}:std::array<UINT,4>{0x40900061,0x3e800000,0x3f000000,0x3f800000};
+                    if(item.snorm && operation==52)values={0xbf000000,0xbe800000,0x3f000000,0x3f800000};
+                    std::vector<BYTE> expected;
+                    if(FAILED(native.texture(control.resource_desc,item.format,item.bytes,values,operation==52,expected)))return 1;
+                    const auto verify=[&] {
+                        for(UINT mip=0;mip<levels;++mip) {
+                            const UINT width=16>>mip;std::vector<BYTE> actual(width*width*width*item.bytes);
+                            bool exact=layout.copy(layout.context.get(),false,actual.data(),canonical,mip,width*item.bytes,width*width*item.bytes,nullptr)==S_OK;
+                            const SIZE_T slice=SIZE_T(width)*width*item.bytes;
+                            for(UINT z=0;z<width;++z) {
+                                const auto begin=actual.begin()+z*slice,end=begin+slice;
+                                exact=exact && (mip==selected_mip && z>=first && z<first+count ?
+                                    std::equal(begin,end,expected.begin()+z*slice):std::all_of(begin,end,[](BYTE value){return value==0x5a;}));
+                            }
+                            check(exact,"3D Uint/Float clear matches native pixels in selected slices and preserves every other mip and slice");
+                        }
+                    };
+                    std::memset(canonical,0x5a,layout.bytes);
+                    reinterpret_cast<ClearVolume>(vt(context)[operation])(context,view,values.data());verify();
+                    std::memset(canonical,0x5a,layout.bytes);
+                    void* producer=nullptr;void* list=nullptr;
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,UINT,void**)>(vt(device)[27])(device,0,&producer)==S_OK && producer,"volume clear creates a deferred producer");if(!producer)return 1;
+                    reinterpret_cast<ClearVolume>(vt(producer)[operation])(producer,view,values.data());values.fill(0);
+                    check(reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,BOOL,void**)>(vt(producer)[114])(producer,FALSE,&list)==S_OK && list &&
+                        std::all_of(canonical,canonical+layout.bytes,[](BYTE value){return value==0x5a;}),"3D clear recording captures values without executing");
+                    reinterpret_cast<Count>(vt(producer)[2])(producer);reinterpret_cast<Count>(vt(view)[2])(view);reinterpret_cast<Count>(vt(resource)[2])(resource);if(!list)return 1;
+                    for(UINT pass=0;pass<2;++pass) {
+                        std::memset(canonical,0x5a,layout.bytes);reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*,BOOL)>(vt(context)[58])(context,list,FALSE);verify();
+                    }
+                    reinterpret_cast<Count>(vt(list)[2])(list);
+                }
+                }
             }
             volume_initial.SysMemSlicePitch=1;
             check(create_volume(device,&volume_desc,&volume_initial,&texture)==E_INVALIDARG && !texture,
@@ -2210,6 +4145,40 @@ int main(int argc, char** argv) {
                             for (UINT sample = 0; sample < actual.standard.SampleDesc.Count; ++sample) identity |= sample << (2 * sample);
                             check(SUCCEEDED(mask_hr) && std::all_of(values.begin(), values.end(), [identity](auto x) { return x == identity; }),
                                   "FMASK bytes map each of the four backed samples to its actual independent fragment");
+                            const HMODULE compiler=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+                            const auto compile=compiler?reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler,"D3DCompile")):nullptr;
+                            ID3DBlob* code=nullptr;ID3DBlob* compiler_errors=nullptr;
+                            constexpr char shader_source[]="Texture2D<uint> mask:register(t0);RWStructuredBuffer<uint> output:register(u0);"
+                                "[numthreads(1,1,1)]void main(){output[0]=mask.Load(int3(0,0,0));}";
+                            void* shader=nullptr;void* output=nullptr;void* uav=nullptr;
+                            HRESULT sample_hr=compile?compile(shader_source,sizeof shader_source-1,nullptr,nullptr,nullptr,"main","cs_5_0",0,0,&code,&compiler_errors):E_NOINTERFACE;
+                            if(SUCCEEDED(sample_hr))sample_hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const void*,SIZE_T,void*,void**)>(vt(device)[18])(
+                                device,code->GetBufferPointer(),code->GetBufferSize(),nullptr,&shader);
+                            struct MaskBufferDesc {D3D11_BUFFER_DESC standard;UINT64 extension;} output_desc{};
+                            output_desc.standard.ByteWidth=16;output_desc.standard.BindFlags=D3D11_BIND_UNORDERED_ACCESS;
+                            output_desc.standard.MiscFlags=D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;output_desc.standard.StructureByteStride=4;
+                            const UINT zeros[4]{};D3D11_SUBRESOURCE_DATA initial{zeros,0,0};
+                            if(SUCCEEDED(sample_hr))sample_hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,const MaskBufferDesc*,const D3D11_SUBRESOURCE_DATA*,void**)>(vt(device)[3])(
+                                device,&output_desc,&initial,&output);
+                            D3D11_UNORDERED_ACCESS_VIEW_DESC out_view{};out_view.ViewDimension=D3D11_UAV_DIMENSION_BUFFER;out_view.Buffer.NumElements=4;
+                            if(SUCCEEDED(sample_hr))sample_hr=reinterpret_cast<HRESULT(STDMETHODCALLTYPE*)(void*,void*,const D3D11_UNORDERED_ACCESS_VIEW_DESC*,void**)>(vt(device)[8])(
+                                device,output,&out_view,&uav);
+                            if(SUCCEEDED(sample_hr)) {
+                                using Bind=void(STDMETHODCALLTYPE*)(void*,UINT,UINT,void* const*);
+                                const auto set_shader=reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,void*)>(vt(context)[69]);
+                                set_shader(context,shader);reinterpret_cast<Bind>(vt(context)[67])(context,0,1,&srv);reinterpret_cast<Bind>(vt(context)[68])(context,0,1,&uav);
+                                reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,UINT,UINT)>(vt(context)[41])(context,1,1,1);
+                                void* result=nullptr;std::memcpy(&result,static_cast<BYTE*>(output)+48,sizeof result);
+                                UINT sampled=0;SIZE_T read=0;
+                                check(result && ReadProcessMemory(GetCurrentProcess(),result,&sampled,sizeof sampled,&read) && read==sizeof sampled && sampled==identity,
+                                      "native compute samples the FMASK view's actual GPU texture, not only its canonical CPU bytes");
+                                void* empty=nullptr;reinterpret_cast<Bind>(vt(context)[67])(context,0,1,&empty);reinterpret_cast<Bind>(vt(context)[68])(context,0,1,&empty);set_shader(context,nullptr);
+                            }
+                            check(SUCCEEDED(sample_hr),"owned FMASK GPU sampling fixture creates real shader and UAV resources");
+                            if(FAILED(sample_hr))std::cerr<<"FMASK fixture HRESULT 0x"<<std::hex<<sample_hr<<std::dec<<'\n';
+                            if(compiler_errors){if(FAILED(sample_hr))std::cerr<<static_cast<const char*>(compiler_errors->GetBufferPointer());compiler_errors->Release();}
+                            for(void* object:{uav,output,shader})if(object)reinterpret_cast<Count>(vt(object)[2])(object);
+                            if(code)code->Release();if(compiler)FreeLibrary(compiler);
                             reinterpret_cast<Count>(vt(srv)[2])(srv);
                         }
                     }
@@ -2218,8 +4187,10 @@ int main(int argc, char** argv) {
                     void* view = nullptr;
                     D3D11_RENDER_TARGET_VIEW_DESC invalid{};
                     invalid.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D; invalid.Texture2D.MipSlice = 1;
-                    check(create_rtv(device, texture, &invalid, &view) == (multisample ? DXGI_ERROR_UNSUPPORTED : E_INVALIDARG) && !view,
-                          "render-target view rejects a missing mip or incompatible sample dimension");
+                    check(create_rtv(device,texture,&invalid,&view)==(multisample ? DXGI_ERROR_UNSUPPORTED:S_OK) && (multisample ? !view:view!=nullptr),
+                          "legacy RTV clamps its native mip like reference 14047ced0 and rejects incompatible sample dimensions");
+                    if(view){D3D11_RENDER_TARGET_VIEW_DESC actual{};reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,D3D11_RENDER_TARGET_VIEW_DESC*)>(vt(view)[9])(view,&actual);
+                        check(actual.Texture2D.MipSlice==1,"legacy RTV GetDesc preserves the requested mip before native clamping");reinterpret_cast<Count>(vt(view)[2])(view);view=nullptr;}
                     check(create_rtv(device, texture, nullptr, nullptr) == S_FALSE,
                           "default render-target view validates without acquiring references");
                     check(create_rtv(device, texture, nullptr, &view) == S_OK && view,
@@ -2447,7 +4418,7 @@ int main(int argc, char** argv) {
                 auto tls_module = read(argv[2]);
                 const auto tls_dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(tls_module.data());
                 reinterpret_cast<IMAGE_NT_HEADERS64*>(tls_module.data() + tls_dos->e_lfanew)->FileHeader.Characteristics |= IMAGE_FILE_DLL;
-                check(!rejected.load(tls_module, resolve_kernelx, module_result, ImageKind::module), "module TLS cannot reuse the title's single static slot");
+                check(rejected.load(tls_module, resolve_kernelx, module_result, ImageKind::module), "module TLS uses a separate slot after the title slot retired");
                 check(module_handle && module_handle(nullptr) == reinterpret_cast<HMODULE>(image.base()), "failed module validation preserves title identity");
             }
         }
@@ -2482,6 +4453,27 @@ int main(int argc, char** argv) {
         const auto lfanew = *reinterpret_cast<const LONG*>(wrong.data() + 0x3c);
         wrong[lfanew + 4] = 0x4c; wrong[lfanew + 5] = 0x01; // IMAGE_FILE_MACHINE_I386
         check(!image.load(wrong, resolve_kernelx, result), "non-AMD64 image rejected");
+        for (DWORD size : {DWORD(1), DWORD(13)}) {
+            auto malformed = file;
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(malformed.data() + lfanew);
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size = size;
+            check(!image.load(malformed, resolve_kernelx, result) && !image.base() &&
+                std::find(result.errors.begin(), result.errors.end(), "invalid unwind directory") != result.errors.end(),
+                "incomplete unwind records are refused before registration");
+        }
+        auto padded = file;
+        auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(padded.data() + lfanew);
+        auto* sections = reinterpret_cast<IMAGE_SECTION_HEADER*>(reinterpret_cast<unsigned char*>(&nt->OptionalHeader) +
+            nt->FileHeader.SizeOfOptionalHeader);
+        auto& section = sections[0];
+        check(section.SizeOfRawData > 1, "fixture has file-backed section padding");
+        if (section.SizeOfRawData > 1) {
+            section.Misc.VirtualSize = 1;
+            padded[section.PointerToRawData + section.SizeOfRawData - 1] = 0x5a;
+            check(image.load(padded, resolve_kernelx, result), "section raw bytes beyond VirtualSize map as in the reference");
+            check(image.base() && image.base()[section.VirtualAddress + section.SizeOfRawData - 1] == 0x5a,
+                "the full file-backed section survives mapping");
+        }
     }
     check(resolve_kernelx({"KERNELX.DLL", "GetTickCount64", 0}) != nullptr, "library name is case-insensitive");
     check(resolve_kernelx({"kernelx.dll", "AllocateTitlePhysicalPages", 0}) == nullptr,
@@ -3309,9 +5301,9 @@ int main(int argc, char** argv) {
                         using GetX = void (STDMETHODCALLTYPE*)(void*, UINT32*);
                         std::array<UINT32, 5> packed{0, 0, 0, 0, 0x12345678};
                         reinterpret_cast<GetX>(vt(sampler)[9])(sampler, packed.data());
-                        check(packed[0] == 0x3088 && packed[1] == 0xfff020 && packed[2] == 0x74003ee0 && !packed[3] && packed[4] == 0x12345678,
+                        check(packed[0] == 0x3088 && packed[1] == 0xfff020 && packed[2] == 0x74003ee0 && (packed[3]&0x3fffffff) && !(packed[3]>>30) && packed[4] == 0x12345678,
                               "sampler GCN words encode address, negative bias and fixed LOD; GetDescX writes exactly sixteen bytes");
-                        check(!std::memcmp(static_cast<char*>(sampler) + 32, packed.data(), 16), "inline sampler SRD matches GetDescX");
+                        check(!std::memcmp(static_cast<char*>(sampler) + 32, packed.data(), 12), "issued sampler keeps the native inline SRD words");
                         using GetDesc = void (STDMETHODCALLTYPE*)(void*, D3D12_SAMPLER_DESC*);
                         D3D12_SAMPLER_DESC actual{};
                         reinterpret_cast<GetDesc>(vt(sampler)[8])(sampler, &actual);
@@ -3363,13 +5355,47 @@ int main(int argc, char** argv) {
                             std::array<UINT32,4> words{};
                             using GetX = void(STDMETHODCALLTYPE*)(void*,UINT32*);
                             reinterpret_cast<GetX>(vt(sampler)[9])(sampler,words.data());
-                            check(words[3] == (border << 30),"sampler SRD retains the standard border color type");
+                            check((words[3]>>30)==border && (words[3]&0x3fffffff),"issued sampler descriptor retains the standard border color type and palette index");
                             using GetDesc = void(STDMETHODCALLTYPE*)(void*,D3D12_SAMPLER_DESC*);
                             D3D12_SAMPLER_DESC actual{};
                             reinterpret_cast<GetDesc>(vt(sampler)[8])(sampler,&actual);
                             check(!std::memcmp(actual.BorderColor,desc.BorderColor,sizeof desc.BorderColor),"sampler GetDesc preserves all border channels");
                             reinterpret_cast<Count>(vt(sampler)[2])(sampler);
                         }
+                    }
+                    {
+                        using GetX=void(STDMETHODCALLTYPE*)(void*,UINT32*);
+                        using GetDesc=void(STDMETHODCALLTYPE*)(void*,D3D12_SAMPLER_DESC*);
+                        using CreateX=HRESULT(STDMETHODCALLTYPE*)(void*,const UINT32*,void**);
+                        const auto create_x=reinterpret_cast<CreateX>(vt(device)[67]);
+                        std::array<UINT32,4> issued{},returned{};
+                        check(factory(device,&desc,&sampler)==S_OK && sampler,"sampler issued-descriptor producer created");
+                        if(!sampler)return 1;
+                        reinterpret_cast<GetX>(vt(sampler)[9])(sampler,issued.data());
+                        reinterpret_cast<Count>(vt(sampler)[2])(sampler);sampler=nullptr;
+                        check(create_x(device,nullptr,&sampler)==E_INVALIDARG && !sampler,"CreateSamplerStateX requires an input descriptor");
+                        check(create_x(device,issued.data(),nullptr)==S_FALSE,"issued sampler validation shares the ordinary creation path");
+                        for(UINT border=0;border<4;++border) {
+                            auto changed=issued;changed[3]=(changed[3]&0x3fffffffu)|(border<<30);
+                            check(create_x(device,changed.data(),&sampler)==S_OK && sampler,"issued descriptor survives release and permits each border-color type");
+                            if(!sampler)return 1;
+                            reinterpret_cast<GetX>(vt(sampler)[9])(sampler,returned.data());
+                            D3D12_SAMPLER_DESC actual{};reinterpret_cast<GetDesc>(vt(sampler)[8])(sampler,&actual);
+                            auto expected=desc;
+                            if(border<3)for(UINT channel=0;channel<4;++channel)expected.BorderColor[channel]=border==2 || (border==1 && channel==3) ? 1.f:0.f;
+                            check(returned==changed && !std::memcmp(&actual,&expected,sizeof actual),"CreateSamplerStateX preserves issued words and changes only the requested border type");
+                            void* duplicate=nullptr;
+                            check(create_x(device,changed.data(),&duplicate)==S_OK && duplicate==sampler && refs(sampler)==2,"extended sampler interning retains exact descriptor identity");
+                            if(duplicate)reinterpret_cast<Count>(vt(duplicate)[2])(duplicate);
+                            reinterpret_cast<Count>(vt(sampler)[2])(sampler);sampler=nullptr;
+                        }
+                        static UINT rejected_sampler_slot=0;
+                        set_d3d11x_trap_handler([](const char*,UINT slot)->std::uintptr_t{rejected_sampler_slot=slot;return 0x80070057u;});
+                        auto invalid=issued;invalid[0]^=1;
+                        check(create_x(device,invalid.data(),&sampler)==E_INVALIDARG && !sampler && rejected_sampler_slot==67,"altering issued sampler fields reaches the explicit unsupported boundary");
+                        rejected_sampler_slot=0;invalid=issued;invalid[3]&=0xc0000000u;
+                        check(create_x(device,invalid.data(),&sampler)==E_INVALIDARG && !sampler && rejected_sampler_slot==67,"unissued raw sampler descriptors are not accepted as issued tokens");
+                        set_d3d11x_trap_handler(nullptr);
                     }
                     for (float& channel : desc.BorderColor) channel = 0;
                     desc.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT; desc.BorderColor[0] = 1;
@@ -3636,8 +5662,8 @@ int main(int argc, char** argv) {
                         using State = UINT (STDMETHODCALLTYPE*)(void*);
                         const auto data = static_cast<unsigned char*>(deferred);
                         check((reinterpret_cast<std::uintptr_t>(deferred) & 63) == 0 &&
-                              reinterpret_cast<const void*>(vt(deferred)) == data + 0x3d0 && data[0x390] == 1,
-                              "old context contains its inline function table and out-of-line dispatch marker");
+                              reinterpret_cast<const void*>(vt(deferred)) == data + 0x3d0 && data[0x390] == 3,
+                              "old context contains its inline function table and both reference out-of-line dispatch flags");
                         check(reinterpret_cast<State>(vt(deferred)[112])(deferred) == 1 &&
                               reinterpret_cast<State>(vt(deferred)[113])(deferred) == flags,
                               "deferred type and creation flags match the requested contract");
@@ -3647,6 +5673,11 @@ int main(int argc, char** argv) {
                         std::memcpy(data + 0x168, &dirty, sizeof dirty);
                         std::memcpy(data + 0x218, &shader_flags, sizeof shader_flags);
                         using Shader = void (STDMETHODCALLTYPE*)(void*, void*);
+                        reinterpret_cast<Shader>(vt(deferred)[64])(deferred, nullptr);
+                        std::memcpy(&domain,data+0x1c8,8);std::memcpy(&dirty,data+0x168,4);std::memcpy(&shader_flags,data+0x218,8);
+                        check(domain==0x1234 && dirty==0x80 && shader_flags==0x100,
+                              "reference out-of-line null stage leaves caller inline caches and dirty bits untouched");
+                        data[0x390]=1;
                         reinterpret_cast<Shader>(vt(deferred)[64])(deferred, nullptr);
                         std::memcpy(&domain, data + 0x1c8, sizeof domain);
                         std::memcpy(&dirty, data + 0x168, sizeof dirty);
@@ -3669,6 +5700,7 @@ int main(int argc, char** argv) {
                         std::memcpy(&shader_flags, data + 0x218, sizeof shader_flags);
                         check(!geometry[0] && !geometry[1] && dirty == 0x3e80 && shader_flags == 0x10e,
                               "geometry unbind clears both native shader-data bindings without losing tessellation state");
+                        data[0x390]=3;
                         const UINT64 pipeline[]={0x1234,0x5678,0x9abc,0xdef0,0x1357,0x2468};
                         std::memcpy(data+0x180,pipeline,16);
                         std::memcpy(data+0x1c0,pipeline+2,32);
@@ -3689,14 +5721,14 @@ int main(int argc, char** argv) {
                         std::memcpy(&condition_flags,data+0x1f8,1);std::memcpy(&cleared_hash,data+0x1e4,4);
                         check(std::all_of(std::begin(observed),std::end(observed),[](auto x){return !x;}) && !condition && !cleared_hash && condition_flags==0x81,
                               "ClearState resets public shader bindings, blend key and predication with original flag semantics");
-                        check(dirty==0x42bfb0 && shader_flags==0x1004c00002eull && guard==unrelated && vt(deferred)==table && data[0x390]==1 &&
+                        check(dirty==0x42bfb0 && shader_flags==0x1004c00002eull && guard==unrelated && vt(deferred)==table && data[0x390]==3 &&
                               reinterpret_cast<State>(table[112])(deferred)==1 && reinterpret_cast<State>(table[113])(deferred)==flags,
                               "ClearState preserves unrelated public state, dispatch, type and creation flags while marking native dirty fields");
                         const UINT64 vertex_marker=0x398,pixel_marker=0x400;
                         std::memcpy(data+0x180,&vertex_marker,8);std::memcpy(data+0x188,&pixel_marker,8);
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(table[110])(deferred);
                         std::memcpy(observed,data+0x180,16);
-                        check(observed[0]==vertex_marker && observed[1]==pixel_marker && data[0x390]==1,
+                        check(observed[0]==vertex_marker && observed[1]==pixel_marker && data[0x390]==3,
                               "ClearState preserves the original special shader markers and out-of-line dispatch");
                         using Finish = HRESULT (STDMETHODCALLTYPE*)(void*, BOOL, void**);
                         using Execute = void (STDMETHODCALLTYPE*)(void*,void*,BOOL);
@@ -3729,12 +5761,34 @@ int main(int argc, char** argv) {
                               "11295 immediate FinishCommandList preserves the original error and untouched output");
                         static unsigned command_slot=0;
                         set_d3d11x_trap_handler([](const char*,unsigned slot)->std::uintptr_t {command_slot=slot;return E_NOTIMPL;});
+                        for(const UINT profile:{0x400000u,0x80c00000u}) {
+                            command_slot=0;
+                            const auto flush=reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(context)[152]);
+                            flush(context,profile,nullptr,0);
+                            check(!command_slot,"reference immediate global cache profiles validate without a GPU barrier");
+                            reinterpret_cast<decltype(flush)>(vt(deferred)[152])(deferred,profile,nullptr,0);
+                            check(!command_slot,"reference deferred global cache profiles record their barrier");
+                            void* cache_list=nullptr;
+                            check(finish(deferred,FALSE,&cache_list)==S_OK && cache_list,"accepted cache profiles produce a complete deferred list");
+                            if(cache_list) {execute(context,cache_list,FALSE);execute(context,cache_list,TRUE);reinterpret_cast<Count>(vt(cache_list)[2])(cache_list);}
+                        }
+                        for(const UINT wait_flags:{1u,UINT_MAX}) for(void* target:{context,deferred}) {
+                            command_slot=0;
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(target)[153])(target,wait_flags);
+                            check(command_slot==153,"reference InsertWaitUntilIdle rejects nonzero flags on immediate and deferred contexts");
+                        }
                         execute(context,reinterpret_cast<void*>(1),FALSE);
                         check(command_slot==58,"ExecuteCommandList rejects unreadable list identity before submission");
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT)>(vt(deferred)[197])(deferred,0xffffffffu);
                         check(command_slot==197,"unknown GPU pipeline events stay explicitly unsupported");
-                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(deferred)[152])(deferred,0x400000,reinterpret_cast<void*>(1),16);
-                        check(command_slot==152,"unverified cache ranges stay explicitly unsupported");
+                        command_slot=0;
+                        reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(context)[152])(context,0,nullptr,0);
+                        check(command_slot==152,"cache flush rejects flags outside both reference profiles");
+                        for(const UINT profile:{0x400000u,0x80c00000u}) {
+                            command_slot=0;
+                            reinterpret_cast<void(STDMETHODCALLTYPE*)(void*,UINT,void*,SIZE_T)>(vt(deferred)[152])(deferred,profile,reinterpret_cast<void*>(1),16);
+                            check(command_slot==152,"both reference cache profiles reject non-global ranges");
+                        }
                         reinterpret_cast<void(STDMETHODCALLTYPE*)(void*)>(vt(deferred)[200])(deferred);
                         check(finish(deferred,FALSE,&invalid)==E_NOTIMPL && !invalid,
                               "unsupported deferred commands cannot produce a successful partial list");
@@ -4362,11 +6416,70 @@ int main(int argc, char** argv) {
                         first_offline_id=offline_id(item);
                         check(offline_id(item)==first_offline_id && reinterpret_cast<UserString>(it[15])(item,nullptr)==E_POINTER,
                               "offline identity is stable across calls and rejects a null output");
+                        using TokenHeaders=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING,HSTRING,HSTRING,void**);
+                        using TokenBytes=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING,HSTRING,HSTRING,UINT,const BYTE*,void**);
                         using Token=HRESULT(STDMETHODCALLTYPE*)(void*,HSTRING,HSTRING,HSTRING,HSTRING,void**);
-                        void* authentication=reinterpret_cast<void*>(1);
-                        check(reinterpret_cast<Token>(it[18])(item,nullptr,nullptr,nullptr,nullptr,&authentication)==HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED) && !authentication &&
-                              reinterpret_cast<Token>(it[18])(item,nullptr,nullptr,nullptr,nullptr,nullptr)==E_POINTER,
-                              "offline token request reports no connection without fabricating authentication or an operation");
+                        using PutCompleted=HRESULT(STDMETHODCALLTYPE*)(void*,IUnknown*);
+                        using GetResults=HRESULT(STDMETHODCALLTYPE*)(void*,void**);
+                        struct TokenHandler : IUnknown {
+                            ULONG refs=1;UINT calls=0;INT32 status=-1;bool drop_operation=false;
+                            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid,void** out) override {
+                                if(!out)return E_POINTER;*out=nullptr;if(iid!=__uuidof(IUnknown))return E_NOINTERFACE;*out=this;AddRef();return S_OK;
+                            }
+                            ULONG STDMETHODCALLTYPE AddRef() override{return ++refs;}
+                            ULONG STDMETHODCALLTYPE Release() override{return --refs;}
+                            virtual HRESULT STDMETHODCALLTYPE Invoke(IUnknown* operation,INT32 value) {
+                                ++calls;status=value;if(drop_operation)operation->Release();return S_OK;
+                            }
+                        };
+                        constexpr GUID token_iid{0xe6c6e9b1,0x363d,0x54fe,{0x80,0x8b,0x89,0xda,0x6b,0xcf,0x78,0xbf}};
+                        for(UINT slot:{16u,17u,18u}) {
+                            const auto request=[&](void** out) {
+                                if(slot==16)return reinterpret_cast<TokenHeaders>(it[slot])(item,nullptr,nullptr,nullptr,out);
+                                if(slot==17)return reinterpret_cast<TokenBytes>(it[slot])(item,nullptr,nullptr,nullptr,0,nullptr,out);
+                                return reinterpret_cast<Token>(it[slot])(item,nullptr,nullptr,nullptr,nullptr,out);
+                            };
+                            struct {IInspectable* value=reinterpret_cast<IInspectable*>(1);UINT64 guard=0x123456789abcdef0;} authentication;
+                            check(request(nullptr)==E_POINTER && request(reinterpret_cast<void**>(&authentication.value))==S_OK &&
+                                  authentication.value && authentication.guard==0x123456789abcdef0,
+                                  "all original token overloads return owned asynchronous offline operations with intact ABI guards");
+                            auto* operation=authentication.value;if(!operation || operation==reinterpret_cast<IInspectable*>(1))continue;
+                            IInspectable* typed=nullptr;IAsyncInfo* info=nullptr;
+                            check(operation->QueryInterface(token_iid,reinterpret_cast<void**>(&typed))==S_OK && typed==operation,
+                                  "offline token operation answers the reference's parameterized IID");
+                            if(typed)typed->Release();
+                            check(operation->QueryInterface(__uuidof(IAsyncInfo),reinterpret_cast<void**>(&info))==S_OK && info,
+                                  "offline token operation exposes its real error status");
+                            const auto table=*reinterpret_cast<void***>(operation);TokenHandler completion;
+                            check(reinterpret_cast<PutCompleted>(table[6])(operation,&completion)==S_OK && completion.calls==1 && completion.status==3 && completion.refs==2,
+                                  "offline token completion immediately delivers Error instead of success or a fabricated token");
+                            check(reinterpret_cast<PutCompleted>(table[6])(operation,&completion)==E_ILLEGAL_DELEGATE_ASSIGNMENT && completion.calls==1,
+                                  "terminal operation rejects a second completion assignment");
+                            void* result=reinterpret_cast<void*>(1);
+                            check(reinterpret_cast<GetResults>(table[8])(operation,&result)==HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE) && !result,
+                                  "GetResults returns the reference network error and never an authentication result");
+                            if(info) {
+                                AsyncStatus status=Started;HRESULT error=S_OK;
+                                check(info->get_Status(&status)==S_OK && status==Error && info->get_ErrorCode(&error)==S_OK &&
+                                      error==HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE) && info->Cancel()==S_OK &&
+                                      info->get_Status(&status)==S_OK && status==Error,
+                                      "async error metadata and cancellation preserve the settled offline failure");
+                                check(info->Close()==S_OK && reinterpret_cast<GetResults>(table[8])(operation,&result)==E_ILLEGAL_METHOD_CALL && !result,
+                                      "closed token operations reject result access without producing a token");
+                                info->Release();
+                            }
+                            operation->Release();check(completion.refs==1,"offline operation retires its retained completion delegate");
+                        }
+                        void* invalid_body=reinterpret_cast<void*>(1);
+                        check(reinterpret_cast<TokenBytes>(it[17])(item,nullptr,nullptr,nullptr,1,nullptr,&invalid_body)==E_INVALIDARG && !invalid_body,
+                              "byte-array token overload rejects a missing nonempty body before creating an operation");
+                        IInspectable* reentrant=nullptr;
+                        if(reinterpret_cast<TokenHeaders>(it[16])(item,nullptr,nullptr,nullptr,reinterpret_cast<void**>(&reentrant))==S_OK && reentrant) {
+                            TokenHandler completion;completion.drop_operation=true;
+                            check(reinterpret_cast<PutCompleted>((*reinterpret_cast<void***>(reentrant))[6])(reentrant,&completion)==S_OK &&
+                                  completion.calls==1 && completion.refs==1,
+                                  "completion can release the caller's last operation reference safely during Invoke");
+                        } else check(false,"reentrant offline token fixture created");
                         IInspectable* display=nullptr;
                         check(reinterpret_cast<Users>(it[9])(item,reinterpret_cast<void**>(&display))==S_OK && display,
                               "User.DisplayInfo retains the same local profile owner");

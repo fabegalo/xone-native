@@ -84,7 +84,7 @@ void diagnose_callers(const CONTEXT& original) {
         for (UINT i=0;i<48 && context.Rip;++i) {
             if (context.Rip>=title_base && context.Rip<title_end) {
                 char line[96];
-                std::snprintf(line,sizeof line,"xone-era:   C++ caller title+0x%llX\n",context.Rip-title_base);
+                std::snprintf(line,sizeof line,"xone-era:   caller title+0x%llX\n",context.Rip-title_base);
                 report(line);
             }
             DWORD64 base=0;
@@ -98,7 +98,7 @@ void diagnose_callers(const CONTEXT& original) {
                 context.Rsp+=sizeof context.Rip;
             }
         }
-    } __except(EXCEPTION_EXECUTE_HANDLER) { report("xone-era:   C++ caller unwind incomplete\n"); }
+    } __except(EXCEPTION_EXECUTE_HANDLER) { report("xone-era:   caller unwind incomplete\n"); }
 }
 
 LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
@@ -153,6 +153,7 @@ LONG CALLBACK on_exception(EXCEPTION_POINTERS* info) {
         std::snprintf(line, sizeof line, "xone-era:   rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX r8=%llX r9=%llX\n",
                       c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi, c.R8, c.R9);
         report(line);
+        diagnose_callers(c);
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -164,7 +165,7 @@ DWORD WINAPI watchdog(void* timeout) {
     return 0;
 }
 
-void on_exit() { report("xone-era: title called exit\n"); }
+void on_exit() { (void)xboxone::era::close_connected_storage();report("xone-era: title called exit\n"); }
 
 int usage() {
     std::cerr << "Usage: xone-era check <title.exe>\n"
@@ -265,7 +266,8 @@ int wmain(int argc, wchar_t** argv) {
     if (!SetCurrentDirectoryW(title.parent_path().c_str())) {
         std::cerr << "cannot enter package directory: Win32 " << GetLastError() << '\n'; return 1;
     }
-    xboxone::era::set_title_storage_root(storage);
+    const HRESULT storage_status=xboxone::era::set_title_storage_root(storage);
+    if(FAILED(storage_status)){std::cerr<<"cannot initialize title storage: HRESULT 0x"<<std::hex<<static_cast<UINT>(storage_status)<<'\n';return 1;}
     xboxone::detail::Sha256 title_hash;title_hash.update(file);
     const auto selected=title.filename().u8string();
     xboxone::era::set_title_package_root(title.parent_path().wstring(),std::string(selected.begin(),selected.end()),title_hash.finish());
@@ -295,5 +297,5 @@ int wmain(int argc, wchar_t** argv) {
     image.process_attach();
     reinterpret_cast<void (*)()>(image.entry())();
     report("xone-era: title entry returned\n");
-    return 0;
+    return FAILED(xboxone::era::close_connected_storage())?1:0;
 }

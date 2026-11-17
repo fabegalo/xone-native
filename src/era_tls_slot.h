@@ -14,7 +14,9 @@ struct EraTlsTitle {
     SIZE_T size;                     // Template + SizeOfZeroFill.
     PIMAGE_TLS_CALLBACK* callbacks;  // Relocated, NULL-terminated, may be NULL.
     void* image;                     // Title image base passed to callbacks.
+    BOOL (WINAPI* module_entry)(HINSTANCE, DWORD, LPVOID); // NULL for a title.
 };
 
 using EraTlsBind = BOOL(*)(const EraTlsTitle*, DWORD*);
 using EraTlsUnbind = void(*)();
+using EraTlsAttach = BOOL(*)();

@@ -160,12 +160,19 @@ HRESULT STDMETHODCALLTYPE user_xbox_id(LocalUser* self,HSTRING* out) try {
     const auto id=std::to_wstring(value ? value : 1);
     return WindowsCreateString(id.c_str(),UINT(id.size()),out);
 } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
-// Sonic 1402d5100: method, URL, headers, string body, operation** (slot 18).
-// The locally recreated profile has no Xbox Live authentication provider.
+HRESULT offline_token_operation(void** out);
+// Reference 1400422e0/140042300/140042350: headers, byte-array and string overloads.
+// Offline failure is an Error operation, not a successful token or synchronous failure.
+HRESULT STDMETHODCALLTYPE user_token_headers(LocalUser*,HSTRING,HSTRING,HSTRING,void** out) {
+    return offline_token_operation(out);
+}
+HRESULT STDMETHODCALLTYPE user_token_bytes(LocalUser*,HSTRING,HSTRING,HSTRING,UINT bytes,const BYTE* body,void** out) {
+    if(!out)return E_POINTER;*out=nullptr;
+    if(bytes && !body)return E_INVALIDARG;
+    return offline_token_operation(out);
+}
 HRESULT STDMETHODCALLTYPE user_token(LocalUser*,HSTRING,HSTRING,HSTRING,HSTRING,void** out) {
-    if (!out) return E_POINTER;
-    *out=nullptr;
-    return HRESULT_FROM_WIN32(ERROR_NOT_CONNECTED);
+    return offline_token_operation(out);
 }
 const auto& user_table() {
     static const auto table=[] { auto t=winrt_vtable();
@@ -176,6 +183,8 @@ const auto& user_table() {
         t[11]=reinterpret_cast<const void*>(&user_is_signed_in);t[12]=reinterpret_cast<const void*>(&user_location);
         t[13]=reinterpret_cast<const void*>(&user_sponsor);
         t[15]=reinterpret_cast<const void*>(&user_xbox_id);
+        t[16]=reinterpret_cast<const void*>(&user_token_headers);
+        t[17]=reinterpret_cast<const void*>(&user_token_bytes);
         t[18]=reinterpret_cast<const void*>(&user_token);return t; }();
     return table;
 }
@@ -352,39 +361,40 @@ HRESULT STDMETHODCALLTYPE picker_result_user(PickerResult* self,void** out) {
     if (!out) return E_POINTER;
     retain(self->user); *out=self->user; return S_OK;
 }
-// Already-completed IAsyncOperation<AccountPickerResult> plus its IAsyncInfo.
-struct PickerOperation;
-struct PickerInfo : WinrtObject { PickerOperation* owner=nullptr; };
-struct PickerOperation : WinrtObject {
-    std::atomic<ULONG> refs{1}; PickerResult* result=nullptr; PickerInfo info{};
+// Terminal user operations share their existing ABI, ownership and completion delivery.
+struct UserOperation;
+struct UserOperationInfo : WinrtObject { UserOperation* owner=nullptr; };
+struct UserOperation : WinrtObject {
+    std::atomic<ULONG> refs{1}; PickerResult* result=nullptr; UserOperationInfo info{};
+    HRESULT result_code=S_OK;
     std::mutex mutex; IUnknown* handler=nullptr; bool closed=false;
-    ~PickerOperation() { if (handler) handler->Release(); if (result) release(result); }
+    ~UserOperation() { if (handler) handler->Release(); if (result) release(result); }
 };
 const GUID& picker_operation_iid() {
     static const GUID iid=winrt_pinterface_iid("pinterface({9fc2b0bb-e446-44e2-aa61-9cab8f636af2};"
         "rc(Windows.Xbox.UI.AccountPickerResult;{84453b4a-51f3-4651-a517-53c73bb3e1f4}))");
     return iid;
 }
-HRESULT picker_operation_query(WinrtObject* self,REFIID iid,void** out) {
-    auto* operation=static_cast<PickerOperation*>(self);
+HRESULT user_operation_query(WinrtObject* self,REFIID iid,void** out) {
+    auto* operation=static_cast<UserOperation*>(self);
     if (iid==__uuidof(IAsyncInfo)) *out=&operation->info;
-    else if (iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==__uuidof(IAgileObject) || iid==picker_operation_iid()) *out=operation;
+    else if (iid==__uuidof(IUnknown) || iid==__uuidof(IInspectable) || iid==__uuidof(IAgileObject) || iid==operation->iid) *out=operation;
     else return E_NOINTERFACE;
     retain(operation); return S_OK;
 }
-HRESULT STDMETHODCALLTYPE picker_info_query(PickerInfo* self,REFIID iid,void** out) {
-    if (!out) return E_POINTER; *out=nullptr; return picker_operation_query(self->owner,iid,out);
+HRESULT STDMETHODCALLTYPE user_operation_info_query(UserOperationInfo* self,REFIID iid,void** out) {
+    if (!out) return E_POINTER; *out=nullptr; return user_operation_query(self->owner,iid,out);
 }
-ULONG STDMETHODCALLTYPE picker_info_retain(PickerInfo* self) { return retain(self->owner); }
-ULONG STDMETHODCALLTYPE picker_info_release(PickerInfo* self) { return release(self->owner); }
-HRESULT STDMETHODCALLTYPE picker_info_id(PickerInfo*,UINT* out) { if (!out) return E_POINTER; *out=1; return S_OK; }
-HRESULT STDMETHODCALLTYPE picker_info_status(PickerInfo*,INT32* out) { if (!out) return E_POINTER; *out=1; return S_OK; } // Completed
-HRESULT STDMETHODCALLTYPE picker_info_error(PickerInfo*,HRESULT* out) { if (!out) return E_POINTER; *out=S_OK; return S_OK; }
-HRESULT STDMETHODCALLTYPE picker_info_cancel(PickerInfo*) { return S_OK; } // No effect once completed.
-HRESULT STDMETHODCALLTYPE picker_info_close(PickerInfo* self) {
+ULONG STDMETHODCALLTYPE user_operation_info_retain(UserOperationInfo* self) { return retain(self->owner); }
+ULONG STDMETHODCALLTYPE user_operation_info_release(UserOperationInfo* self) { return release(self->owner); }
+HRESULT STDMETHODCALLTYPE user_operation_info_id(UserOperationInfo*,UINT* out) { if (!out) return E_POINTER; *out=1; return S_OK; }
+HRESULT STDMETHODCALLTYPE user_operation_info_status(UserOperationInfo* self,INT32* out) { if (!out) return E_POINTER; *out=FAILED(self->owner->result_code)?3:1; return S_OK; }
+HRESULT STDMETHODCALLTYPE user_operation_info_error(UserOperationInfo* self,HRESULT* out) { if (!out) return E_POINTER; *out=self->owner->result_code; return S_OK; }
+HRESULT STDMETHODCALLTYPE user_operation_info_cancel(UserOperationInfo*) { return S_OK; } // No effect once completed.
+HRESULT STDMETHODCALLTYPE user_operation_info_close(UserOperationInfo* self) {
     std::lock_guard lock(self->owner->mutex); self->owner->closed=true; return S_OK;
 }
-HRESULT STDMETHODCALLTYPE picker_put_completed(PickerOperation* self,IUnknown* handler) {
+HRESULT STDMETHODCALLTYPE user_operation_put_completed(UserOperation* self,IUnknown* handler) {
     if (!handler) return E_POINTER;
     {
         std::lock_guard lock(self->mutex);
@@ -394,45 +404,58 @@ HRESULT STDMETHODCALLTYPE picker_put_completed(PickerOperation* self,IUnknown* h
     }
     // Completed before assignment: the handler runs now, on the assigning thread.
     using Invoke=HRESULT(STDMETHODCALLTYPE*)(IUnknown*,void*,INT32);
-    return reinterpret_cast<Invoke>((*reinterpret_cast<void***>(handler))[3])(handler,self,1);
+    retain(self);handler->AddRef();
+    const HRESULT result=reinterpret_cast<Invoke>((*reinterpret_cast<void***>(handler))[3])(handler,self,FAILED(self->result_code)?3:1);
+    handler->Release();release(self);return result;
 }
-HRESULT STDMETHODCALLTYPE picker_get_completed(PickerOperation* self,IUnknown** out) {
+HRESULT STDMETHODCALLTYPE user_operation_get_completed(UserOperation* self,IUnknown** out) {
     if (!out) return E_POINTER;
     std::lock_guard lock(self->mutex);
     if (self->handler) self->handler->AddRef();
     *out=self->handler; return S_OK;
 }
-HRESULT STDMETHODCALLTYPE picker_results(PickerOperation* self,void** out) {
+HRESULT STDMETHODCALLTYPE user_operation_results(UserOperation* self,void** out) {
     if (!out) return E_POINTER; *out=nullptr;
     std::lock_guard lock(self->mutex);
     if (self->closed) return E_ILLEGAL_METHOD_CALL;
+    if(FAILED(self->result_code))return self->result_code;
     retain(self->result); *out=self->result; return S_OK;
 }
-HRESULT STDMETHODCALLTYPE show_account_picker(WinrtObject*,IUnknown*,INT32 options,void** out) try {
+HRESULT make_user_operation(REFIID iid,const wchar_t* runtime_class,PickerResult* result,HRESULT result_code,void** out) try {
     if (!out) return E_POINTER; *out=nullptr;
-    if (options<0 || options>2) return E_INVALIDARG; // None, AllowGuests, AllowOnlyDistinctControllerTypes.
+    static const auto operation_vt=[] { auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&dynamic_query<UserOperation>);t[1]=reinterpret_cast<const void*>(&retain<UserOperation>);
+        t[2]=reinterpret_cast<const void*>(&release<UserOperation>);t[6]=reinterpret_cast<const void*>(&user_operation_put_completed);
+        t[7]=reinterpret_cast<const void*>(&user_operation_get_completed);t[8]=reinterpret_cast<const void*>(&user_operation_results);return t; }();
+    static const auto info_vt=[] { auto t=winrt_vtable();
+        t[0]=reinterpret_cast<const void*>(&user_operation_info_query);t[1]=reinterpret_cast<const void*>(&user_operation_info_retain);
+        t[2]=reinterpret_cast<const void*>(&user_operation_info_release);t[6]=reinterpret_cast<const void*>(&user_operation_info_id);
+        t[7]=reinterpret_cast<const void*>(&user_operation_info_status);t[8]=reinterpret_cast<const void*>(&user_operation_info_error);
+        t[9]=reinterpret_cast<const void*>(&user_operation_info_cancel);t[10]=reinterpret_cast<const void*>(&user_operation_info_close);return t; }();
+    auto operation=std::make_unique<UserOperation>();
+    static_cast<WinrtObject&>(*operation)={operation_vt.data(),runtime_class,iid,&user_operation_query};
+    static_cast<WinrtObject&>(operation->info)={info_vt.data(),runtime_class,__uuidof(IAsyncInfo),nullptr};
+    operation->info.owner=operation.get();operation->result_code=result_code;operation->result=result;
+    *out=operation.release(); return S_OK;
+} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+HRESULT offline_token_operation(void** out) {
+    // Reference 1401a43f0, parameterized IID from its DAT_1406ee0a0.
+    constexpr GUID iid{0xe6c6e9b1,0x363d,0x54fe,{0x80,0x8b,0x89,0xda,0x6b,0xcf,0x78,0xbf}};
+    return make_user_operation(iid,L"xone.OfflineTokenRequest",nullptr,HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE),out);
+}
+HRESULT STDMETHODCALLTYPE show_account_picker(WinrtObject*,IUnknown*,INT32 options,void** out) try {
+    if(!out)return E_POINTER;*out=nullptr;
+    if(options<0 || options>2)return E_INVALIDARG;
     static const auto result_vt=[] { auto t=winrt_vtable();
         t[0]=reinterpret_cast<const void*>(&dynamic_query<PickerResult>);t[1]=reinterpret_cast<const void*>(&retain<PickerResult>);
         t[2]=reinterpret_cast<const void*>(&release<PickerResult>);t[6]=reinterpret_cast<const void*>(&picker_result_user);return t; }();
-    static const auto operation_vt=[] { auto t=winrt_vtable();
-        t[0]=reinterpret_cast<const void*>(&dynamic_query<PickerOperation>);t[1]=reinterpret_cast<const void*>(&retain<PickerOperation>);
-        t[2]=reinterpret_cast<const void*>(&release<PickerOperation>);t[6]=reinterpret_cast<const void*>(&picker_put_completed);
-        t[7]=reinterpret_cast<const void*>(&picker_get_completed);t[8]=reinterpret_cast<const void*>(&picker_results);return t; }();
-    static const auto info_vt=[] { auto t=winrt_vtable();
-        t[0]=reinterpret_cast<const void*>(&picker_info_query);t[1]=reinterpret_cast<const void*>(&picker_info_retain);
-        t[2]=reinterpret_cast<const void*>(&picker_info_release);t[6]=reinterpret_cast<const void*>(&picker_info_id);
-        t[7]=reinterpret_cast<const void*>(&picker_info_status);t[8]=reinterpret_cast<const void*>(&picker_info_error);
-        t[9]=reinterpret_cast<const void*>(&picker_info_cancel);t[10]=reinterpret_cast<const void*>(&picker_info_close);return t; }();
     auto result=std::make_unique<PickerResult>();
     static_cast<WinrtObject&>(*result)={result_vt.data(),picker_result_class,iid_picker_result,&picker_result_query};
-    const HRESULT hr=acquire_user(&result->user); if (FAILED(hr)) return hr;
-    auto operation=std::make_unique<PickerOperation>();
-    static_cast<WinrtObject&>(*operation)={operation_vt.data(),picker_result_class,picker_operation_iid(),&picker_operation_query};
-    static_cast<WinrtObject&>(operation->info)={info_vt.data(),picker_result_class,__uuidof(IAsyncInfo),nullptr};
-    operation->info.owner=operation.get(); operation->result=result.release();
-    std::fputs("xone-era: account picker completed with the session's local profile\n",stderr);
-    *out=operation.release(); return S_OK;
-} catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    HRESULT hr=acquire_user(&result->user);if(FAILED(hr))return hr;
+    hr=make_user_operation(picker_operation_iid(),picker_result_class,result.get(),S_OK,out);
+    if(SUCCEEDED(hr)){result.release();std::fputs("xone-era: account picker completed with the session's local profile\n",stderr);}
+    return hr;
+} catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
 struct SystemUiFactory { WinrtObject activation; WinrtObject statics; };
 SystemUiFactory& system_ui();
 HRESULT system_ui_query(WinrtObject*, REFIID iid, void** out) {

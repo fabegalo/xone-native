@@ -3,9 +3,11 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <intrin.h>
 
 #include "era_tls_slot.h"
 #include "era_audio.h"
+#include "era_winrt_classes.h"
 
 #include <cstring>
 #include <algorithm>
@@ -41,12 +43,15 @@ const char* image_string(const std::uint8_t* base, std::size_t size, DWORD rva) 
 Image::~Image() { release(); }
 
 void Image::process_attach() const {
-    for (auto* cb = static_cast<PIMAGE_TLS_CALLBACK*>(tls_callbacks_); cb && *cb; ++cb)
-        (*cb)(base_, DLL_PROCESS_ATTACH, nullptr);
+    if (tls_attach_ && !reinterpret_cast<EraTlsAttach>(tls_attach_)()) __fastfail(FAST_FAIL_FATAL_APP_EXIT);
 }
 bool Image::attach_module() {
     if (!base_ || kind_ != ImageKind::module) return false;
     if (attached_) return true;
+    if (tls_attach_) {
+        attached_ = reinterpret_cast<EraTlsAttach>(tls_attach_)() != FALSE;
+        return attached_;
+    }
     using DllEntry = BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID);
     if (entry_ && !reinterpret_cast<DllEntry>(entry_)(reinterpret_cast<HINSTANCE>(base_), DLL_PROCESS_ATTACH, nullptr)) return false;
     attached_ = true;
@@ -66,12 +71,13 @@ void* Image::find_export(std::string_view name, std::uint16_t ordinal) const {
 }
 
 void Image::release() {
-    if (attached_ && entry_)
+    if (attached_ && entry_ && !tls_unbind_)
         reinterpret_cast<BOOL (WINAPI*)(HINSTANCE, DWORD, LPVOID)>(entry_)(reinterpret_cast<HINSTANCE>(base_), DLL_PROCESS_DETACH, nullptr);
     attached_ = false;
-    if (base_ && kind_ == ImageKind::title) reset_acp_heaps();
     if (tls_unbind_) reinterpret_cast<EraTlsUnbind>(tls_unbind_)();
-    tls_unbind_ = nullptr; tls_callbacks_ = nullptr;
+    if (base_ && kind_ == ImageKind::title) (void)close_connected_storage();
+    if (base_ && kind_ == ImageKind::title) reset_acp_heaps();
+    tls_unbind_ = nullptr; tls_attach_ = nullptr;
     if (function_table_) RtlDeleteFunctionTable(static_cast<PRUNTIME_FUNCTION>(function_table_));
     if (base_) { if (kind_ == ImageKind::title) set_title_module(nullptr); VirtualFree(base_, 0, MEM_RELEASE); }
     base_ = nullptr; size_ = 0; entry_ = nullptr; function_table_ = nullptr;
@@ -112,8 +118,6 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
         return fail("delay-load imports not implemented");
     if (dirs[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress)
         return fail("CLR images not supported");
-    if (kind == ImageKind::module && dirs[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress)
-        return fail("module static TLS is not implemented");
 
     size_ = opt.SizeOfImage;
     base_ = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, size_, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
@@ -125,7 +129,9 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
         const std::size_t span = (std::max)(s.Misc.VirtualSize, s.SizeOfRawData);
         if (s.VirtualAddress < opt.SizeOfHeaders || s.VirtualAddress > size_ || span > size_ - s.VirtualAddress)
             return fail("section outside image");
-        const std::size_t raw = (std::min)(s.SizeOfRawData, s.Misc.VirtualSize ? s.Misc.VirtualSize : s.SizeOfRawData);
+        // Reference FUN_140163e70 maps all file-backed section bytes, including
+        // raw alignment padding beyond VirtualSize.
+        const std::size_t raw = s.SizeOfRawData;
         if (raw && (s.PointerToRawData > file.size() || raw > file.size() - s.PointerToRawData))
             return fail("section raw data outside file");
         if (raw) std::memcpy(base_ + s.VirtualAddress, file.data() + s.PointerToRawData, raw);
@@ -244,7 +250,9 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
 
     // Unwind data is required for exceptions, stack walks and C++ EH in title code.
     if (!dir(IMAGE_DIRECTORY_ENTRY_EXCEPTION, rva, bytes)) return fail("exception directory outside image");
-    if (rva && bytes >= sizeof(RUNTIME_FUNCTION)) {
+    // Reference FUN_140163610 rejects incomplete RUNTIME_FUNCTION records.
+    if (bytes % sizeof(RUNTIME_FUNCTION)) return fail("invalid unwind directory");
+    if (rva && bytes) {
         auto* table = reinterpret_cast<PRUNTIME_FUNCTION>(base_ + rva);
         if (!RtlAddFunctionTable(table, static_cast<DWORD>(bytes / sizeof(RUNTIME_FUNCTION)),
                                  reinterpret_cast<DWORD64>(base_)))
@@ -280,18 +288,42 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
         if (n == 0 || n == MAX_PATH) return fail("cannot locate launcher directory");
         std::wstring slot_path(module, n);
         slot_path.resize(slot_path.find_last_of(L"\\/") + 1);
-        slot_path += L"xone-era-tls.dll";
-        const HMODULE slot = LoadLibraryExW(slot_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-        const auto bind = slot ? reinterpret_cast<EraTlsBind>(GetProcAddress(slot, "era_tls_bind")) : nullptr;
-        if (!bind) return fail("TLS slot module xone-era-tls.dll unavailable");
+        if (opt.AddressOfEntryPoint >= size_) return fail("entry point outside image");
         EraTlsTitle title{reinterpret_cast<const void*>(tls.StartAddressOfRawData),
                           static_cast<SIZE_T>(tls.EndAddressOfRawData - tls.StartAddressOfRawData),
-                          static_cast<SIZE_T>(needed), reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls.AddressOfCallBacks), base_};
+                          static_cast<SIZE_T>(needed), reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls.AddressOfCallBacks), base_,
+                          kind == ImageKind::module && opt.AddressOfEntryPoint ?
+                              reinterpret_cast<BOOL(WINAPI*)(HINSTANCE, DWORD, LPVOID)>(base_ + opt.AddressOfEntryPoint) : nullptr};
         DWORD index = 0;
-        if (!bind(&title, &index)) return fail("TLS slot already bound to another title in this process");
-        tls_unbind_ = reinterpret_cast<void*>(GetProcAddress(slot, "era_tls_unbind"));
+        // Reference FUN_14054df20 uses two library slots, separate from title TLS.
+        const wchar_t* names[] = {L"xone-era-tls.dll", L"xone-era-tls-1.dll", L"xone-era-tls-2.dll"};
+        const unsigned first = kind == ImageKind::title ? 0 : 1;
+        const unsigned last = kind == ImageKind::title ? 1 : 3;
+        for (unsigned i = first; i < last && !tls_unbind_; ++i) {
+            const auto path = slot_path + names[i];
+            const HMODULE slot = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            const auto bind = slot ? reinterpret_cast<EraTlsBind>(GetProcAddress(slot, "era_tls_bind")) : nullptr;
+            const auto attach = slot ? reinterpret_cast<EraTlsAttach>(GetProcAddress(slot, "era_tls_attach")) : nullptr;
+            const auto unbind = slot ? reinterpret_cast<EraTlsUnbind>(GetProcAddress(slot, "era_tls_unbind")) : nullptr;
+            HMODULE pinned = nullptr;
+            // Retired thread blocks still need the helper's detach callback after
+            // the guest mapping is released. Pin at most the three known helpers.
+            const bool valid = bind && attach && unbind && GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(bind), &pinned);
+            const bool bound = valid && bind(&title, &index);
+            const DWORD bind_error = GetLastError();
+            if (bound) {
+                tls_attach_ = reinterpret_cast<void*>(attach);
+                tls_unbind_ = reinterpret_cast<void*>(unbind);
+            }
+            if (slot) FreeLibrary(slot);
+            if (!valid) return fail("TLS helper unavailable or incompatible");
+            if (!bound && bind_error != ERROR_BUSY) return fail("TLS thread initialization failed: " + std::to_string(bind_error));
+        }
+        if (!tls_unbind_) return fail(kind == ImageKind::title ? "TLS slot already bound to another title in this process" :
+            "all two module TLS slots are occupied or retiring");
         *reinterpret_cast<DWORD*>(tls.AddressOfIndex) = index;
-        tls_callbacks_ = reinterpret_cast<void*>(tls.AddressOfCallBacks);
     }
 
     DWORD old = 0;
@@ -301,7 +333,7 @@ bool Image::load(const std::vector<std::uint8_t>& file, const Resolver& resolver
         if (span && !VirtualProtect(base_ + s.VirtualAddress, span, protection(s.Characteristics), &old))
             return fail("section protection failed");
     }
-    FlushInstructionCache(GetCurrentProcess(), base_, size_);
+    if (!FlushInstructionCache(GetCurrentProcess(), base_, size_)) return fail("instruction cache flush failed");
     if (opt.AddressOfEntryPoint >= size_) return fail("entry point outside image");
     entry_ = opt.AddressOfEntryPoint ? base_ + opt.AddressOfEntryPoint : nullptr;
     if (kind == ImageKind::title) set_title_module(base_);

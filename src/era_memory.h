@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <array>
+#include <span>
 
 namespace xboxone::era {
 // ACP heaps retain registered CPU backing until their session ends.
@@ -15,6 +16,13 @@ struct TitleGpuClearState {
     // Ingress only: read without the depth block (shader/copy). The GCN 2 texture unit
     // does not consult HTILE (TC-compatible HTILE starts with GFX8), so it reads the base plane.
     bool bypass_htile = false;
+};
+struct TitleTextureSampleOffsets {
+    std::array<const UINT32*,2> planes{}; // Primary sample and optional stencil byte, indexed by (y*width+x)*samples+sample.
+    std::size_t count=0,htile_offset=0,htile_bytes=0;
+    UINT32 expanded_htile=0;
+    UINT element_bytes=8;
+    bool depth_stencil=true;
 };
 struct TitleTextureLayout {
     std::size_t bytes = 0, alignment = 0;
@@ -31,6 +39,7 @@ struct TitleTextureLayout {
     // Immutable, original-XG-verified 32-bit texel byte offsets, when available.
     // S_FALSE keeps the CPU reference path for other layouts/revisions.
     HRESULT (*offsets)(void* context,const UINT32** values,std::size_t* count) = nullptr;
+    HRESULT (*sample_offsets)(void* context,TitleTextureSampleOffsets* out) = nullptr;
 };
 HRESULT create_xg_texture_layout(UINT width, UINT height, UINT mips, UINT arrays, DXGI_FORMAT format,
                                  UINT tile_mode, TitleTextureLayout& out, UINT bind_flags = 0, UINT samples = 1);
@@ -50,14 +59,17 @@ struct TitleGpuResource {
     std::size_t canonical_offset = 0, size = 0;
     bool composite = false; // A graphics reservation spanning physical/shared commitments.
     TitleGpuClearState clear; // Logical resource state; physical aliases retain independent clear registers.
+    std::shared_ptr<void> allocation_owner; // Original allocation/alias callback, retained through queued GPU use.
 };
-HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil);
+HRESULT set_title_gpu_clear(TitleGpuResource& resource,UINT aspects,UINT32 depth,UINT8 stencil,bool native_write=false);
 HRESULT map_title_esram(UINT flags, void* address, UINT pages, const UINT* page_list);
 // Resource capabilities are fixed by the first binding; later requests never
 // replace a cached resource with an unsynchronized alias.
 HRESULT acquire_title_gpu_buffer(void* address, std::size_t size, ID3D12Device* device, TitleGpuResource& out,
                                  D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE, bool aligned = false);
 HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layout, ID3D12Device* device, TitleGpuResource& out);
+// Query the existing ownership registry, including distinct virtual views of ESRAM.
+HRESULT title_gpu_resources_overlap(const TitleGpuResource& first,const TitleGpuResource& second,bool& overlap);
 // Aligned bindings retain storage; GPU use remains explicit. Tracked graphics
 // mappings keep native contents resident and publish canonical bytes on CPU
 // access or incompatible alias use. Completion still requires the real fence.
@@ -65,20 +77,25 @@ HRESULT acquire_title_gpu_texture(void* address, const TitleTextureLayout& layou
 // Return the representation to the state passed to begin before calling end.
 // read_only promises no writes or write-state transitions within this interval;
 // it skips redundant writeback, but retains exclusion and fence retirement.
-HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only=false);
+HRESULT begin_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool read_only=false,ID3D12CommandQueue* ordered_queue=nullptr);
 HRESULT end_title_gpu_buffer(TitleGpuResource& buffer, ID3D12GraphicsCommandList* list);
-// discard_contents requires a full overwrite of every aspect of a single-subresource texture.
+// discard_contents requires a full overwrite: every aspect/subresource for COPY_DEST/RESOLVE_DEST,
+// or every aspect of a single-subresource texture for render/depth clears.
 HRESULT begin_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list, D3D12_RESOURCE_STATES state,bool discard_contents=false,
-                                const D3D12_SUBRESOURCE_DATA* first_subresource=nullptr,bool read_only=false);
+                                const D3D12_SUBRESOURCE_DATA* first_subresource=nullptr,bool read_only=false,ID3D12CommandQueue* ordered_queue=nullptr);
 HRESULT end_title_gpu_texture(TitleGpuResource& texture, ID3D12GraphicsCommandList* list);
 // Publish guest completion only after S_OK. For tracked mappings, protected CPU
 // reads/writes retire the canonical image before the faulting access resumes.
+// Prepare native retention before submission. S_FALSE preserves synchronous retirement
+// for untracked writable textures or writable buffers. Publish only after a real queue signal.
+HRESULT prepare_title_gpu_submission(std::span<TitleGpuResource* const> resources,std::shared_ptr<void>& lease);
+HRESULT publish_title_gpu_submission(const std::shared_ptr<void>& lease,ID3D12CommandQueue* queue,ID3D12Fence* fence,UINT64 value);
 HRESULT complete_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value);
 // CPU maps share the canonical bytes and exclude GPU access to the parent.
 // E_PENDING means a GPU interval still needs its completion fence. Blocking maps
 // wait for another submission thread's retirement, with the normal 5 s deadline.
 HRESULT map_title_gpu_resource(TitleGpuResource& buffer, void** address, bool wait=false);
 HRESULT unmap_title_gpu_resource(TitleGpuResource& buffer);
-// E_PENDING preserves the pin; retry after the last GPU use has completed.
-HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value);
+// E_PENDING preserves the pin; a logical retained_owner may hand off to an existing queued lease.
+HRESULT release_title_gpu_resource(TitleGpuResource& buffer, ID3D12Fence* fence, UINT64 value,bool retained_owner=false);
 }

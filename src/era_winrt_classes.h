@@ -34,6 +34,11 @@ HRESULT title_local_user(void** user); // Retained snapshot of the selected sess
 // Windows.Xbox.UI.SystemUI (statics; observed slots only).
 HRESULT xbox_system_ui_factory(REFIID iid, void** factory);
 HRESULT connected_storage_factory(REFIID iid, void** factory);
+// Host lifecycle: start before title initialization, flush accepted snapshots,
+// then close/join before changing profiles or unmapping the title image.
+HRESULT begin_connected_storage(bool enabled);
+HRESULT flush_connected_storage();
+HRESULT close_connected_storage();
 bool title_writable_path(const std::wstring& path);
 HRESULT xbox_controller_factory(REFIID iid, void** factory);
 HRESULT xbox_gamepad_factory(REFIID iid, void** factory);

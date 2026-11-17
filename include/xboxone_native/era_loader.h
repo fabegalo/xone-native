@@ -50,10 +50,11 @@ public:
               ImageKind kind = ImageKind::title);
     // Runs the title's TLS callbacks for DLL_PROCESS_ATTACH on the calling thread.
     // Static TLS data is bound by load(); thread attach/detach is forwarded by
-    // xone-era-tls.dll, which must sit next to the launcher executable.
+    // the xone-era-tls helpers deployed next to the launcher. TLS images must be
+    // initialized/released on their loading thread with guest execution stopped.
     void process_attach() const;
-    // Explicit DLL initialization, never called by load/check. Module TLS is
-    // still unsupported; the existing static-TLS slot belongs to the title.
+    // Explicit DLL initialization, never called by load/check. TLS callbacks
+    // precede DllMain; module slots are independent of the title's static TLS.
     bool attach_module();
     void* find_export(std::string_view name, std::uint16_t ordinal = 0) const;
     void* entry() const { return entry_; }
@@ -66,7 +67,7 @@ private:
     std::size_t size_ = 0;
     void* entry_ = nullptr;
     void* function_table_ = nullptr;
-    void* tls_callbacks_ = nullptr;
+    void* tls_attach_ = nullptr;
     void* tls_unbind_ = nullptr;
     ImageKind kind_ = ImageKind::title;
     bool attached_ = false;
@@ -109,7 +110,7 @@ void* resolve_etwplus(const ImportRequest& request);
 // Writable title storage root for file mutation APIs. Empty (the
 // default) means no writable storage: mutations fail with ERROR_ACCESS_DENIED,
 // as for the read-only package. Paths outside the root fail the same way.
-void set_title_storage_root(const std::wstring& root);
+HRESULT set_title_storage_root(const std::wstring& root);
 // Matching CRT/CX versions, UCRT, combase and audited Winsock/crypto exports,
 // loaded from System32 only; unknown symbols/ordinals remain unresolved.
 void* resolve_host_module(const ImportRequest& request);

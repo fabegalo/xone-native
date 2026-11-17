@@ -8,7 +8,7 @@ endif()
 
 add_library(xboxone_era STATIC ${PROJECT_SOURCE_DIR}/src/era_loader.cpp ${PROJECT_SOURCE_DIR}/src/era_kernelx.cpp
             ${PROJECT_SOURCE_DIR}/src/era_host.cpp ${PROJECT_SOURCE_DIR}/src/era_etwplus.cpp
-            ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_display.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
+            ${PROJECT_SOURCE_DIR}/src/era_d3d11x.cpp ${PROJECT_SOURCE_DIR}/src/era_shader_translation.cpp ${PROJECT_SOURCE_DIR}/src/era_display.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_services.cpp ${PROJECT_SOURCE_DIR}/src/era_winrt_object.cpp
             ${PROJECT_SOURCE_DIR}/src/era_xbox_system.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_input.cpp ${PROJECT_SOURCE_DIR}/src/era_xbox_deployment.cpp
             ${PROJECT_SOURCE_DIR}/src/era_core_application.cpp ${PROJECT_SOURCE_DIR}/src/era_audio.cpp
@@ -22,12 +22,17 @@ target_compile_features(xboxone_era PUBLIC cxx_std_20)
 target_compile_options(xboxone_era PRIVATE /W4 /permissive-)
 
 # Static TLS slot for the title; must be deployed next to the launcher executable.
-add_library(xone-era-tls SHARED ${PROJECT_SOURCE_DIR}/src/era_tls_slot.cpp)
-target_compile_options(xone-era-tls PRIVATE /W4 /permissive- /GS- /Zl)
-target_link_libraries(xone-era-tls PRIVATE kernel32)
-target_link_options(xone-era-tls PRIVATE /NODEFAULTLIB /ENTRY:era_tls_dll_main /INCLUDE:_tls_used
-                    /MANIFEST:NO /INCREMENTAL:NO)
-add_dependencies(xboxone_era xone-era-tls)
+foreach(tls_helper xone-era-tls xone-era-tls-1 xone-era-tls-2)
+    add_library(${tls_helper} SHARED ${PROJECT_SOURCE_DIR}/src/era_tls_slot.cpp)
+    target_compile_options(${tls_helper} PRIVATE /W4 /permissive- /GS- /Zl)
+    target_link_libraries(${tls_helper} PRIVATE kernel32)
+    target_link_options(${tls_helper} PRIVATE /NODEFAULTLIB /ENTRY:era_tls_dll_main /INCLUDE:_tls_used
+                        /MANIFEST:NO /INCREMENTAL:NO)
+    if(NOT tls_helper STREQUAL "xone-era-tls")
+        target_compile_definitions(${tls_helper} PRIVATE ERA_TLS_MODULE_SLOT)
+    endif()
+    add_dependencies(xboxone_era ${tls_helper})
+endforeach()
 
 add_executable(xone-era ${PROJECT_SOURCE_DIR}/src/era_main.cpp)
 target_link_libraries(xone-era PRIVATE xboxone_era)
@@ -72,9 +77,19 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     target_link_options(era_tls_component PRIVATE /NODEFAULTLIB /ENTRY:era_tls_entry /SUBSYSTEM:CONSOLE
                         /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO /INCLUDE:_tls_used)
 
+    add_library(era_tls_module_component SHARED ${PROJECT_SOURCE_DIR}/tests/era_tls_module_component.cpp)
+    target_compile_options(era_tls_module_component PRIVATE /GS- /Zl)
+    target_link_options(era_tls_module_component PRIVATE /NODEFAULTLIB /ENTRY:era_tls_module_main /INCLUDE:_tls_used
+                        /MANIFEST:NO /INCREMENTAL:NO /DYNAMICBASE /FIXED:NO)
+
     add_executable(xboxone_era_loader_tests ${PROJECT_SOURCE_DIR}/tests/era_loader_tests.cpp)
-    add_dependencies(xboxone_era_loader_tests era_module_component)
+    add_dependencies(xboxone_era_loader_tests era_module_component era_tls_module_component)
     target_link_libraries(xboxone_era_loader_tests PRIVATE xboxone_era)
+    add_test(NAME era_graphics_stream_regressions COMMAND xboxone_era_loader_tests --graphics-stream)
+    set_tests_properties(era_graphics_stream_regressions PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era;graphics")
+    add_test(NAME era_module_tls_regressions COMMAND xboxone_era_loader_tests --tls-modules
+             $<TARGET_FILE:era_tls_module_component> $<TARGET_FILE:era_tls_component>)
+    set_tests_properties(era_module_tls_regressions PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era")
     add_executable(xboxone_era_memory_tests ${PROJECT_SOURCE_DIR}/tests/era_memory_tests.cpp)
     add_executable(xboxone_era_audio_tests ${PROJECT_SOURCE_DIR}/tests/era_audio_tests.cpp)
     target_link_libraries(xboxone_era_audio_tests PRIVATE xboxone_era)
@@ -92,6 +107,11 @@ if(XBOXONE_NATIVE_BUILD_TESTS)
     target_link_libraries(xboxone_era_storage_tests PRIVATE xboxone_era)
     add_test(NAME era_storage_regressions COMMAND xboxone_era_storage_tests)
     set_tests_properties(era_storage_regressions PROPERTIES TIMEOUT 15 LABELS "windows;synthetic;era")
+    add_test(NAME era_storage_worker_regressions COMMAND xboxone_era_storage_tests --worker)
+    add_test(NAME era_storage_worker_failure_regressions COMMAND xboxone_era_storage_tests --worker-failure)
+    set_tests_properties(era_storage_worker_regressions era_storage_worker_failure_regressions PROPERTIES TIMEOUT 40 LABELS "windows;synthetic;era;storage")
+    add_test(NAME era_storage_quota_regressions COMMAND xboxone_era_storage_tests --quota)
+    set_tests_properties(era_storage_quota_regressions PROPERTIES TIMEOUT 120 LABELS "windows;synthetic;era;storage")
     add_test(NAME era_check_cli COMMAND xone-era check $<TARGET_FILE:era_component>)
     set_tests_properties(era_check_cli PROPERTIES TIMEOUT 10 PASS_REGULAR_EXPRESSION "resolved 2, unresolved 0")
     if(Python3_Interpreter_FOUND)

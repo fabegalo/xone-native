@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "era_display.h"
 #include "era_session.h"
+#include "era_memory.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #include <climits>
@@ -8,33 +9,61 @@
 #include <cstdio>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
+#include <wrl/wrappers/corewrappers.h>
 
 namespace xboxone::era {
 namespace {
 std::atomic<SIZE_T> layout_bytes{0};
-constexpr SIZE_T layout_budget=128u<<20;
+std::atomic<SIZE_T> sample_layout_bytes{0};
+constexpr SIZE_T layout_budget=384u<<20,sample_layout_budget=512u<<20;
 void layout_transition(ID3D12GraphicsCommandList* list,ID3D12Resource* resource,D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition={resource,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,before,after};list->ResourceBarrier(1,&barrier);
 }
+HRESULT cache_immutable_offsets(ID3D12Device* device,ID3D12Resource* upload,SIZE_T bytes,Microsoft::WRL::ComPtr<ID3D12Resource>& out) {
+    auto desc=upload->GetDesc();D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+    HRESULT hr=device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&out));
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    const D3D12_COMMAND_QUEUE_DESC q{};
+    if(SUCCEEDED(hr))hr=device->CreateCommandQueue(&q,IID_PPV_ARGS(&queue));
+    if(SUCCEEDED(hr))hr=device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator));
+    if(SUCCEEDED(hr))hr=device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list));
+    if(SUCCEEDED(hr))hr=device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence));
+    if(FAILED(hr))return hr;
+    Microsoft::WRL::Wrappers::Event completed(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(!completed.IsValid())return HRESULT_FROM_WIN32(GetLastError());
+    list->CopyBufferRegion(out.Get(),0,upload,0,bytes);
+    layout_transition(list.Get(),out.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    hr=list->Close();if(SUCCEEDED(hr))hr=fence->SetEventOnCompletion(1,completed.Get());if(FAILED(hr))return hr;
+    ID3D12CommandList* lists[]{list.Get()};queue->ExecuteCommandLists(1,lists);hr=queue->Signal(fence.Get(),1);
+    // Submitted initialization must retire before local staging and allocator lifetimes end.
+    if(FAILED(hr) || WaitForSingleObject(completed.Get(),5000)!=WAIT_OBJECT_0 || fence->GetCompletedValue()!=1) {
+        std::fputs("xone-era: immutable offset initialization did not retire\n",stderr);
+        RaiseFailFastException(nullptr,nullptr,0);std::abort();
+    }
+    return S_OK;
+}
 }
 TextureLayoutTransfer::~TextureLayoutTransfer() {
     offsets_.Reset();upload_.Reset();linear_.Reset();tiled_.Reset();readback_.Reset();
-    if(retained_bytes_)layout_bytes.fetch_sub(retained_bytes_);
+    if(retained_bytes_)(sample_transport_ ? sample_layout_bytes:layout_bytes).fetch_sub(retained_bytes_);
 }
 HRESULT TextureLayoutTransfer::initialize(ID3D12Device* device,std::span<const UINT32> offsets,UINT width,UINT height,
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,SIZE_T tiled_bytes) try {
     if(!device || retained_bytes_)return E_INVALIDARG;
+    const UINT element=footprint.Footprint.Format>=DXGI_FORMAT_R8_TYPELESS && footprint.Footprint.Format<=DXGI_FORMAT_A8_UNORM ? 1:4;
     const UINT64 count=UINT64(width)*height,linear_bytes=UINT64(footprint.Footprint.RowPitch)*height;
     if(!width || !height || offsets.size()!=count || !tiled_bytes || footprint.Offset ||
         footprint.Footprint.Width!=width || footprint.Footprint.Height!=height || footprint.Footprint.Depth!=1 ||
-        footprint.Footprint.RowPitch<UINT64(width)*4 || footprint.Footprint.RowPitch%4)return E_INVALIDARG;
+        footprint.Footprint.RowPitch<UINT64(width)*element || footprint.Footprint.RowPitch%4)return E_INVALIDARG;
     if(count>65535u*64 || tiled_bytes>(16u<<20) || linear_bytes>(16u<<20))return S_FALSE;
     const SIZE_T padded=(tiled_bytes+3)&~SIZE_T(3);
     auto sorted=std::vector<UINT32>(offsets.begin(),offsets.end());std::sort(sorted.begin(),sorted.end());
     for(SIZE_T i=0;i<sorted.size();++i)
-        if(sorted[i]%4 || sorted[i]>tiled_bytes || tiled_bytes-sorted[i]<4 || (i && sorted[i]==sorted[i-1]))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
-    SIZE_T end=0;for(auto offset:sorted){if(offset>end)padding_.push_back({end,offset-end});end=SIZE_T(offset)+4;}
+        if(sorted[i]%element || sorted[i]>tiled_bytes || tiled_bytes-sorted[i]<element || (i && sorted[i]==sorted[i-1]))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    SIZE_T end=0;for(auto offset:sorted){if(offset>end)padding_.push_back({end,offset-end});end=SIZE_T(offset)+element;}
     if(end<tiled_bytes)padding_.push_back({end,tiled_bytes-end});
     const SIZE_T required=padded*3+SIZE_T(linear_bytes)+offsets.size_bytes()+padding_.capacity()*sizeof(padding_[0]);
     auto used=layout_bytes.load();
@@ -59,27 +88,215 @@ ByteAddressBuffer offsets:register(t0);ByteAddressBuffer input:register(t1);RWBy
 cbuffer Layout:register(b0){uint width;uint pitch;uint count;uint into_tiled;};
 [numthreads(64,1,1)] void main(uint3 id:SV_DispatchThreadID){
  if(id.x>=count)return;
- uint linear_address=(id.x/width)*pitch+(id.x%width)*4;uint tiled_address=offsets.Load(id.x*4);
- output.Store(into_tiled?tiled_address:linear_address,input.Load(into_tiled?linear_address:tiled_address));
+ uint linear_address=(id.x/width)*pitch+(id.x%width)*SAMPLE_BYTES;uint tiled_address=offsets.Load(id.x*4);
+ uint source=into_tiled?linear_address:tiled_address;uint destination=into_tiled?tiled_address:linear_address;
+#if SAMPLE_BYTES==1
+ uint value=(input.Load(source&~3u)>>((source&3u)*8))&255u;
+ uint shift=(destination&3u)*8;uint ignored;
+ output.InterlockedAnd(destination&~3u,~(255u<<shift),ignored);
+ output.InterlockedOr(destination&~3u,value<<shift,ignored);
+#else
+ output.Store(destination,input.Load(source));
+#endif
 })";
+    return initialize_program(device,source,sizeof(source)-1,4,element);
+}catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+HRESULT TextureLayoutTransfer::initialize_program(ID3D12Device* device,const char* source,SIZE_T bytes,UINT constants,UINT sample_bytes,bool depth_stencil) {
     struct Compiler{HMODULE value=LoadLibraryExW(L"d3dcompiler_47.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);~Compiler(){if(value)FreeLibrary(value);}}compiler;
     if(!compiler.value)return HRESULT_FROM_WIN32(GetLastError());
     const auto compile=reinterpret_cast<decltype(&D3DCompile)>(GetProcAddress(compiler.value,"D3DCompile"));
     if(!compile)return E_NOINTERFACE;
     Microsoft::WRL::ComPtr<ID3DBlob> code,errors,serialized;
-    hr=compile(source,sizeof(source)-1,nullptr,nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+    const D3D_SHADER_MACRO macros[]{{"SAMPLE_BYTES",sample_bytes==1 ? "1":sample_bytes==4 ? "4":"8"},{"DEPTH_STENCIL",depth_stencil ? "1":"0"},{nullptr,nullptr}};
+    HRESULT hr=compile(source,bytes,nullptr,sample_bytes ? macros:nullptr,nullptr,"main","cs_5_0",D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
     if(FAILED(hr) && errors)std::fprintf(stderr,"xone-era: layout shader: %.2048s\n",static_cast<const char*>(errors->GetBufferPointer()));
     if(FAILED(hr))return hr;
     D3D12_ROOT_PARAMETER parameters[4]{};
     for(UINT i=0;i<2;++i){parameters[i].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;parameters[i].Descriptor.ShaderRegister=i;}
     parameters[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;parameters[2].Descriptor.ShaderRegister=0;
-    parameters[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[3].Constants={0,0,4};
+    parameters[3].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;parameters[3].Constants={0,0,constants};
     const D3D12_ROOT_SIGNATURE_DESC root{4,parameters,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};
     hr=D3D12SerializeRootSignature(&root,D3D_ROOT_SIGNATURE_VERSION_1,&serialized,nullptr);
     if(SUCCEEDED(hr))hr=device->CreateRootSignature(0,serialized->GetBufferPointer(),serialized->GetBufferSize(),IID_PPV_ARGS(&root_));
     if(SUCCEEDED(hr)){D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};desc.pRootSignature=root_.Get();desc.CS={code->GetBufferPointer(),code->GetBufferSize()};hr=device->CreateComputePipelineState(&desc,IID_PPV_ARGS(&pipeline_));}
     return hr;
+}
+HRESULT TextureLayoutTransfer::initialize_samples(ID3D12Device* device,const TitleTextureSampleOffsets& offsets,UINT width,UINT height,
+        std::span<const D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints,SIZE_T tiled_bytes,std::shared_ptr<void> owner) try {
+    if(!device || retained_bytes_ || !owner || !width || !height || footprints.size()<2 || footprints.size()>8 ||
+        offsets.count!=UINT64(width)*height*footprints.size() || !offsets.planes[0] ||
+        (offsets.depth_stencil ? (!offsets.planes[1] || offsets.element_bytes!=8) :
+            (offsets.htile_bytes || (offsets.element_bytes!=4 && offsets.element_bytes!=8))) ||
+        !tiled_bytes || tiled_bytes%4 || offsets.htile_offset%4 || offsets.htile_bytes%4 ||
+        offsets.htile_offset>tiled_bytes || offsets.htile_bytes>tiled_bytes-offsets.htile_offset)return E_INVALIDARG;
+    if(tiled_bytes>(64u<<20) || offsets.count>(16u<<20))return S_FALSE;
+    const auto& first=footprints[0];const UINT64 slice=footprints[1].Offset;
+    const auto format=offsets.depth_stencil ? DXGI_FORMAT_R32G32_UINT : offsets.element_bytes==4 ? DXGI_FORMAT_R11G11B10_FLOAT : DXGI_FORMAT_R16G16B16A16_UINT;
+    if(first.Offset || !slice || slice>UINT_MAX || first.Footprint.Format!=format ||
+        first.Footprint.RowPitch<UINT64(width)*offsets.element_bytes || slice<UINT64(first.Footprint.RowPitch)*height)return E_INVALIDARG;
+    for(SIZE_T i=0;i<footprints.size();++i) {
+        const auto& f=footprints[i];
+        if(f.Offset!=i*slice || f.Footprint.Width!=width || f.Footprint.Height!=height || f.Footprint.Depth!=1 ||
+            f.Footprint.Format!=first.Footprint.Format || f.Footprint.RowPitch!=first.Footprint.RowPitch)return E_INVALIDARG;
+    }
+    const UINT64 linear_bytes=footprints.back().Offset+UINT64(first.Footprint.RowPitch)*height;
+    if(linear_bytes>(128u<<20))return S_FALSE;
+    // Reference 140211120/140212330: footprints, original address tables and raw buffers.
+    std::vector<BYTE> covered((tiled_bytes+7)/8,0);
+    const auto mark=[&](SIZE_T at,UINT bytes) {
+        if(at>tiled_bytes || bytes>tiled_bytes-at)return false;
+        for(UINT n=0;n<bytes;++n) {
+            const SIZE_T bit=at+n;const BYTE mask=BYTE(1u<<(bit%8));
+            if(covered[bit/8]&mask)return false;covered[bit/8]|=mask;
+        }
+        return true;
+    };
+    for(SIZE_T at=0;at<offsets.htile_bytes;at+=4)
+        if(!mark(offsets.htile_offset+at,4))return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    for(SIZE_T i=0;i<offsets.count;++i)
+        if(offsets.planes[0][i]%4 || !mark(offsets.planes[0][i],offsets.depth_stencil ? 4:offsets.element_bytes) ||
+            (offsets.depth_stencil && !mark(offsets.planes[1][i],1)))
+            return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    if(offsets.depth_stencil) {
+        for(SIZE_T at=0;at<tiled_bytes;) {
+            if(covered[at/8]&(1u<<(at%8))){++at;continue;}
+            const SIZE_T gap_start=at;
+            do {++at;}while(at<tiled_bytes && !(covered[at/8]&(1u<<(at%8))));
+            // Batch nearby gaps; intervening texels are rewritten by the same shader.
+            if(!padding_.empty() && gap_start-padding_.back().first-padding_.back().second<=4096) {
+                padding_.back().second=at-padding_.back().first;continue;
+            }
+            if(padding_.size()==512){padding_.assign(1,{0,tiled_bytes});break;} // Fragmented maps retain the full-copy path.
+            padding_.emplace_back(gap_start,at-gap_start);
+        }
+    } else padding_.emplace_back(0,tiled_bytes);
+    const UINT table_words=offsets.depth_stencil ? 2:1;
+    const SIZE_T table_bytes=offsets.count*4*table_words,required=tiled_bytes*3+SIZE_T(linear_bytes)+table_bytes+padding_.capacity()*sizeof(padding_[0]);
+    auto used=sample_layout_bytes.load();
+    do {if(required>sample_layout_budget-used)return S_FALSE;}while(!sample_layout_bytes.compare_exchange_weak(used,used+required));
+    retained_bytes_=required;sample_transport_=true;tiled_bytes_=tiled_bytes;width_=width;height_=height;sample_pitch_=UINT(slice);
+    sample_owner_=std::move(owner);sample_depth_offsets_=offsets.planes[0];
+    sample_depth_stencil_=offsets.depth_stencil;
+    sample_footprints_.assign(footprints.begin(),footprints.end());
+    htile_offset_=UINT(offsets.htile_offset);htile_words_=UINT(offsets.htile_bytes/4);expanded_htile_=offsets.expanded_htile;
+    const auto create=[&](SIZE_T bytes,D3D12_HEAP_TYPE type,D3D12_RESOURCE_FLAGS flags,D3D12_RESOURCE_STATES state,auto& out) {
+        D3D12_RESOURCE_DESC d{};d.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;d.Width=bytes;
+        d.Height=d.DepthOrArraySize=d.MipLevels=1;d.SampleDesc.Count=1;d.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;d.Flags=flags;
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=type;
+        return device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&d,state,nullptr,IID_PPV_ARGS(&out));
+    };
+    HRESULT hr=create(table_bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,offsets_);
+    if(SUCCEEDED(hr))hr=create(tiled_bytes,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_GENERIC_READ,upload_);
+    if(SUCCEEDED(hr))hr=create(tiled_bytes,D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,tiled_);
+    if(SUCCEEDED(hr))hr=create(SIZE_T(linear_bytes),D3D12_HEAP_TYPE_DEFAULT,D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COMMON,linear_);
+    if(SUCCEEDED(hr))hr=create(tiled_bytes,D3D12_HEAP_TYPE_READBACK,D3D12_RESOURCE_FLAG_NONE,D3D12_RESOURCE_STATE_COPY_DEST,readback_);
+    if(FAILED(hr))return hr;
+    void* mapped=nullptr;const D3D12_RANGE no_read{0,0};hr=offsets_->Map(0,&no_read,&mapped);if(FAILED(hr))return hr;
+    auto* words=static_cast<UINT32*>(mapped);
+    for(SIZE_T i=0;i<offsets.count;++i){words[i*table_words]=offsets.planes[0][i];if(offsets.depth_stencil)words[i*2+1]=offsets.planes[1][i];}
+    offsets_->Unmap(0,nullptr);
+    static constexpr char source[]=R"(
+ByteAddressBuffer offsets:register(t0);ByteAddressBuffer input:register(t1);RWByteAddressBuffer output:register(u0);
+cbuffer Layout:register(b0){uint width;uint height;uint samples;uint pitch;uint slice_pitch;uint count;uint htile_offset;uint htile_words;uint expanded;uint into_tiled;};
+[numthreads(64,1,1)] void main(uint3 id:SV_DispatchThreadID){
+ uint i=id.y*(65535u*64u)+id.x;
+ if(into_tiled && i<htile_words)output.Store(htile_offset+i*4,expanded);
+ if(i>=count)return;
+ uint sample_index=i%samples;uint pixel=i/samples;uint source=sample_index*slice_pitch+(pixel/width)*pitch+(pixel%width)*SAMPLE_BYTES;
+#if DEPTH_STENCIL
+ uint stencil=offsets.Load(i*8+4);uint shift=(stencil&3)*8;uint ignored;
+ if(!into_tiled){output.Store(source,input.Load(offsets.Load(i*8)));output.Store(source+4,(input.Load(stencil&~3u)>>shift)&255u);return;}
+ output.Store(offsets.Load(i*8),input.Load(source));
+ output.InterlockedAnd(stencil&~3u,~(255u<<shift),ignored);
+ output.InterlockedOr(stencil&~3u,(input.Load(source+4)&255u)<<shift,ignored);
+#else
+ uint base=offsets.Load(i*4);uint from=into_tiled?source:base;uint to=into_tiled?base:source;
+#if SAMPLE_BYTES == 8
+ output.Store2(to,input.Load2(from));
+#else
+ output.Store(to,input.Load(from));
+#endif
+#endif
+})";
+    hr=initialize_program(device,source,sizeof(source)-1,10,offsets.element_bytes,offsets.depth_stencil);
+    if(FAILED(hr) || !offsets.depth_stencil)return hr;
+    // The original-XG table is immutable. Cache it once, without per-dispatch DMA or a second retained table.
+    used=sample_layout_bytes.load();
+    do {if(table_bytes>sample_layout_budget-used)return S_OK;}while(!sample_layout_bytes.compare_exchange_weak(used,used+table_bytes));
+    retained_bytes_+=table_bytes;
+    Microsoft::WRL::ComPtr<ID3D12Resource> cached;
+    hr=cache_immutable_offsets(device,offsets_.Get(),table_bytes,cached);
+    if(SUCCEEDED(hr)) {
+        offsets_=std::move(cached);
+        wchar_t timing[2]{};
+        if(GetEnvironmentVariableW(L"XONE_ERA_TIMING",timing,2)==1 && timing[0]==L'1') {
+            SIZE_T bytes=0;for(const auto& span:padding_)bytes+=span.second;
+            std::fprintf(stderr,"xone-era: immutable sample offsets cached once bytes=%zu padding_bytes=%zu padding_regions=%zu\n",table_bytes,bytes,padding_.size());
+        }
+    } else {cached.Reset();std::fprintf(stderr,"xone-era: immutable offset cache unavailable 0x%08lX; retaining upload table\n",hr);}
+    retained_bytes_-=table_bytes;sample_layout_bytes.fetch_sub(table_bytes);
+    return S_OK;
 }catch(const std::bad_alloc&){return E_OUTOFMEMORY;}
+HRESULT TextureLayoutTransfer::validate_samples(const void* canonical,bool bypass_htile) const {
+    if(!canonical || !sample_owner_)return E_INVALIDARG;
+    if(!sample_depth_stencil_)return S_OK; // Packed color and half-float payloads are transported as raw bits.
+    const auto* bytes=static_cast<const BYTE*>(canonical);
+    if(!bypass_htile)for(UINT i=0;i<htile_words_;++i) {
+        UINT32 word;std::memcpy(&word,bytes+htile_offset_+SIZE_T(i)*4,4);
+        if(word!=expanded_htile_)return DXGI_ERROR_UNSUPPORTED;
+    }
+    const SIZE_T count=SIZE_T(width_)*height_*sample_footprints_.size();
+    for(SIZE_T i=0;i<count;++i) {
+        UINT32 bits;std::memcpy(&bits,bytes+sample_depth_offsets_[i],4);
+        if(bits>0x3f800000u || (bits && !(bits&0x7f800000u)))return DXGI_ERROR_UNSUPPORTED;
+    }
+    return S_OK;
+}
+void TextureLayoutTransfer::detile_samples(ID3D12GraphicsCommandList* list,ID3D12Resource* array) const {
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyBufferRegion(tiled_.Get(),0,upload_.Get(),0,tiled_bytes_);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetPipelineState(pipeline_.Get());list->SetComputeRootSignature(root_.Get());
+    list->SetComputeRootShaderResourceView(0,offsets_->GetGPUVirtualAddress());list->SetComputeRootShaderResourceView(1,tiled_->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2,linear_->GetGPUVirtualAddress());
+    const UINT count=width_*height_*UINT(sample_footprints_.size());
+    const UINT constants[]{width_,height_,UINT(sample_footprints_.size()),sample_footprints_[0].Footprint.RowPitch,sample_pitch_,count,htile_offset_,htile_words_,expanded_htile_,0};
+    list->SetComputeRoot32BitConstants(3,10,constants,0);
+    const UINT groups=(count+63)/64;list->Dispatch((std::min)(groups,65535u),(groups+65534)/65535,1);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    for(UINT i=0;i<sample_footprints_.size();++i) {
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=linear_.Get();from.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;from.PlacedFootprint=sample_footprints_[i];
+        to.pResource=array;to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;to.SubresourceIndex=i;
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    }
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+}
+void TextureLayoutTransfer::retile_samples(ID3D12GraphicsCommandList* list,ID3D12Resource* array) const {
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    for(UINT i=0;i<sample_footprints_.size();++i) {
+        D3D12_TEXTURE_COPY_LOCATION from{},to{};from.pResource=array;from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;from.SubresourceIndex=i;
+        to.pResource=linear_.Get();to.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;to.PlacedFootprint=sample_footprints_[i];
+        list->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    }
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST);
+    // Every marked byte is rewritten by the shader; only its exact complement needs the preimage.
+    for(const auto& [offset,bytes]:padding_)list->CopyBufferRegion(tiled_.Get(),offset,upload_.Get(),offset,bytes);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    list->SetPipelineState(pipeline_.Get());list->SetComputeRootSignature(root_.Get());
+    list->SetComputeRootShaderResourceView(0,offsets_->GetGPUVirtualAddress());list->SetComputeRootShaderResourceView(1,linear_->GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2,tiled_->GetGPUVirtualAddress());
+    const UINT count=width_*height_*UINT(sample_footprints_.size());
+    const UINT constants[]{width_,height_,UINT(sample_footprints_.size()),sample_footprints_[0].Footprint.RowPitch,sample_pitch_,count,htile_offset_,htile_words_,expanded_htile_,1};
+    list->SetComputeRoot32BitConstants(3,10,constants,0);
+    const UINT groups=((std::max)(count,htile_words_)+63)/64;list->Dispatch((std::min)(groups,65535u),(groups+65534)/65535,1);
+    layout_transition(list,linear_.Get(),D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,D3D12_RESOURCE_STATE_COMMON);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(readback_.Get(),0,tiled_.Get(),0,tiled_bytes_);
+    layout_transition(list,tiled_.Get(),D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COMMON);
+}
 HRESULT TextureLayoutTransfer::prepare(const void* canonical,bool full_overwrite) {
     if(!canonical || !pipeline_)return E_INVALIDARG;
     void* mapped=nullptr;const D3D12_RANGE no_read{0,0};const auto hr=upload_->Map(0,&no_read,&mapped);
@@ -130,7 +347,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
         const char* source, const D3D_SHADER_MACRO* macros,
         Microsoft::WRL::ComPtr<ID3D12RootSignature>& out_root, Microsoft::WRL::ComPtr<ID3D12PipelineState>& out_pipeline,
         bool depth_target = false, UINT srv_count = 1, UINT stencil_bit = UINT_MAX,
-        DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, bool overlay = false) {
+        DXGI_FORMAT depth_format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT, bool overlay = false, UINT quality = 0) {
     if (!device) return E_INVALIDARG;
     struct CompilerModule {
         HMODULE handle;
@@ -182,7 +399,7 @@ static HRESULT graphics_pipeline(ID3D12Device* device, DXGI_FORMAT output_format
     desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
     desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    desc.NumRenderTargets = 1; desc.RTVFormats[0] = output_format; desc.SampleDesc.Count = samples;
+    desc.NumRenderTargets = 1; desc.RTVFormats[0] = output_format; desc.SampleDesc = {samples,quality};
     if (depth_target) {
         desc.NumRenderTargets = 0; desc.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
         desc.DSVFormat = depth_format;
@@ -249,6 +466,20 @@ HRESULT DisplayTransfer::record(ID3D12GraphicsCommandList* list, ID3D12Descripto
         UINT width, UINT height, bool srgb_to_709) const {
     return fullscreen(list, root_.Get(), pipeline_.Get(), heap, source, target, width, height, srgb_to_709 ? 1 : 0);
 }
+HRESULT MipmapTransfer::initialize(ID3D12Device* device,DXGI_FORMAT format) {
+    // Reference helper VS 1406eec80 / PS 140719880: float array sample, linear clamp, explicit LOD zero.
+    static constexpr char source[]=R"(
+Texture2DArray<float4> image:register(t0);SamplerState linear_clamp:register(s0);
+struct Vertex {float4 position:SV_Position;float2 uv:TEXCOORD0;};
+Vertex vs_main(uint id:SV_VertexID){Vertex v;v.uv=float2((id<<1)&2,id&2);v.position=float4(v.uv*float2(2,-2)+float2(-1,1),0,1);return v;}
+float4 ps_main(Vertex v):SV_Target{return image.SampleLevel(linear_clamp,float3(v.uv,0),0);}
+)";
+    return graphics_pipeline(device,format,1,source,nullptr,root_,pipeline_);
+}
+HRESULT MipmapTransfer::record(ID3D12GraphicsCommandList* list,ID3D12DescriptorHeap* heap,
+        D3D12_GPU_DESCRIPTOR_HANDLE source,D3D12_CPU_DESCRIPTOR_HANDLE target,UINT width,UINT height) const {
+    return fullscreen(list,root_.Get(),pipeline_.Get(),heap,source,target,width,height,0);
+}
 HRESULT GuideComposition::record(ID3D12Device* device, ID3D12GraphicsCommandList* list, ID3D12Resource* output) {
     active_ = false;
     UINT width = 0, height = 0;
@@ -312,7 +543,7 @@ HRESULT GuideComposition::record(ID3D12Device* device, ID3D12GraphicsCommandList
     return hr;
 }
 
-HRESULT SampleTransfer::initialize(ID3D12Device* device, DXGI_FORMAT format, UINT samples) {
+HRESULT SampleTransfer::initialize(ID3D12Device* device, DXGI_FORMAT format, UINT samples, UINT quality) {
     if (samples < 2 || samples > 8 || (samples & (samples - 1))) return E_INVALIDARG;
     const bool depth_stencil = format==DXGI_FORMAT_R32G8X24_TYPELESS;
     const bool depth_only = format==DXGI_FORMAT_R32_TYPELESS;
@@ -394,14 +625,14 @@ float4 ps_main(Vertex v) : SV_Target {
     const D3D_SHADER_MACRO into[]{{"INTO_MSAA", "1"}, {transport_macro,"1"}, {nullptr,nullptr}};
     const D3D_SHADER_MACRO out[]{{transport_macro,"1"}, {nullptr,nullptr}};
     HRESULT hr = graphics_pipeline(device, transport_format, samples, source, into, roots[0], pipelines[0],depth_stencil || depth_only,
-        1,UINT_MAX,depth_only ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+        1,UINT_MAX,depth_only ? DXGI_FORMAT_D32_FLOAT : DXGI_FORMAT_D32_FLOAT_S8X24_UINT,false,quality);
     if (SUCCEEDED(hr)) hr = graphics_pipeline(device, depth_stencil ? DXGI_FORMAT_R32G32_UINT : depth_only ? DXGI_FORMAT_R32_UINT : transport_format, 1, source, out,
         roots[1], pipelines[1],false,depth_stencil ? 2 : 1);
     std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>,8> stencil;
     if (depth_stencil) for (UINT bit=0;bit<8 && SUCCEEDED(hr);++bit) {
         const D3D_SHADER_MACRO masks[]{{"INTO_MSAA","1"},{"DEPTH_STENCIL","1"},{"STENCIL_BIT","1"},{nullptr,nullptr}};
         Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
-        hr=graphics_pipeline(device,format,samples,source,masks,root,stencil[bit],true,1,bit);
+        hr=graphics_pipeline(device,format,samples,source,masks,root,stencil[bit],true,1,bit,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,false,quality);
     }
     if (SUCCEEDED(hr)) { roots_ = std::move(roots); pipelines_ = std::move(pipelines); stencil_pipelines_=std::move(stencil); samples_ = samples; depth_stencil_=depth_stencil; depth_target_=depth_stencil || depth_only; }
     return hr;

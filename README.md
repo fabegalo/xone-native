@@ -21,7 +21,11 @@
 |---|---|
 | ![Original Sonic Mania Xbox One title screen rendered by xone-era](docs/assets/screenshots/sonic-mania-title.png) | ![Locally recreated dashboard Home with Sonic Mania and the title suspension result](docs/assets/screenshots/local-dashboard-home.png) |
 
-<sub>Local Windows x64 captures, 15 November 2026. Sonic Mania 1.0.4.2 reached its title screen through the ERA runtime; gameplay is not certified. Home is output from the locally recreated dashboard renderer (`local_recreation`), not original SystemOS. Game imagery belongs to its respective owners. [Session evidence and remaining limitations](docs/NEXT-TASK.md).</sub>
+| Forza Horizon 2 · original Xbox One title screen |
+|---|
+| ![Original Forza Horizon 2 Xbox One title screen, "Press A to start", shown in the xone-era window](docs/assets/screenshots/forza-horizon-2-title.webp) |
+
+<sub>Local Windows x64 captures, 15 November 2026. Sonic Mania 1.0.4.2 reached its title screen through the ERA runtime; gameplay is not certified. Forza Horizon 2 reached its original title screen in the `xone-era` window (game language set to Brazilian Portuguese); gameplay is not certified. Home is output from the locally recreated dashboard renderer (`local_recreation`), not original SystemOS. Game imagery belongs to its respective owners. [Session evidence and remaining limitations](docs/NEXT-TASK.md).</sub>
 
 ## What is xone-native?
 
